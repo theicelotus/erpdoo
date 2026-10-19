@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "erpdoo"
+version = "0.0.1"
+description = "Turn Odoo database changes into business events and stream them to Kafka and other sinks"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "confluent-kafka>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+erpdoo = "erpdoo.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
