@@ -36,7 +36,8 @@ class Odoo:
             reply = json.load(resp)
         if "error" in reply:
             raise RuntimeError(reply["error"]["data"]["message"])
-        return reply["result"]
+        # Odoo leaves "result" out when the method returns None.
+        return reply.get("result")
 
     def __call__(self, model: str, method: str, *args, **kwargs):
         return self._call("object", "execute_kw", self.db, self.uid, self.password, model, method, args, kwargs)
