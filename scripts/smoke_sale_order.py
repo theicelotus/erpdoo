@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from decimal import Decimal
 
 from confluent_kafka import Consumer, TopicPartition
 
@@ -117,6 +118,22 @@ def main() -> int:
     found = events_for(order_id, args.timeout)
     if len(found) != 1 or found[0]["event_type"] != "SaleOrderConfirmed":
         print(f"FAIL: expected one SaleOrderConfirmed for order {order_id}, got {len(found)}")
+        return 1
+
+    # Related records come from erpdoo's state store; they must match Odoo.
+    record = found[0]["record"]
+    partner_name = odoo("res.partner", "read", [partner_id], ["name"])[0]["name"]
+    product_name = odoo("product.product", "read", [product_id], ["name"])[0]["name"]
+    lines = record.get("order_line") or []
+    problems = []
+    if (record.get("partner_id") or {}).get("name") != partner_name:
+        problems.append(f"partner name {record.get('partner_id')!r}, Odoo says {partner_name!r}")
+    if [(line.get("product_id") or {}).get("name") for line in lines] != [product_name]:
+        problems.append(f"order lines {lines!r}, expected one line for product {product_name!r}")
+    elif Decimal(lines[0].get("product_uom_qty") or 0) != 2:  # numeric values are strings
+        problems.append(f"line quantity {lines[0].get('product_uom_qty')!r}, expected 2")
+    if problems:
+        print("FAIL: " + "; ".join(problems))
         return 1
 
     # A later edit of the confirmed order must not produce another event.
