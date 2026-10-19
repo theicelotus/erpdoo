@@ -1,0 +1,14 @@
+# Sales events. See src/erpdoo/rules.py for the rule format.
+
+SaleOrderConfirmed:
+  model: sale.order
+  when:
+    # Odoo confirms quotations from draft and from sent (emailed), and an
+    # order created and confirmed in one transaction starts with no state.
+    state: { to: sale }
+  fields: [name, state, date_order, client_order_ref, currency_id,
+           amount_untaxed, amount_tax, amount_total, user_id, team_id, company_id]
+  include:
+    partner_id: [name, email, phone, vat]
+    order_line: [name, product_uom_qty, price_unit, discount, price_subtotal, price_total]
+    order_line.product_id: [name, default_code]

@@ -1,8 +1,4 @@
-"""Business events built from committed transactions.
-
-For now there is a single hard-coded event, SaleOrderConfirmed. The YAML rule
-engine (Phase 1, step 3) replaces this module's detection logic.
-"""
+"""Business events built from committed transactions by YAML rules."""
 
 from __future__ import annotations
 
@@ -10,8 +6,11 @@ import logging
 import uuid
 from dataclasses import dataclass
 
+from erpdoo.models import ModelRegistry
 from erpdoo.pgoutput import format_lsn
 from erpdoo.replication import Transaction
+from erpdoo.rules import Include, Rule, related_hops
+from erpdoo.store import StateStore
 
 log = logging.getLogger(__name__)
 
@@ -69,40 +68,94 @@ def net_changes(txn: Transaction, model: str) -> dict[int, tuple[dict | None, di
     return result
 
 
-SALE_ORDER_FIELDS = (
-    "id", "name", "state", "partner_id", "partner_invoice_id", "partner_shipping_id",
-    "user_id", "team_id", "company_id", "currency_id", "pricelist_id", "date_order",
-    "client_order_ref", "amount_untaxed", "amount_tax", "amount_total",
-)
+class EventBuilder:
+    """Evaluates rules against committed transactions and renders events,
+    taking related records from the state store."""
 
+    def __init__(self, rules: list[Rule], registry: ModelRegistry, store: StateStore, lang: str = "en_US") -> None:
+        self.rules = rules
+        self.registry = registry
+        self.store = store
+        self.lang = lang
+        self._hops: dict[tuple[str, str], list] = {}
 
-def sale_order_confirmed(txn: Transaction) -> list[Event]:
-    """A sale order whose state became 'sale' in this transaction.
+    def build(self, txn: Transaction) -> list[Event]:
+        """Events for one transaction. Apply the transaction to the store
+        first, so related records are as of its commit."""
+        events = []
+        changes_by_model: dict[str, dict] = {}
+        for rule in self.rules:
+            if rule.model not in changes_by_model:
+                changes_by_model[rule.model] = net_changes(txn, rule.model)
+            for record_id, (before, after) in changes_by_model[rule.model].items():
+                if before is None:
+                    log.warning("%s %s: row before the change unknown, needs REPLICA IDENTITY FULL", rule.model, record_id)
+                    continue
+                if not rule.matches(before, after):
+                    continue
+                row = after if after is not None else before
+                eid = event_id(txn, rule.name, rule.model, record_id)
+                payload = {
+                    "event_id": eid,
+                    "event_type": rule.name,
+                    "model": rule.model,
+                    "record_id": record_id,
+                    "occurred_at": txn.commit_time.isoformat(),
+                    "changes": {
+                        c.field: {"from": before.get(c.field), "to": (after or {}).get(c.field)}
+                        for c in rule.conditions if c.is_transition
+                    },
+                    "record": self.render(rule.model, row, rule.fields, rule.includes),
+                    "source": {
+                        "table": self.registry.models[rule.model].table,
+                        "xid": txn.xid,
+                        "commit_lsn": format_lsn(txn.commit_lsn),
+                    },
+                }
+                events.append(Event(eid, rule.name, rule.model, record_id, payload))
+        return events
 
-    Odoo confirms quotations from both 'draft' and 'sent' (quotation emailed),
-    so any previous state other than 'sale' counts.
-    """
-    events = []
-    for record_id, (before, after) in net_changes(txn, "sale.order").items():
-        if after is None or after.get("state") != "sale":
-            continue
-        if before is None:
-            log.warning("sale_order %s: previous state unknown, needs REPLICA IDENTITY FULL", record_id)
-            continue
-        previous = before.get("state")  # None: created already confirmed
-        if previous == "sale":
-            continue
-        rule = "SaleOrderConfirmed"
-        eid = event_id(txn, rule, "sale.order", record_id)
-        payload = {
-            "event_id": eid,
-            "event_type": rule,
-            "model": "sale.order",
-            "record_id": record_id,
-            "occurred_at": txn.commit_time.isoformat(),
-            "changes": {"state": {"from": previous, "to": "sale"}},
-            "record": {f: after.get(f) for f in SALE_ORDER_FIELDS},
-            "source": {"table": "sale_order", "xid": txn.xid, "commit_lsn": format_lsn(txn.commit_lsn)},
-        }
-        events.append(Event(eid, rule, "sale.order", record_id, payload))
-    return events
+    def render(self, model: str, row: dict, fields, includes: dict[str, Include]) -> dict:
+        m = self.registry.models[model]
+        names = fields if fields is not None else [n for n, f in m.fields.items() if f.column]
+        out = {"id": row.get("id")}
+        for name in names:
+            out[name] = self.value(model, row, name)
+        for inc in includes.values():
+            f = m.fields[inc.field]
+            target = self.registry.models[f.relation]
+            if f.type == "many2one":
+                target_id = row.get(f.column)
+                related = self.store.get(target.table, target_id) if target_id is not None else None
+                if target_id is None:
+                    out[inc.field] = None
+                elif related is None:
+                    out[inc.field] = {"id": target_id}  # not in the store (yet)
+                else:
+                    out[inc.field] = self.render(target.name, related, inc.fields, inc.children)
+            else:
+                inverse = target.fields[f.inverse].column
+                rows = self.store.find(target.table, inverse, row["id"])
+                out[inc.field] = [
+                    self.render(target.name, r, inc.fields, inc.children)
+                    for r in rows if all(c.matches({}, r) for c in inc.where)
+                ]
+        return out
+
+    def value(self, model: str, row: dict, name: str) -> object:
+        """A field's value: its column, or for a related field, the value at
+        the end of its path of many2one fields, read from the store."""
+        key = (model, name)
+        if key not in self._hops:
+            self._hops[key] = related_hops(self.registry, model, name)
+        *hops, (_, f) = self._hops[key]
+        current = row
+        for _, hop in hops:
+            target_id = current.get(hop.column)
+            current = self.store.get(self.registry.models[hop.relation].table, target_id) if target_id else None
+            if current is None:
+                return None
+        value = current.get(f.column)
+        if f.translate and isinstance(value, dict):
+            value = value.get(self.lang) or value.get("en_US") or next(iter(value.values()), None)
+        return value

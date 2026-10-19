@@ -113,6 +113,10 @@ services:
       ERPDOO_PG_DSN: host=postgres dbname=odoo user=erpdoo password=erpdoo
       ERPDOO_KAFKA_BOOTSTRAP: redpanda:9092
       ERPDOO_TOPIC: erpdoo.events
+    volumes:
+      # Edit rules here and restart erpdoo; no rebuild needed.
+      - ./rules:/app/rules:ro
+      - erpdoo-state:/var/lib/erpdoo
     restart: unless-stopped
     depends_on:
       postgres:
@@ -127,3 +131,4 @@ volumes:
   pg-data:
   odoo-data:
   redpanda-data:
+  erpdoo-state:

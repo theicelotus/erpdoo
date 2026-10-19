@@ -153,14 +153,15 @@ class ReplicationReader:
         self.cur = None
         self.assembler: TransactionAssembler | None = None
 
-    def setup(self, tables: list[str], replica_identity_full: list[str] = ()) -> None:
-        """Create or update the publication and create the slot if missing."""
+    def setup(self, tables: list[str], replica_identity_full: list[str] = ()) -> bool:
+        """Create or update the publication and create the slot if missing.
+        Returns True if the slot was created."""
         with closing(psycopg2.connect(self.dsn, application_name="erpdoo-setup")) as conn:
             conn.autocommit = True
             with conn.cursor() as cur:
-                self._setup(cur, tables, replica_identity_full)
+                return self._setup(cur, tables, replica_identity_full)
 
-    def _setup(self, cur, tables, replica_identity_full) -> None:
+    def _setup(self, cur, tables, replica_identity_full) -> bool:
         for table in replica_identity_full:
             cur.execute("SELECT relreplident FROM pg_class WHERE oid = %s::regclass", [f"public.{table}"])
             if cur.fetchone()[0] != "f":
@@ -194,10 +195,11 @@ class ReplicationReader:
         if row is None:
             cur.execute("SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", [self.slot])
             log.info("created replication slot %s", self.slot)
-        elif row[0] != "pgoutput":
+            return True
+        if row[0] != "pgoutput":
             raise RuntimeError(f"slot {self.slot} uses plugin {row[0]}, expected pgoutput")
-        else:
-            log.info("resuming slot %s from %s", self.slot, row[1])
+        log.info("resuming slot %s from %s", self.slot, row[1])
+        return False
 
     def start(self) -> None:
         """Open the replication connection and start streaming from the slot's
