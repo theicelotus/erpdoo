@@ -2,7 +2,9 @@
 
 Creates a quotation in Odoo, confirms it (the same action_confirm the
 "Confirm" button calls), and waits for exactly one SaleOrderConfirmed event on
-Kafka. Then edits the confirmed order and checks no second event appears.
+Kafka, with the partner and order lines matching Odoo. Then edits the
+confirmed order and checks no second event appears. Finally posts a customer
+invoice (one InvoicePosted with its product lines) and a vendor bill (no event).
 
     python scripts/smoke_sale_order.py
 """
@@ -15,6 +17,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from datetime import date
 from decimal import Decimal
 
 from confluent_kafka import Consumer, TopicPartition
@@ -94,11 +97,10 @@ def main() -> int:
     name = odoo("sale.order", "read", [order_id], ["name"])[0]["name"]
     print(f"created quotation {name} (id {order_id}), confirming")
 
-    started = time.monotonic()
     odoo("sale.order", "action_confirm", [order_id])
     confirmed_at = time.monotonic()
 
-    def events_for(order: int, wait: float) -> list[dict]:
+    def events_for(record_id: int, wait: float, model: str = "sale.order", since: float | None = None) -> list[dict]:
         found = []
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
@@ -106,16 +108,17 @@ def main() -> int:
             if msg is None or msg.error():
                 continue
             event = json.loads(msg.value())
-            if event["model"] == "sale.order" and event["record_id"] == order:
+            if event["model"] == model and event["record_id"] == record_id:
                 found.append(event)
                 if not found[1:]:
-                    print(f"event after {time.monotonic() - confirmed_at:.2f}s "
-                          f"(confirm call took {confirmed_at - started:.2f}s), key {msg.key().decode()}")
+                    if since is not None:
+                        print(f"event {time.monotonic() - since:.2f}s after the call returned")
+                    print(f"key {msg.key().decode()}")
                     print(json.dumps(event, indent=2))
                     deadline = time.monotonic() + 3  # keep listening for duplicates
         return found
 
-    found = events_for(order_id, args.timeout)
+    found = events_for(order_id, args.timeout, since=confirmed_at)
     if len(found) != 1 or found[0]["event_type"] != "SaleOrderConfirmed":
         print(f"FAIL: expected one SaleOrderConfirmed for order {order_id}, got {len(found)}")
         return 1
@@ -141,6 +144,37 @@ def main() -> int:
     again = events_for(order_id, 5)
     if again:
         print(f"FAIL: editing the confirmed order produced {len(again)} more event(s)")
+        return 1
+
+    # Posting a customer invoice gives InvoicePosted with only its product
+    # lines; posting a vendor bill gives nothing.
+    def post(move_type: str) -> int:
+        move_id = odoo("account.move", "create", {
+            "move_type": move_type, "partner_id": partner_id, "invoice_date": date.today().isoformat(),
+            "invoice_line_ids": [(0, 0, {"product_id": product_id, "quantity": 3, "price_unit": 100})],
+        })
+        odoo("account.move", "action_post", [move_id])
+        return move_id
+
+    invoice_id = post("out_invoice")
+    posted_at = time.monotonic()
+    print(f"posted customer invoice id {invoice_id}")
+    invoices = [e for e in events_for(invoice_id, args.timeout, model="account.move", since=posted_at)
+                if e["event_type"] == "InvoicePosted"]
+    invoice = invoices[0]["record"] if len(invoices) == 1 else {}
+    lines = invoice.get("invoice_line_ids") or []
+    problems = []
+    if len(invoices) != 1:
+        problems.append(f"expected one InvoicePosted for invoice {invoice_id}, got {len(invoices)}")
+    elif (invoice.get("partner_id") or {}).get("name") != partner_name:
+        problems.append(f"invoice partner {invoice.get('partner_id')!r}, Odoo says {partner_name!r}")
+    elif [((line.get("product_id") or {}).get("name"), Decimal(line["quantity"])) for line in lines] != [(product_name, 3)]:
+        problems.append(f"invoice lines {lines!r}, expected one product line of 3 x {product_name!r}")
+    bill_id = post("in_invoice")
+    if events_for(bill_id, 5, model="account.move"):
+        problems.append(f"posting vendor bill {bill_id} produced an event")
+    if problems:
+        print("FAIL: " + "; ".join(problems))
         return 1
 
     print("OK")
