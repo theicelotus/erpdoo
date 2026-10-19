@@ -13,9 +13,12 @@ import signal
 
 from erpdoo.events import sale_order_confirmed
 from erpdoo.kafka import KafkaSink
+from erpdoo.models import ModelRegistry
 from erpdoo.replication import ReplicationReader
 
 log = logging.getLogger("erpdoo")
+
+MODEL_TABLES = ("ir_model", "ir_model_fields")
 
 
 def main() -> None:
@@ -41,10 +44,13 @@ def main() -> None:
     sink = KafkaSink(bootstrap, topic)
     sink.ensure_topic()
 
-    reader = ReplicationReader(dsn, slot, publication)
+    registry = ModelRegistry.load(dsn)
+    log.info("loaded %d Odoo models", len(registry.models))
+    reader = ReplicationReader(dsn, slot, publication, lambda table: registry.model_for_table(table))
     # REPLICA IDENTITY FULL makes Postgres send the old row on update,
-    # which is how we see the state the order is leaving.
-    reader.setup(tables=["sale_order"], replica_identity_full=["sale_order"])
+    # which is how we see the state the order is leaving. ir_model and
+    # ir_model_fields are streamed so the registry follows module installs.
+    reader.setup(tables=["sale_order", *MODEL_TABLES], replica_identity_full=["sale_order"])
     reader.start()
     log.info("streaming to %s topic %s", bootstrap, topic)
     try:
@@ -57,6 +63,9 @@ def main() -> None:
                     print(json.dumps(event.payload), flush=True)
             if batch.ack_lsn is not None:
                 reader.ack(batch.ack_lsn)
+            if any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes):
+                registry = ModelRegistry.load(dsn)
+                log.info("Odoo models changed, reloaded %d models", len(registry.models))
     finally:
         reader.close()
         sink.close()

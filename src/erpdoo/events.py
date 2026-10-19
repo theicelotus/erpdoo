@@ -40,8 +40,8 @@ def event_id(txn: Transaction, rule: str, model: str, record_id: int) -> str:
     return str(uuid.uuid5(EVENT_ID_NAMESPACE, name))
 
 
-def net_changes(txn: Transaction, table: str) -> dict[int, tuple[dict | None, dict | None]]:
-    """Per record id, the row at the start and at the end of the transaction.
+def net_changes(txn: Transaction, model: str) -> dict[int, tuple[dict | None, dict | None]]:
+    """Per record id of ``model``, the row at the start and at the end of the transaction.
 
     before is {} if the record was created in this transaction, and None if it
     is unknown (an update without REPLICA IDENTITY FULL). after is None if the
@@ -49,7 +49,7 @@ def net_changes(txn: Transaction, table: str) -> dict[int, tuple[dict | None, di
     """
     result: dict[int, tuple[dict | None, dict | None]] = {}
     for change in txn.changes:
-        if change.table != table or change.op == "truncate":
+        if change.model != model or change.op == "truncate":
             continue
         record_id = (change.new or change.old)["id"]
         if record_id in result:
@@ -83,7 +83,7 @@ def sale_order_confirmed(txn: Transaction) -> list[Event]:
     so any previous state other than 'sale' counts.
     """
     events = []
-    for record_id, (before, after) in net_changes(txn, "sale_order").items():
+    for record_id, (before, after) in net_changes(txn, "sale.order").items():
         if after is None or after.get("state") != "sale":
             continue
         if before is None:
