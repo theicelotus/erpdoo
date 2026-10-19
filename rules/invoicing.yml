@@ -1,0 +1,18 @@
+# Invoicing events. See src/erpdoo/rules.py for the rule format.
+
+InvoicePosted:
+  model: account.move
+  when:
+    state: { to: posted }
+    move_type: out_invoice    # customer invoices; credit notes are out_refund
+  fields: [name, move_type, state, invoice_date, invoice_date_due, invoice_origin,
+           payment_reference, currency_id, amount_untaxed, amount_tax, amount_total,
+           amount_residual, payment_state, company_id]
+  include:
+    partner_id: [name, email, vat]
+    # Odoo filters invoice_line_ids in Python, so the database link holds
+    # every journal item (tax, receivable, ...). Keep the product lines.
+    invoice_line_ids:
+      fields: [name, quantity, price_unit, discount, price_subtotal, price_total]
+      where: { display_type: product }
+    invoice_line_ids.product_id: [name, default_code]
