@@ -1,0 +1,129 @@
+# Development stack: Odoo 18 with demo data, Postgres 16 with logical
+# replication, Redpanda (Kafka API + schema registry), Redpanda Console, erpdoo.
+#
+#   docker compose up -d --build
+#
+# Odoo:     http://localhost:8069  (admin / admin)
+# Console:  http://localhost:8080  (topic erpdoo.events)
+# Kafka:    127.0.0.1:19092        Schema registry: http://localhost:18081
+# Postgres: localhost:5432         (odoo / odoo)
+
+name: erpdoo
+
+services:
+  postgres:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: postgres
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Creates the "odoo" database with the Sales app and demo data, then exits.
+  # On later runs the module is already installed and this finishes quickly.
+  odoo-init:
+    image: odoo:18.0
+    command: ["odoo", "-d", "odoo", "-i", "sale_management", "--stop-after-init", "--no-http"]
+    environment: &odoo-db
+      HOST: postgres
+      USER: odoo
+      PASSWORD: odoo
+    volumes:
+      - odoo-data:/var/lib/odoo
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  odoo:
+    image: odoo:18.0
+    command: ["odoo", "-d", "odoo", "--db-filter=^odoo$$"]
+    environment: *odoo-db
+    volumes:
+      - odoo-data:/var/lib/odoo
+    ports:
+      - "127.0.0.1:8069:8069"
+    depends_on:
+      odoo-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8069/web/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.4
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19092
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    ports:
+      - "127.0.0.1:19092:19092"
+      - "127.0.0.1:18081:18081"
+      - "127.0.0.1:19644:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v3.12.0
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      SCHEMAREGISTRY_ENABLED: "true"
+      SCHEMAREGISTRY_URLS: http://redpanda:8081
+      REDPANDA_ADMINAPI_ENABLED: "true"
+      REDPANDA_ADMINAPI_URLS: http://redpanda:9644
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  erpdoo:
+    build: .
+    environment:
+      ERPDOO_PG_DSN: host=postgres dbname=odoo user=erpdoo password=erpdoo
+      ERPDOO_KAFKA_BOOTSTRAP: redpanda:9092
+      ERPDOO_TOPIC: erpdoo.events
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      # Odoo's tables must exist before erpdoo creates its publication.
+      odoo-init:
+        condition: service_completed_successfully
+
+volumes:
+  pg-data:
+  odoo-data:
+  redpanda-data:
