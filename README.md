@@ -95,6 +95,11 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
   Kafka has acknowledged the events. Confirmations reach Postgres about every
   10 seconds, so after a crash up to roughly the last 10 seconds of events
   are sent again, with the same `event_id`.
+- **Table names are inferred.** Odoo does not store a model's table name in
+  the database, so erpdoo uses Odoo's naming rule (`sale.order` →
+  `sale_order`) plus the core models known to differ (`ir.actions.*`). A
+  model from another module that sets its own `_table` is not recognised
+  yet. `python -m erpdoo.models <model>` shows how a model is mapped.
 - **An unused replication slot keeps WAL.** If erpdoo is stopped for a long
   time, Postgres keeps the WAL it hasn't read yet and disk use grows. Drop the
   slot (`SELECT pg_drop_replication_slot('erpdoo')`) if you remove erpdoo.
