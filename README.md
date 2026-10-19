@@ -11,9 +11,10 @@ no Kafka Connect: Postgres, one erpdoo process and a sink.
 Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ Kafka / Redpanda
 ```
 
-> **Status: early development.** Today erpdoo emits one hard-coded event,
-> `SaleOrderConfirmed`. YAML rules, a state store for related records, more
-> sinks and built-in event packs are next.
+> **Status: early development.** Events are defined by YAML rules; the
+> repository ships `SaleOrderConfirmed` and `InvoicePosted`. Related records
+> (partner, order lines, product names) come from a local SQLite copy kept
+> current from the stream. More sinks and event packs are next.
 
 ## Try it
 
@@ -28,15 +29,16 @@ docker compose logs -f erpdoo
 Open Odoo at http://localhost:8069 (login `admin`, password `admin`), go to
 **Sales**, open a quotation and click **Confirm**. The event appears in the
 erpdoo log and in Redpanda Console at http://localhost:8080 (topic `erpdoo.events`).
+Posting a customer invoice gives an `InvoicePosted` event the same way.
 This is a real event from the dev stack:
 
 ```json
 {
-  "event_id": "54b11ee0-d688-5e06-ae49-205e7a0cb5cd",
+  "event_id": "cdf720b0-763d-5c84-b402-ce66b89b9e47",
   "event_type": "SaleOrderConfirmed",
   "model": "sale.order",
-  "record_id": 21,
-  "occurred_at": "2026-10-19T22:07:27.481175+00:00",
+  "record_id": 35,
+  "occurred_at": "2026-10-19T23:47:45.626831+00:00",
   "changes": {
     "state": {
       "from": "draft",
@@ -44,27 +46,46 @@ This is a real event from the dev stack:
     }
   },
   "record": {
-    "id": 21,
-    "name": "S00021",
+    "id": 35,
+    "name": "S00035",
     "state": "sale",
-    "partner_id": 10,
-    "partner_invoice_id": 10,
-    "partner_shipping_id": 10,
+    "date_order": "2026-10-19 23:47:45",
+    "client_order_ref": null,
+    "currency_id": 1,
+    "amount_untaxed": "1500.00",
+    "amount_tax": "0.00",
+    "amount_total": "1500.00",
     "user_id": 2,
     "team_id": 1,
     "company_id": 1,
-    "currency_id": 1,
-    "pricelist_id": null,
-    "date_order": "2026-10-19 22:07:27",
-    "client_order_ref": null,
-    "amount_untaxed": "1500.00",
-    "amount_tax": "0.00",
-    "amount_total": "1500.00"
+    "partner_id": {
+      "id": 10,
+      "name": "Acme Corporation",
+      "email": "info@agrolait.com",
+      "phone": "(603)-996-3829",
+      "vat": "US12345673"
+    },
+    "order_line": [
+      {
+        "id": 59,
+        "name": "[DESK0005] Customizable Desk (Custom, White)\n160x80cm, with large legs.",
+        "product_uom_qty": "2.00",
+        "price_unit": "750.0",
+        "discount": "0.00",
+        "price_subtotal": "1500.00",
+        "price_total": "1500.00",
+        "product_id": {
+          "id": 44,
+          "name": "Customizable Desk",
+          "default_code": "DESK0005"
+        }
+      }
+    ]
   },
   "source": {
     "table": "sale_order",
-    "xid": 1375,
-    "commit_lsn": "0/46A8C40"
+    "xid": 1813,
+    "commit_lsn": "0/61C27B0"
   }
 }
 ```
@@ -72,14 +93,48 @@ This is a real event from the dev stack:
 Events are keyed `sale.order:<id>`, so all events for one record stay in order
 on one partition. `event_id` is derived from the Postgres transaction, the rule
 and the record, so redelivered events carry the same id and consumers can dedupe.
+Numeric values are strings (`"1500.00"`) so no precision is lost.
 
-To check the whole path from a script (creates and confirms an order through
-Odoo's API, then waits for the event):
+To check the whole path from a script (confirms an order and posts an
+invoice through Odoo's API, then checks the events against Odoo's data):
 
 ```sh
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/python scripts/smoke_sale_order.py
 ```
+
+## Writing rules
+
+Rules live in [rules/](rules/), one or more YAML files, mounted into the
+container: edit them and run `docker compose restart erpdoo`. A shortened
+version of the `InvoicePosted` rule ([rules/invoicing.yml](rules/invoicing.yml)):
+
+```yaml
+InvoicePosted:
+  model: account.move
+  when:
+    state: { to: posted }      # changed to posted in this transaction
+    move_type: out_invoice     # and is a customer invoice
+  include:
+    partner_id: [name, email, vat]
+    invoice_line_ids:
+      fields: [name, quantity, price_unit, price_subtotal]
+      where: { display_type: product }
+    invoice_line_ids.product_id: [name, default_code]
+```
+
+- `when` compares each record at the start of a transaction with the same
+  record at commit: `field: value` (value at commit), `{to: v}`,
+  `{from: v, to: w}` or `{changed: true}`. Values can be lists.
+- `on` picks the triggers: `create`, `update`, `delete` (default: create and update).
+- `fields` lists the record's fields to keep (default: every stored column).
+- `include` expands many2one and one2many fields, nested with dots. Related
+  fields such as a product's `name` (stored on the product template) are
+  followed automatically. `where` filters the related rows.
+
+erpdoo checks rules against Odoo's models at startup and lists every
+problem, such as an unknown field. The full reference is at the top of
+[src/erpdoo/rules.py](src/erpdoo/rules.py).
 
 ## Trade-offs, honestly
 
@@ -87,9 +142,20 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
   role with `REPLICATION`). Hosted Odoo platforms (Odoo Online, Odoo.sh)
   usually don't give you this. A polling mode over Odoo's API is planned for
   that case, with its own limits.
-- **`REPLICA IDENTITY FULL` on `sale_order`.** erpdoo sets this so Postgres
-  includes the previous row in each update, which is how it sees which state
-  an order is leaving. It makes each update to that table write more WAL.
+- **`REPLICA IDENTITY FULL` on each rule's table** (`sale_order`,
+  `account_move` with the shipped rules). erpdoo sets this so Postgres
+  includes the previous row in each update, which is how a rule sees the
+  value a field is leaving. It makes each update to those tables write more WAL.
+- **erpdoo adds tables to Odoo's publication** for its rules and their
+  related records, but first checks that each has a primary key or another
+  replica identity. Without one, Postgres would reject Odoo's updates and
+  deletes on that table, so erpdoo refuses to start and names the table.
+- **The state store copies whole tables.** Each table a rule includes
+  (partners, products, order and invoice lines, ...) is copied into SQLite
+  when tracking starts, which takes a while on a large database, then kept
+  current from the stream. If events are sent again after a crash, their
+  related records reflect the current state, not the original moment.
+  many2many includes are not supported yet.
 - **Delivery is at-least-once.** erpdoo streams changes over Postgres'
   replication protocol and confirms its position in the slot right after
   Kafka has acknowledged the events. If it crashes between the two, those
