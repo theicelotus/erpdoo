@@ -10,9 +10,6 @@ import json
 import logging
 import os
 import signal
-import time
-
-import psycopg
 
 from erpdoo.events import sale_order_confirmed
 from erpdoo.kafka import KafkaSink
@@ -31,7 +28,6 @@ def main() -> None:
     topic = os.environ.get("ERPDOO_TOPIC", "erpdoo.events")
     slot = os.environ.get("ERPDOO_SLOT", "erpdoo")
     publication = os.environ.get("ERPDOO_PUBLICATION", "erpdoo")
-    poll_interval = float(os.environ.get("ERPDOO_POLL_INTERVAL", "0.5"))
 
     stopping = False
 
@@ -45,15 +41,15 @@ def main() -> None:
     sink = KafkaSink(bootstrap, topic)
     sink.ensure_topic()
 
-    with psycopg.connect(dsn, autocommit=True, application_name="erpdoo") as conn:
-        reader = ReplicationReader(conn, slot, publication)
-        # REPLICA IDENTITY FULL makes Postgres send the old row on update,
-        # which is how we see the state the order is leaving.
-        reader.setup(tables=["sale_order"], replica_identity_full=["sale_order"])
-        log.info("streaming to %s topic %s", bootstrap, topic)
-
+    reader = ReplicationReader(dsn, slot, publication)
+    # REPLICA IDENTITY FULL makes Postgres send the old row on update,
+    # which is how we see the state the order is leaving.
+    reader.setup(tables=["sale_order"], replica_identity_full=["sale_order"])
+    reader.start()
+    log.info("streaming to %s topic %s", bootstrap, topic)
+    try:
         while not stopping:
-            batch = reader.poll()
+            batch = reader.poll(timeout=1.0)
             events = [e for txn in batch.transactions for e in sale_order_confirmed(txn)]
             if events:
                 sink.send(events)
@@ -61,10 +57,9 @@ def main() -> None:
                     print(json.dumps(event.payload), flush=True)
             if batch.ack_lsn is not None:
                 reader.ack(batch.ack_lsn)
-            if not batch.transactions:
-                time.sleep(poll_interval)
-
-    sink.close()
+    finally:
+        reader.close()
+        sink.close()
     log.info("stopped")
 
 

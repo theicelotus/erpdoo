@@ -90,13 +90,11 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 - **`REPLICA IDENTITY FULL` on `sale_order`.** erpdoo sets this so Postgres
   includes the previous row in each update, which is how it sees which state
   an order is leaving. It makes each update to that table write more WAL.
-- **Delivery is at-least-once.** erpdoo confirms its position in the
-  replication slot only after Kafka has acknowledged the events. After a
-  crash, events since the last confirmation are sent again with the same
-  `event_id`.
-- **Changes are read by polling (every 0.5 s by default),** using Postgres'
-  SQL interface to the replication slot, because the Python driver in use
-  (psycopg 3) does not support the streaming replication protocol.
+- **Delivery is at-least-once.** erpdoo streams changes over Postgres'
+  replication protocol and confirms its position in the slot only after
+  Kafka has acknowledged the events. Confirmations reach Postgres about every
+  10 seconds, so after a crash up to roughly the last 10 seconds of events
+  are sent again, with the same `event_id`.
 - **An unused replication slot keeps WAL.** If erpdoo is stopped for a long
   time, Postgres keeps the WAL it hasn't read yet and disk use grows. Drop the
   slot (`SELECT pg_drop_replication_slot('erpdoo')`) if you remove erpdoo.

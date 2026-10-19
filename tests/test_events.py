@@ -9,7 +9,7 @@ def txn(*changes: Change, xid: int = 900) -> Transaction:
 
 
 def update(old: dict | None, new: dict) -> Change:
-    return Change("update", "sale_order", old, False, new)
+    return Change("update", "sale_order", "sale.order", old, False, new)
 
 
 def test_draft_to_sale_fires_once():
@@ -35,7 +35,7 @@ def test_already_confirmed_order_edit_does_not_fire():
 
 def test_created_and_confirmed_in_one_transaction():
     t = txn(
-        Change("insert", "sale_order", None, False, {"id": 6, "state": "draft"}),
+        Change("insert", "sale_order", "sale.order", None, False, {"id": 6, "state": "draft"}),
         update({"id": 6, "state": "draft"}, {"id": 6, "state": "sale"}),
     )
     [event] = sale_order_confirmed(t)
