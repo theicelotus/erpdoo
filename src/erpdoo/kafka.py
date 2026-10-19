@@ -57,7 +57,13 @@ class KafkaSink:
             )
         remaining = self.producer.flush(self.flush_timeout)
         if errors or remaining:
-            raise DeliveryError(f"{len(errors)} failed, {remaining} undelivered: {errors[:3]}")
+            message = f"{len(errors)} failed, {remaining} undelivered: {errors[:3]}"
+            # The slot was not acknowledged, so these events are read again
+            # after a restart. Drop the queued copies so that close() cannot
+            # deliver them as well once the broker is back.
+            self.producer.purge()
+            self.producer.poll(0)
+            raise DeliveryError(message)
 
     def close(self) -> None:
         self.producer.flush(self.flush_timeout)
