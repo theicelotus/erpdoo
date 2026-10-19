@@ -62,7 +62,9 @@ def main() -> None:
                 for event in events:
                     print(json.dumps(event.payload), flush=True)
             if batch.ack_lsn is not None:
-                reader.ack(batch.ack_lsn)
+                # After a delivery, confirm right away so a crash does not
+                # resend it. Idle progress can wait for the status interval.
+                reader.ack(batch.ack_lsn, now=bool(events))
             if any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes):
                 registry = ModelRegistry.load(dsn)
                 log.info("Odoo models changed, reloaded %d models", len(registry.models))

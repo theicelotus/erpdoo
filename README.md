@@ -91,10 +91,9 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
   includes the previous row in each update, which is how it sees which state
   an order is leaving. It makes each update to that table write more WAL.
 - **Delivery is at-least-once.** erpdoo streams changes over Postgres'
-  replication protocol and confirms its position in the slot only after
-  Kafka has acknowledged the events. Confirmations reach Postgres about every
-  10 seconds, so after a crash up to roughly the last 10 seconds of events
-  are sent again, with the same `event_id`.
+  replication protocol and confirms its position in the slot right after
+  Kafka has acknowledged the events. If it crashes between the two, those
+  events are sent again after a restart, with the same `event_id`.
 - **Table names are inferred.** Odoo does not store a model's table name in
   the database, so erpdoo uses Odoo's naming rule (`sale.order` →
   `sale_order`) plus the core models known to differ (`ir.actions.*`). A
