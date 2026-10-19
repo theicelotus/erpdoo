@@ -105,6 +105,38 @@ class TransactionAssembler:
         return [self._change("delete", rel, old, msg.old_is_key_only, None)]
 
 
+class PublicationError(Exception):
+    pass
+
+
+def _replica_identity_problem(cur, table: str) -> str | None:
+    """Why ``table`` cannot be published safely, or None if it can.
+
+    A published table must identify the rows of an UPDATE or DELETE: by its
+    primary key (REPLICA IDENTITY DEFAULT), a chosen unique index (USING
+    INDEX) or the whole row (FULL). Otherwise Postgres rejects those
+    statements on the table, which would break Odoo.
+    """
+    cur.execute(
+        "SELECT c.relreplident,"
+        " EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary),"
+        " EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident AND i.indisvalid)"
+        " FROM pg_class c WHERE c.oid = to_regclass(%s)",
+        [f"public.{table}"],
+    )
+    row = cur.fetchone()
+    if row is None:
+        return f"{table}: no such table"
+    ident, has_pk, has_ident_index = row
+    if ident == "f" or (ident == "d" and has_pk) or (ident == "i" and has_ident_index):
+        return None
+    if ident == "n":
+        return f"{table}: REPLICA IDENTITY NOTHING"
+    if ident == "i":
+        return f"{table}: REPLICA IDENTITY USING INDEX, but the index is missing or invalid"
+    return f"{table}: no primary key (REPLICA IDENTITY DEFAULT needs one)"
+
+
 class ReplicationReader:
     def __init__(
         self,
@@ -129,6 +161,20 @@ class ReplicationReader:
                 self._setup(cur, tables, replica_identity_full)
 
     def _setup(self, cur, tables, replica_identity_full) -> None:
+        for table in replica_identity_full:
+            cur.execute("SELECT relreplident FROM pg_class WHERE oid = %s::regclass", [f"public.{table}"])
+            if cur.fetchone()[0] != "f":
+                cur.execute(sql.SQL("ALTER TABLE {} REPLICA IDENTITY FULL").format(sql.Identifier("public", table)))
+                log.info("set REPLICA IDENTITY FULL on %s", table)
+
+        problems = [p for t in tables if (p := _replica_identity_problem(cur, t))]
+        if problems:
+            raise PublicationError(
+                "refusing to publish these tables, because Postgres would then reject Odoo's"
+                " UPDATE and DELETE on them:\n  " + "\n  ".join(problems)
+                + "\nGive each table a primary key, or set REPLICA IDENTITY FULL or USING INDEX."
+            )
+
         table_list = sql.SQL(", ").join(sql.Identifier("public", t) for t in tables)
         pub = sql.Identifier(self.publication)
         cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", [self.publication])
@@ -140,12 +186,6 @@ class ReplicationReader:
         else:
             cur.execute(sql.SQL("CREATE PUBLICATION {} FOR TABLE {}").format(pub, table_list))
             log.info("created publication %s: %s", self.publication, ", ".join(tables))
-
-        for table in replica_identity_full:
-            cur.execute("SELECT relreplident FROM pg_class WHERE oid = %s::regclass", [f"public.{table}"])
-            if cur.fetchone()[0] != "f":
-                cur.execute(sql.SQL("ALTER TABLE {} REPLICA IDENTITY FULL").format(sql.Identifier("public", table)))
-                log.info("set REPLICA IDENTITY FULL on %s", table)
 
         cur.execute(
             "SELECT plugin, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = %s", [self.slot]
@@ -206,10 +246,11 @@ class ReplicationReader:
             ack_lsn = max(ack_lsn or 0, self.cur.wal_end)
         return Batch(transactions, ack_lsn)
 
-    def ack(self, lsn: int) -> None:
-        """Confirm everything before ``lsn`` as delivered. psycopg2 sends the
-        position to the server on its status interval."""
-        self.cur.send_feedback(flush_lsn=lsn)
+    def ack(self, lsn: int, now: bool = False) -> None:
+        """Confirm everything before ``lsn`` as delivered. With ``now`` the
+        position goes to the server immediately; otherwise psycopg2 sends it
+        on its status interval (10 s)."""
+        self.cur.send_feedback(flush_lsn=lsn, force=now)
 
     def close(self) -> None:
         if self.conn is None:
