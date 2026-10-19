@@ -2,17 +2,17 @@ from erpdoo.models import Link, ModelRegistry, Reference
 
 MODELS = ["sale.order", "sale.order.line", "res.partner", "crm.tag", "mail.thread",
           "ir.actions.actions", "ir.actions.act_window", "ir.actions.act_window_close"]
-# model, name, ttype, relation, relation_field, relation_table, column1, column2, store
+# model, name, ttype, relation, relation_field, relation_table, column1, column2, store, related, translate
 FIELDS = [
-    ("sale.order", "id", "integer", None, None, None, None, None, True),
-    ("sale.order", "state", "selection", None, None, None, None, None, True),
-    ("sale.order", "partner_id", "many2one", "res.partner", None, None, None, None, True),
-    ("sale.order", "tax_country_id", "many2one", "res.country", None, None, None, None, False),
-    ("sale.order", "order_line", "one2many", "sale.order.line", "order_id", None, None, None, True),
-    ("sale.order", "tag_ids", "many2many", "crm.tag", None, "sale_order_tag_rel", "order_id", "tag_id", True),
-    ("sale.order", "invoice_ids", "many2many", "account.move", None, None, None, None, False),
-    ("sale.order.line", "order_id", "many2one", "sale.order", None, None, None, None, True),
-    ("mail.thread", "message_ids", "one2many", "mail.message", "res_id", None, None, None, True),
+    ("sale.order", "id", "integer", None, None, None, None, None, True, None, False),
+    ("sale.order", "state", "selection", None, None, None, None, None, True, None, False),
+    ("sale.order", "partner_id", "many2one", "res.partner", None, None, None, None, True, None, False),
+    ("sale.order", "tax_country_id", "many2one", "res.country", None, None, None, None, False, None, False),
+    ("sale.order", "order_line", "one2many", "sale.order.line", "order_id", None, None, None, True, None, False),
+    ("sale.order", "tag_ids", "many2many", "crm.tag", None, "sale_order_tag_rel", "order_id", "tag_id", True, None, False),
+    ("sale.order", "invoice_ids", "many2many", "account.move", None, None, None, None, False, None, False),
+    ("sale.order.line", "order_id", "many2one", "sale.order", None, None, None, None, True, None, False),
+    ("mail.thread", "message_ids", "one2many", "mail.message", "res_id", None, None, None, True, None, False),
 ]
 TABLES = {
     "sale_order": {"id", "state", "partner_id"},

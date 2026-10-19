@@ -39,6 +39,8 @@ class Field:
     relation_table: str | None  # many2many: join table
     column1: str | None  # many2many: join table column holding this model's id
     column2: str | None  # many2many: join table column holding the target's id
+    related: str | None = None  # path of a related field, e.g. "product_tmpl_id.name"
+    translate: bool = False  # stored as jsonb {"en_US": ..., "fr_FR": ...}
 
 
 @dataclass(frozen=True)
@@ -86,8 +88,8 @@ class ModelRegistry:
             cur.execute("SELECT model FROM ir_model")
             model_names = [r[0] for r in cur.fetchall()]
             cur.execute(
-                "SELECT model, name, ttype, relation, relation_field, relation_table, column1, column2, store"
-                " FROM ir_model_fields"
+                "SELECT model, name, ttype, relation, relation_field, relation_table, column1, column2, store,"
+                " related, translate FROM ir_model_fields"
             )
             field_rows = cur.fetchall()
             cur.execute(
@@ -113,14 +115,14 @@ class ModelRegistry:
             if table in table_columns:
                 tables[name] = table
                 fields_by_model[name] = {}
-        for model, name, ttype, relation, inverse, rel_table, column1, column2, store in field_rows:
+        for model, name, ttype, relation, inverse, rel_table, column1, column2, store, related, translate in field_rows:
             if model not in tables:
                 continue
             is_column = store and ttype not in ("one2many", "many2many") and name in table_columns[tables[model]]
             fields_by_model[model][name] = Field(
                 name, ttype, relation or None, name if is_column else None, inverse or None,
                 rel_table if store and ttype == "many2many" else None,
-                column1 or None, column2 or None,
+                column1 or None, column2 or None, related or None, bool(translate),
             )
         models = {name: Model(name, tables[name], fields_by_model[name]) for name in tables}
         join_tables: dict[str, list[tuple[str, Field]]] = {}
