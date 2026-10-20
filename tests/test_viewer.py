@@ -45,3 +45,22 @@ def test_page_and_recent_items():
             time.sleep(0.02)
     assert items[0]["xid"] == 900 and items[0]["commit_lsn"] == "0/2000"
     assert items[0]["events"] == [{"event_type": "LeadWon", "record_id": 3}]
+
+
+def test_field_changes_that_fired_a_rule_link_to_the_event():
+    txn = Transaction(901, 0x3000, 0x3100, datetime(2026, 1, 1, tzinfo=timezone.utc), [
+        Change("update", "sale_order", "sale.order", {"id": 5, "state": "draft", "note": "a"}, False,
+               {"id": 5, "state": "sale", "note": "b"}),
+        Change("update", "sale_order_line", "sale.order.line", {"id": 9, "write_date": "x"}, False,
+               {"id": 9, "write_date": "y"}),
+        Change("update", "sale_order_line", "sale.order.line", {"id": 10, "state": "draft"}, False,
+               {"id": 10, "state": "sale"}),
+    ])
+    event = Event("ev-1", "SaleOrderConfirmed", "sale.order", 5,
+                  {"event_id": "ev-1", "changes": {"state": {"from": "draft", "to": "sale"}}})
+    item = describe(txn, [event], [None, None, None])
+    order, internal, line = item["changes"]
+    assert order["fires"] == {"state": ["ev-1"]}  # note changed too, but did not fire anything
+    assert internal["internal"] and "fires" not in internal
+    assert "fires" not in line  # same field name, different record
+    assert (item["change_count"], item["table_count"]) == (3, 2)

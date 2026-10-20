@@ -41,6 +41,9 @@ def describe_change(change: Change, previous: dict | None = None) -> dict:
         item["changed"] = None if before is None else {
             k: [before.get(k), v] for k, v in change.new.items() if k not in NOISE and before.get(k) != v
         }
+        # Odoo rewrites rows for bookkeeping (write_date, computed fields that
+        # kept their value); the page hides these unless asked.
+        item["internal"] = item["changed"] == {}
     elif change.op == "insert":
         values = {k: v for k, v in change.new.items() if v is not None and k not in NOISE and k != "id"}
         item["values"] = dict(list(values.items())[:MAX_VALUES])
@@ -49,12 +52,24 @@ def describe_change(change: Change, previous: dict | None = None) -> dict:
 
 
 def describe(txn: Transaction, events: list[Event], previous: list[dict | None]) -> dict:
+    changes = [describe_change(c, p) for c, p in zip(txn.changes[:MAX_CHANGES], previous)]
+    # Link the field changes that made a rule fire to the event they produced:
+    # the event's transition fields, on the event's record.
+    for event in events:
+        for item in changes:
+            if item["model"] != event.model or item["id"] != event.record_id:
+                continue
+            shown = item.get("changed") or item.get("values") or {}
+            for name in event.payload.get("changes", {}):
+                if name in shown:
+                    item.setdefault("fires", {}).setdefault(name, []).append(event.event_id)
     return {
         "xid": txn.xid,
         "commit_lsn": format_lsn(txn.commit_lsn),
         "commit_time": txn.commit_time.isoformat(),
         "change_count": len(txn.changes),
-        "changes": [describe_change(c, p) for c, p in zip(txn.changes[:MAX_CHANGES], previous)],
+        "table_count": len({c.table for c in txn.changes}),
+        "changes": changes,
         "events": [e.payload for e in events],
     }
 
@@ -162,7 +177,15 @@ PAGE = """<!doctype html>
   .op { font-weight: 600; font-size: 12px; }
   .op.insert { color: var(--ins); } .op.update { color: var(--upd); } .op.delete, .op.truncate { color: var(--del); }
   .fields { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
-  .event { background: var(--event-bg); border-radius: 6px; padding: 6px 8px; margin: 0 0 6px; }
+  .summary { font-weight: 600; }
+  .fire { color: var(--event); background: var(--event-bg); border-radius: 3px; padding: 0 3px; text-decoration: none; font-weight: 600; }
+  .fire:hover { text-decoration: underline; }
+  .change.internal .fields { font-style: italic; }
+  body:not(.show-internal) .change.internal { display: none; }
+  body.show-internal .internal-note { display: none; }
+  .event { background: var(--event-bg); border-radius: 6px; padding: 6px 8px; margin: 0 0 6px; scroll-margin-top: 70px; }
+  .event:target { outline: 2px solid var(--event); }
+  .fired-by { color: var(--muted); font-size: 12px; }
   .event b { color: var(--event); }
   .event pre { margin: 6px 0 0; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .none { color: var(--muted); font-style: italic; }
@@ -175,6 +198,7 @@ PAGE = """<!doctype html>
   <h1>erpdoo live</h1>
   <span id="status" class="status">connecting</span>
   <label><input type="checkbox" id="only-events"> only transactions with events</label>
+  <label><input type="checkbox" id="show-internal"> show internal-only updates</label>
   <label><input type="checkbox" id="pause"> pause</label>
 </header>
 <main id="list"><p class="empty">Waiting for changes. Confirm a sale order in Odoo.</p></main>
@@ -185,17 +209,34 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", 
 const short = v => { const s = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v); return s.length > 60 ? s.slice(0, 57) + "..." : s; };
 let queued = [];
 
+// A field change that made a rule fire links to the event it produced.
+function field(c, k, text) {
+  const ids = (c.fires || {})[k];
+  return ids ? `<a class="fire" href="#ev-${esc(ids[0])}" title="made a rule fire">${text}</a>` : text;
+}
+
 function changeHtml(c) {
   let detail = "";
   if (c.op === "update") {
     detail = c.changed === null ? "previous row not known"
-      : Object.entries(c.changed).map(([k, [a, b]]) => `${esc(k)}: ${esc(short(a))} \\u2192 ${esc(short(b))}`).join(", ") || "no visible change";
+      : c.internal ? "only internal fields changed"
+      : Object.entries(c.changed).map(([k, [a, b]]) => field(c, k, `${esc(k)}: ${esc(short(a))} \\u2192 ${esc(short(b))}`)).join(", ");
   } else if (c.op === "insert") {
-    detail = Object.entries(c.values).map(([k, v]) => `${esc(k)}=${esc(short(v))}`).join(", ") + (c.more ? `, +${c.more} more` : "");
+    detail = Object.entries(c.values).map(([k, v]) => field(c, k, `${esc(k)}=${esc(short(v))}`)).join(", ") + (c.more ? `, +${c.more} more` : "");
   }
   const what = c.model ? `${esc(c.model)} <span class="fields">(${esc(c.table)})</span>` : esc(c.table);
-  return `<div class="change"><span class="op ${c.op}">${c.op.toUpperCase()}</span> ${what}${c.id != null ? " #" + c.id : ""}`
+  return `<div class="change${c.internal ? " internal" : ""}"><span class="op ${c.op}">${c.op.toUpperCase()}</span> ${what}${c.id != null ? " #" + c.id : ""}`
     + (detail ? `<div class="fields">${detail}</div>` : "") + `</div>`;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function eventHtml(e, changes) {
+  const by = changes.filter(c => Object.values(c.fires || {}).some(ids => ids.includes(e.event_id)))
+    .map(c => `${esc(c.model)} #${c.id} ${Object.keys(c.fires).filter(k => c.fires[k].includes(e.event_id)).map(esc).join(", ")}`);
+  return `<div class="event" id="ev-${esc(e.event_id)}"><b>${esc(e.event_type)}</b> ${esc(e.model)}:${e.record_id}`
+    + (by.length ? `<div class="fired-by">fired by ${[...new Set(by)].join("; ")}</div>` : "")
+    + `<details><summary>payload</summary><pre>${esc(JSON.stringify(e, null, 2))}</pre></details></div>`;
 }
 
 function render(t) {
@@ -203,19 +244,41 @@ function render(t) {
   el.className = "txn" + (t.events.length ? " has-events" : "");
   el.dataset.events = t.events.length;
   const hidden = t.change_count - t.changes.length;
-  el.innerHTML = `<div class="meta">transaction ${t.xid} \\u00b7 ${new Date(t.commit_time).toLocaleTimeString()} \\u00b7 LSN ${esc(t.commit_lsn)} \\u00b7 ${t.change_count} change${t.change_count === 1 ? "" : "s"}</div>
-    <div class="cols"><div class="col"><h2>Raw changes</h2>${t.changes.map(changeHtml).join("")}${hidden > 0 ? `<div class="none">+${hidden} more</div>` : ""}</div>
-    <div class="col"><h2>Events</h2>${t.events.length ? t.events.map(e => `<div class="event"><b>${esc(e.event_type)}</b> ${esc(e.model)}:${e.record_id}<details><summary>payload</summary><pre>${esc(JSON.stringify(e, null, 2))}</pre></details></div>`).join("") : '<div class="none">no event</div>'}</div></div>`;
+  const internal = t.changes.filter(c => c.internal).length;
+  el.innerHTML = `<div class="meta"><span class="summary">${plural(t.change_count, "change")} in ${plural(t.table_count, "table")} \\u2192 ${plural(t.events.length, "event")}</span>
+    \\u00b7 transaction ${t.xid} \\u00b7 ${new Date(t.commit_time).toLocaleTimeString()} \\u00b7 LSN ${esc(t.commit_lsn)}</div>
+    <div class="cols"><div class="col"><h2>Raw changes</h2>${t.changes.map(changeHtml).join("")}
+      ${internal ? `<div class="none internal-note">+${plural(internal, "update")} with only internal fields changed</div>` : ""}
+      ${hidden > 0 ? `<div class="none">+${hidden} more not shown</div>` : ""}</div>
+    <div class="col"><h2>Events</h2>${t.events.length ? t.events.map(e => eventHtml(e, t.changes)).join("") : '<div class="none">no event</div>'}</div></div>`;
   el.hidden = onlyEvents.checked && !t.events.length;
   return el;
+}
+
+// The newest event's payload starts open; the one opened before it closes
+// again unless the reader toggled it.
+let autoOpened = null;
+function openNewest(card) {
+  const details = card.querySelector(".event details");
+  if (!details) return;
+  if (autoOpened && autoOpened.dataset.auto) autoOpened.open = false;
+  details.open = true;
+  details.dataset.auto = "1";
+  details.querySelector("summary").addEventListener("click", () => delete details.dataset.auto);
+  autoOpened = details;
 }
 
 function add(t) {
   if (pause.checked) { queued.push(t); return; }
   const empty = list.querySelector(".empty"); if (empty) empty.remove();
-  list.prepend(render(t));
+  const card = render(t);
+  list.prepend(card);
+  openNewest(card);
   while (list.children.length > 300) list.lastChild.remove();
 }
+
+const showInternal = document.getElementById("show-internal");
+showInternal.onchange = () => document.body.classList.toggle("show-internal", showInternal.checked);
 
 onlyEvents.onchange = () => { for (const el of list.querySelectorAll(".txn")) el.hidden = onlyEvents.checked && el.dataset.events === "0"; };
 pause.onchange = () => { if (!pause.checked) { const q = queued; queued = []; q.forEach(add); } };
