@@ -91,7 +91,7 @@ class EventBuilder:
                 if before is None:
                     log.warning("%s %s: row before the change unknown, needs REPLICA IDENTITY FULL", rule.model, record_id)
                     continue
-                if not rule.matches(before, after):
+                if not rule.matches(before, self._with_related(rule, after)):
                     continue
                 row = after if after is not None else before
                 eid = event_id(txn, rule.name, rule.model, record_id)
@@ -114,6 +114,15 @@ class EventBuilder:
                 }
                 events.append(Event(eid, rule.name, rule.model, record_id, payload))
         return events
+
+    def _with_related(self, rule: Rule, row: dict | None) -> dict | None:
+        """The row plus the values of conditions on related fields or paths."""
+        if row is None:
+            return None
+        columns = self.registry.models[rule.model].fields
+        extra = {c.field: self.value(rule.model, row, c.field)
+                 for c in rule.conditions if not (c.field in columns and columns[c.field].column)}
+        return {**row, **extra} if extra else row
 
     def render(self, model: str, row: dict, fields, includes: dict[str, Include]) -> dict:
         m = self.registry.models[model]

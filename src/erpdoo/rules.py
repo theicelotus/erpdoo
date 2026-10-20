@@ -18,6 +18,9 @@ Conditions under ``when``:
     field: { to: v }                changed to v (v may be a list)
     field: { from: v, to: w }       changed from v to w
     field: { changed: true }        changed at all
+A plain-value condition may also use a related field or a dotted path
+through many2one fields (``picking_type_id.code: outgoing``); its value is
+read from the state store as of the commit.
 ``on`` limits the trigger to [create, update, delete]; the default is create
 and update. Everything is compared per transaction: the row at its start
 against the row at its commit.
@@ -190,7 +193,15 @@ def _parse_includes(rule: str, spec) -> dict[str, Include]:
 def related_hops(registry: ModelRegistry, model: str, name: str, depth: int = 0) -> list[tuple[str, Field]]:
     """How to read field ``name`` of ``model``: the many2one fields to follow,
     then the field that holds the value, each with the model it belongs to.
-    Raises RuleError if the value is not stored anywhere reachable."""
+    ``name`` may be a related field or a dotted path through stored many2one
+    fields (``picking_type_id.code``). Raises RuleError if the value is not
+    stored anywhere reachable."""
+    if "." in name:
+        first, rest = name.split(".", 1)
+        hop = registry.models[model].fields.get(first)
+        if hop is None or hop.type != "many2one" or not hop.column or hop.relation not in registry.models:
+            raise RuleError(f"{model}.{first} in {name} is not a stored many2one field")
+        return [(model, hop)] + related_hops(registry, hop.relation, rest, depth + 1)
     f = registry.models[model].fields.get(name)
     if f is None:
         raise RuleError(f"{model} has no field {name}")
@@ -227,8 +238,13 @@ def _validate(rule: Rule, registry: ModelRegistry) -> None:
         raise RuleError(f"unknown model {rule.model} (or it has no table)")
     model = registry.models[rule.model]
     for c in rule.conditions:
-        if c.field not in model.fields or not model.fields[c.field].column:
-            raise RuleError(f"condition field {c.field} is not a stored column of {rule.model}")
+        if c.field in model.fields and model.fields[c.field].column:
+            continue
+        related_hops(registry, rule.model, c.field)
+        if c.is_transition:
+            # Related values come from the state store, which only has the
+            # current row, so their previous value is unknown.
+            raise RuleError(f"condition on {c.field}: a related value supports only a plain value, not from/to/changed")
     for name in rule.fields or ():
         related_hops(registry, rule.model, name)
     _validate_includes(registry, rule.model, rule.includes)
@@ -285,5 +301,6 @@ def tracked_tables(rules: list[Rule], registry: ModelRegistry) -> dict[str, set[
 
     for rule in rules:
         need_fields(rule.model, rule.fields)
+        need_fields(rule.model, [c.field for c in rule.conditions])
         walk(rule.model, rule.includes)
     return tables

@@ -48,7 +48,7 @@ def test_includes_accept_list_and_mapping_forms():
 
 @pytest.mark.parametrize("spec, message", [
     ({"model": "no.such"}, "unknown model no.such"),
-    ({"model": "sale.order", "when": {"tax_country_id": 1}}, "not a stored column"),
+    ({"model": "sale.order", "when": {"tax_country_id": 1}}, "tax_country_id is not stored"),
     ({"model": "sale.order", "fields": ["nope"]}, "has no field nope"),
     ({"model": "sale.order", "include": ["tag_ids"]}, "many2many includes are not supported"),
     ({"model": "sale.order", "include": ["name"]}, "not a many2one or one2many"),
@@ -71,3 +71,15 @@ def test_tracked_tables_follow_includes_and_related_fields():
         "res_partner": set(), "sale_order_line": {"order_id"},
         "product_product": set(), "product_template": set(),  # product name is product_tmpl_id.name
     }
+
+
+def test_conditions_on_related_paths():
+    registry = fake_odoo.registry()
+    rule = parse_rule("R", {"model": "sale.order.line", "when": {"product_id.name": "Office Chair"}})
+    validate([rule], registry)
+    # product_id.name follows product_id, then the related product_tmpl_id.name.
+    assert tracked_tables([rule], registry) == {"product_product": set(), "product_template": set()}
+    with pytest.raises(RuleError, match="supports only a plain value"):
+        validate([parse_rule("R", {"model": "sale.order.line", "when": {"product_id.name": {"to": "x"}}})], registry)
+    with pytest.raises(RuleError, match="not a stored many2one"):
+        validate([parse_rule("R", {"model": "sale.order.line", "when": {"name.x": "y"}})], registry)
