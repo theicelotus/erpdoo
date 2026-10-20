@@ -111,11 +111,13 @@ class StateStore:
         """Rows of ``table`` whose ``column`` equals ``value``, by id."""
         if not _COLUMN.match(column):
             raise ValueError(f"invalid column name {column!r}")
+        # No ORDER BY: with it, SQLite prefers the primary key (tbl, id) and
+        # scans the whole table instead of using the column's index.
         rows = self.db.execute(
-            f"SELECT data FROM records WHERE tbl = ? AND json_extract(data, '$.{column}') = ? ORDER BY id",
+            f"SELECT id, data FROM records WHERE tbl = ? AND json_extract(data, '$.{column}') = ?",
             [table, value],
         )
-        return [json.loads(r[0]) for r in rows]
+        return [json.loads(data) for _, data in sorted(rows)]
 
     def sync(self, dsn: str, tables: dict[str, set[str]]) -> None:
         """Track exactly ``tables`` (table -> columns to index): drop tables no

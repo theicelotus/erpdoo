@@ -51,3 +51,15 @@ def test_tracking_survives_reopen(tmp_path):
     reopened = StateStore(path)
     assert reopened.tables == {"res_partner"}
     assert reopened.get("res_partner", 1)["name"] == "Azure Interior"
+
+
+def test_find_uses_the_column_index():
+    # Ordering in SQL made SQLite scan the table via the primary key instead,
+    # which got slower with every row (18 ms per lookup at 8000 lines).
+    s = StateStore(":memory:")
+    s.load("sale_order_line", [{"id": i, "order_id": i // 3} for i in range(3000)])
+    s.index("order_id")
+    plan = s.db.execute("EXPLAIN QUERY PLAN SELECT id, data FROM records WHERE tbl = ? "
+                        "AND json_extract(data, '$.order_id') = ?", ["sale_order_line", 5]).fetchall()
+    assert "records_order_id" in plan[0][3]
+    assert [r["id"] for r in s.find("sale_order_line", "order_id", 5)] == [15, 16, 17]
