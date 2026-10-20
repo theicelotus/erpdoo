@@ -2,7 +2,9 @@ import pytest
 import yaml
 
 import fake_odoo
-from erpdoo.rules import Condition, RuleError, YamlLoader, parse_rule, split_by_model, tracked_tables, validate
+from erpdoo.rules import (
+    Condition, RuleError, YamlLoader, missing_model_message, parse_rule, split_by_model, tracked_tables, validate,
+)
 
 
 def test_yaml_keeps_on_and_no_as_strings():
@@ -89,3 +91,11 @@ def test_split_by_model_sets_aside_rules_for_missing_apps():
     rules = [parse_rule("A", {"model": "sale.order"}), parse_rule("B", {"model": "crm.lead"})]
     active, skipped = split_by_model(rules, fake_odoo.registry())
     assert [r.name for r in active] == ["A"] and [r.name for r in skipped] == ["B"]
+
+
+def test_missing_model_message_suggests_close_names():
+    registry = fake_odoo.registry()
+    assert missing_model_message(parse_rule("R", {"model": "sale.ordr"}), registry) == \
+        "model sale.ordr not found (did you mean sale.order or sale.order.line?)"
+    assert missing_model_message(parse_rule("R", {"model": "crm.lead"}), registry) == \
+        "model crm.lead not found (is its Odoo app installed?)"

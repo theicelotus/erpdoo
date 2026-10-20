@@ -16,7 +16,9 @@ from erpdoo.config import ConfigError, load_config
 from erpdoo.events import EventBuilder
 from erpdoo.models import ModelRegistry
 from erpdoo.replication import PublicationError, ReplicationReader
-from erpdoo.rules import Rule, RuleError, load_rules, split_by_model, tracked_tables, validate
+from erpdoo.rules import (
+    Rule, RuleError, load_rules, missing_model_message, split_by_model, tracked_tables, validate,
+)
 from erpdoo.sinks import make_sink
 from erpdoo.store import StateStore
 
@@ -81,15 +83,17 @@ def run() -> None:
         store.sync(dsn, tracked)
         return EventBuilder(active, registry, store, lang), skipped
 
-    def report(skipped: list[Rule], previous: set[str]) -> None:
+    def report(skipped: list[Rule], previous: set[str], registry: ModelRegistry) -> None:
         for rule in skipped:
             if rule.name not in previous:
-                log.warning("rule %s skipped: model %s not found (is its Odoo app installed?);"
-                            " it is activated when the model appears", rule.name, rule.model)
+                log.warning("rule %s skipped: %s; it is activated when the model appears",
+                            rule.name, missing_model_message(rule, registry))
 
     builder, skipped = activate(registry)
-    report(skipped, set())
-    log.info("active rules: %s", ", ".join(r.name for r in builder.rules) or "none")
+    report(skipped, set(), registry)
+    log.info("rules: %d active (%s), %d inactive%s", len(builder.rules),
+             ", ".join(r.name for r in builder.rules) or "none", len(skipped),
+             f" ({', '.join(f'{r.name}: {r.model} not found' for r in skipped)})" if skipped else "")
     # Sinks start after the slot exists, so once the Kafka topic exists no
     # change is missed (the smoke test relies on this).
     sinks = [make_sink(spec) for spec in config["sinks"]]
@@ -144,7 +148,7 @@ def run() -> None:
                     builder.registry = registry
                     log.error("Odoo models changed and the rules no longer fit, keeping the active ones: %s", e)
                     continue
-                report(new_skipped, {r.name for r in skipped})
+                report(new_skipped, {r.name for r in skipped}, registry)
                 skipped = new_skipped
                 for name in sorted({r.name for r in builder.rules} - before):
                     log.info("rule %s activated", name)

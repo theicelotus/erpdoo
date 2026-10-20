@@ -28,6 +28,7 @@ against the row at its commit.
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -226,6 +227,17 @@ def split_by_model(rules: list[Rule], registry: ModelRegistry) -> tuple[list[Rul
     because its Odoo app is not installed."""
     active = [r for r in rules if r.model in registry.models]
     return active, [r for r in rules if r.model not in registry.models]
+
+
+def similar_models(model: str, registry: ModelRegistry, n: int = 3) -> list[str]:
+    """Installed model names closest to ``model``, to catch typos."""
+    return difflib.get_close_matches(model, registry.models.keys(), n=n, cutoff=0.75)
+
+
+def missing_model_message(rule: Rule, registry: ModelRegistry) -> str:
+    similar = similar_models(rule.model, registry)
+    hint = f"did you mean {' or '.join(similar)}?" if similar else "is its Odoo app installed?"
+    return f"model {rule.model} not found ({hint})"
 
 
 def validate(rules: list[Rule], registry: ModelRegistry) -> None:
