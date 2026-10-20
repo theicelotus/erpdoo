@@ -11,7 +11,8 @@ sinks:
   - type: stdout
 
   # POST each event as JSON. Retries network errors, 5xx, 408 and 429 with
-  # exponential backoff; other 4xx stop erpdoo without losing the event.
+  # exponential backoff. An event that is rejected (other 4xx) or still fails
+  # after the retries stops erpdoo without being lost, unless dead_letter is set.
   # - type: webhook
   #   url: https://example.com/hooks/erpdoo
   #   headers: { Authorization: "Bearer ${WEBHOOK_TOKEN}" }
@@ -19,3 +20,6 @@ sinks:
   #   timeout: 10                 # seconds per request
   #   retries: 5                  # after the first attempt
   #   backoff: 1                  # seconds before the first retry, doubling up to 60
+  #   dead_letter:                # optional, any sink: park failed events and continue
+  #     topic: erpdoo.dead-letter
+  #     bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}

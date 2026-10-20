@@ -8,7 +8,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from erpdoo.events import Event
-from erpdoo.sinks import DeliveryError, make_sink
+from erpdoo.config import ConfigError
+from erpdoo.sinks import DeadLetterSink, DeliveryError, make_sink
 from erpdoo.sinks.stdout import StdoutSink
 from erpdoo.sinks.webhook import WebhookSink
 
@@ -90,6 +91,69 @@ def test_stdout_writes_json_lines():
     assert [json.loads(line)["record_id"] for line in out.getvalue().splitlines()] == [1, 2]
 
 
-def test_make_sink_rejects_unknown_type():
-    with pytest.raises(ValueError, match="unknown sink type 'ftp'"):
+def test_make_sink_rejects_bad_config():
+    with pytest.raises(ConfigError, match="unknown sink type 'ftp'"):
         make_sink({"type": "ftp"})
+    with pytest.raises(ConfigError, match="sink webhook: .*urll"):
+        make_sink({"type": "webhook", "urll": "x"})
+    with pytest.raises(ConfigError, match="dead_letter needs topic and bootstrap_servers"):
+        make_sink({"type": "stdout", "dead_letter": {"topic": "dlq"}})
+
+
+def test_webhook_failure_names_the_event_and_what_is_left(receiver):
+    receiver["statuses"] = [200, 400]
+    with pytest.raises(DeliveryError) as e:
+        sink(receiver["url"]).send([event(1), event(2), event(3)])
+    assert [ev.record_id for ev, _ in e.value.failed] == [2]
+    assert "HTTP 400" in e.value.failed[0][1]
+    assert [ev.record_id for ev in e.value.remaining] == [3]
+
+
+class FakeSink:
+    """Fails the events whose record id is in ``reject`` (one at a time, like
+    the webhook sink), or everything if ``down``."""
+
+    def __init__(self, reject=(), down=False):
+        self.reject, self.down, self.delivered = set(reject), down, []
+
+    def send(self, events):
+        if self.down:
+            raise DeliveryError("unreachable")
+        for i, ev in enumerate(events):
+            if ev.record_id in self.reject:
+                raise DeliveryError("rejected", failed=[(ev, f"HTTP 400 for {ev.record_id}")], remaining=events[i + 1:])
+            self.delivered.append(ev.record_id)
+
+    def close(self):
+        pass
+
+
+class FakeQueue:
+    def __init__(self, fail=False):
+        self.records, self.fail = [], fail
+
+    def deliver(self, records):
+        self.records.extend(records)
+        return ["broker error" if self.fail else None for _ in records]
+
+    def close(self):
+        pass
+
+
+def test_dead_letter_takes_failed_events_and_continues():
+    inner, queue = FakeSink(reject={2, 4}), FakeQueue()
+    DeadLetterSink(inner, "webhook x", "dlq", "unused", queue=queue).send([event(n) for n in range(1, 6)])
+    assert inner.delivered == [1, 3, 5]
+    letters = [json.loads(value) for _, value, _ in queue.records]
+    assert [(d["event"]["record_id"], d["error"], d["sink"]) for d in letters] == [
+        (2, "HTTP 400 for 2", "webhook x"), (4, "HTTP 400 for 4", "webhook x")]
+
+
+def test_dead_letter_still_blocks_when_no_event_is_at_fault():
+    with pytest.raises(DeliveryError, match="unreachable"):
+        DeadLetterSink(FakeSink(down=True), "kafka", "dlq", "unused", queue=FakeQueue()).send([event(1)])
+
+
+def test_dead_letter_blocks_if_the_dead_letter_topic_fails():
+    with pytest.raises(DeliveryError, match="could not write to dead-letter topic dlq"):
+        DeadLetterSink(FakeSink(reject={1}), "webhook x", "dlq", "unused", queue=FakeQueue(fail=True)).send([event(1)])

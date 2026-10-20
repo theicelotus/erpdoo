@@ -5,7 +5,7 @@ exponential backoff. Other 4xx responses mean the receiver rejects the
 event, so they fail at once. When an event cannot be delivered, send()
 raises and erpdoo stops without confirming it; after a restart the event
 is sent again, so a receiver that keeps failing holds up the stream rather
-than losing events.
+than losing events, unless the sink has a dead-letter topic.
 """
 
 from __future__ import annotations
@@ -48,8 +48,12 @@ class WebhookSink:
         self.sleep = sleep
 
     def send(self, events: list[Event]) -> None:
-        for event in events:
-            self._post(event)
+        for i, event in enumerate(events):
+            try:
+                self._post(event)
+            except DeliveryError as e:
+                # Events before this one were delivered; the rest were not tried.
+                raise DeliveryError(str(e), failed=[(event, str(e))], remaining=events[i + 1:]) from e
 
     def _post(self, event: Event) -> None:
         body = json.dumps(event.payload).encode()
