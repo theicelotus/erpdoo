@@ -1,5 +1,7 @@
 # erpdoo
 
+[![CI](https://github.com/theicelotus/erpdoo/actions/workflows/ci.yml/badge.svg)](https://github.com/theicelotus/erpdoo/actions/workflows/ci.yml)
+
 Turn Odoo's raw database changes into clean business events (`SaleOrderConfirmed`,
 `InvoicePaid`, ...) and stream them to Kafka and other sinks, with nothing
 installed inside Odoo.
@@ -14,7 +16,8 @@ Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ 
 > **Status: early development.** Events are defined by YAML rules, and six
 > ship with erpdoo (below). Related records (partner, order lines, product
 > names) come from a local SQLite copy kept current from the stream. Events
-> go to Kafka, a webhook or stdout.
+> go to Kafka, a webhook or stdout, and a live page shows them next to the
+> database changes they came from.
 
 ## Try it
 
@@ -31,7 +34,8 @@ Open Odoo at http://localhost:8069 (login `admin`, password `admin`), go to
 **Sales**, open a quotation and click **Confirm**. The event appears in the
 erpdoo log and in Redpanda Console at http://localhost:8080 (topic `erpdoo.events`).
 Posting a customer invoice gives an `InvoicePosted` event the same way.
-This is a real event from the dev stack:
+The live viewer at http://localhost:8000 shows each transaction's raw changes
+next to the events built from it. This is a real event from the dev stack:
 
 ```json
 {
@@ -98,7 +102,7 @@ Numeric values are strings (`"1500.00"`) so no precision is lost.
 
 To check the whole path from a script (drives every shipped event through
 Odoo's API and checks each against Odoo's data, plus actions that must not
-produce an event):
+produce an event; CI runs it on every push):
 
 ```sh
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'
@@ -118,9 +122,9 @@ The packs in [rules/](rules/) cover:
 | `DeliveryDone` | `stock.picking` | an outgoing delivery is validated |
 | `LeadWon` | `crm.lead` | an opportunity is marked won |
 
-Each pack is plain YAML. A rule for an app you don't have installed stops
-erpdoo at startup with a message saying so: delete that file (for example
-`rules/crm.yml` without CRM).
+Each pack is plain YAML. A rule for an app that isn't installed is skipped
+with a warning, and starts working as soon as the app is installed, without
+a restart.
 
 ## Sinks
 
@@ -150,8 +154,35 @@ sinks:
   up to 60 s; `Retry-After` is honoured); any other 4xx counts as a rejection.
 - **stdout**: one JSON event per line, for debugging (`docker compose logs erpdoo`).
 
+By default an event a sink cannot deliver stops erpdoo, so nothing is lost
+(see the trade-offs). To keep going instead, give the sink a dead-letter topic:
+
+```yaml
+  - type: webhook
+    url: https://example.com/hooks/erpdoo
+    dead_letter:
+      topic: erpdoo.dead-letter
+      bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
+```
+
+An event the sink rejects, or that still fails after the retries, is then
+written to that topic as `{"event": ..., "error": ..., "sink": ...,
+"failed_at": ...}` and the stream continues. A sink failure that is not
+about one event, such as an unreachable Kafka broker, still stops erpdoo,
+and so does a failure to write the dead-letter topic.
+
 Without a config file, events go to Kafka as set by `ERPDOO_KAFKA_BOOTSTRAP`
 and `ERPDOO_TOPIC`.
+
+## Live viewer
+
+With `viewer:` in [erpdoo.yml](erpdoo.yml) (on in the dev stack), erpdoo
+serves a page at http://localhost:8000 that shows each transaction as it is
+delivered: its inserts, updates (with the fields that changed, old and new)
+and deletes on one side, and the events built from it on the other. It
+needs the `viewer` extra (`pip install 'erpdoo[viewer]'`, included in the
+Docker image). It has no login and shows business data, so keep it on
+localhost or a private network.
 
 ## Writing rules
 
@@ -213,11 +244,15 @@ problem, such as an unknown field. The full reference is at the top of
   every sink has delivered the events. If it crashes in between, or one sink
   fails after another succeeded, the events are sent again after a restart,
   with the same `event_id`. Consumers should dedupe on it.
-- **A sink that keeps failing stops the stream.** erpdoo never skips an
-  event: when a webhook rejects one (a 4xx) or stays unreachable past its
-  retries, erpdoo exits without confirming it and tries again after a
-  restart. Nothing is lost, but nothing newer gets through until the
-  receiver accepts it.
+- **A sink that keeps failing stops the stream,** unless it has a
+  dead-letter topic. By default erpdoo never skips an event: when a webhook
+  rejects one (a 4xx) or stays unreachable past its retries, erpdoo exits
+  without confirming it and tries again after a restart. Nothing is lost,
+  but nothing newer gets through until the receiver accepts it. With a
+  dead-letter topic, failed events wait there for you instead.
+- **erpdoo does not undo `REPLICA IDENTITY FULL`.** When a rule is removed,
+  its table keeps the setting; reset it with
+  `ALTER TABLE <table> REPLICA IDENTITY DEFAULT` if you want the smaller WAL back.
 - **Table names are inferred.** Odoo does not store a model's table name in
   the database, so erpdoo uses Odoo's naming rule (`sale.order` →
   `sale_order`) plus the core models known to differ (`ir.actions.*`). A
