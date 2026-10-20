@@ -70,6 +70,7 @@ def test_tracked_tables_follow_includes_and_related_fields():
     rule = parse_rule("R", {"model": "sale.order", "include": {
         "partner_id": ["name"], "order_line": ["name"], "order_line.product_id": ["name"]}})
     assert tracked_tables([rule], fake_odoo.registry()) == {
+        "sale_order": set(),  # the rule's own table, for each change's previous row
         "res_partner": set(), "sale_order_line": {"order_id"},
         "product_product": set(), "product_template": set(),  # product name is product_tmpl_id.name
     }
@@ -80,11 +81,20 @@ def test_conditions_on_related_paths():
     rule = parse_rule("R", {"model": "sale.order.line", "when": {"product_id.name": "Office Chair"}})
     validate([rule], registry)
     # product_id.name follows product_id, then the related product_tmpl_id.name.
-    assert tracked_tables([rule], registry) == {"product_product": set(), "product_template": set()}
+    assert tracked_tables([rule], registry) == {
+        "sale_order_line": set(), "product_product": set(), "product_template": set()}
     with pytest.raises(RuleError, match="supports only a plain value"):
         validate([parse_rule("R", {"model": "sale.order.line", "when": {"product_id.name": {"to": "x"}}})], registry)
     with pytest.raises(RuleError, match="not a stored many2one"):
         validate([parse_rule("R", {"model": "sale.order.line", "when": {"name.x": "y"}})], registry)
+
+
+def test_rule_table_without_id_is_not_tracked():
+    from erpdoo.models import ModelRegistry
+
+    registry = ModelRegistry.from_rows(
+        ["x.log"], [("x.log", "name", "char", None, None, None, None, None, True, None, False)], {"x_log": {"name"}})
+    assert tracked_tables([parse_rule("R", {"model": "x.log"})], registry) == {}
 
 
 def test_split_by_model_sets_aside_rules_for_missing_apps():

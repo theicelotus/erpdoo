@@ -30,14 +30,14 @@ MAX_VALUES = 8  # fields shown for an inserted row
 NOISE = {"create_uid", "create_date", "write_uid", "write_date"}
 
 
-def describe_change(change: Change, previous: dict | None = None) -> dict:
+def describe_change(change: Change) -> dict:
     """A change for display. For updates, the fields that changed; the old
-    values come from the change itself (REPLICA IDENTITY FULL tables) or from
-    ``previous``, the row the state store held before the change."""
+    values come from Postgres or, for tables in the state store, from the
+    store (StateStore.apply_transaction)."""
     row = change.new or change.old or {}
     item = {"op": change.op, "table": change.table, "model": change.model, "id": row.get("id")}
     if change.op == "update":
-        before = change.old if change.old is not None and not change.old_is_key_only else previous
+        before = change.old if change.old is not None and not change.old_is_key_only else None
         item["changed"] = None if before is None else {
             k: [before.get(k), v] for k, v in change.new.items() if k not in NOISE and before.get(k) != v
         }
@@ -51,8 +51,8 @@ def describe_change(change: Change, previous: dict | None = None) -> dict:
     return item
 
 
-def describe(txn: Transaction, events: list[Event], previous: list[dict | None]) -> dict:
-    changes = [describe_change(c, p) for c, p in zip(txn.changes[:MAX_CHANGES], previous)]
+def describe(txn: Transaction, events: list[Event]) -> dict:
+    changes = [describe_change(c) for c in txn.changes[:MAX_CHANGES]]
     # Link the field changes that made a rule fire to the event they produced:
     # the event's transition fields, on the event's record.
     for event in events:

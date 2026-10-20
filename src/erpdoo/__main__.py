@@ -32,6 +32,7 @@ log = logging.getLogger("erpdoo")
 
 MODEL_TABLES = ("ir_model", "ir_model_fields")
 RECHECK_SECONDS = 30
+CONFIRM_SECONDS = 10  # at most this long between confirmations sent to Postgres
 
 
 def main() -> None:
@@ -74,18 +75,24 @@ def run() -> None:
     store = StateStore(state_path)
 
     def activate(registry: ModelRegistry) -> tuple[EventBuilder, list[Rule]]:
-        """Publish and track what the rules of installed apps need. Rule
-        models get REPLICA IDENTITY FULL so Postgres sends the row before each
-        update, which is how a rule sees the value a field is leaving.
+        """Publish and track what the rules of installed apps need. The
+        rules' own tables are kept in the state store, which gives each
+        update and delete the row it replaces, so a rule sees the value a
+        field is leaving. Only a rule table whose rows the store cannot keep
+        needs REPLICA IDENTITY FULL, so that Postgres sends that row instead.
         ir_model and ir_model_fields are streamed so the registry follows
         module installs."""
         active, skipped = split_by_model(rules, registry)
         validate(active, registry)
         tracked = tracked_tables(active, registry)
-        rule_tables = sorted({registry.models[r.model].table for r in active})
+        rule_tables = {registry.models[r.model].table for r in active}
+        full = sorted(rule_tables - tracked.keys())
+        for table in full:
+            log.info("%s has no id column, so the state store cannot keep its rows; its rules need"
+                     " REPLICA IDENTITY FULL instead", table)
         slot_created = reader.setup(
-            tables=sorted(set(rule_tables) | tracked.keys() | set(MODEL_TABLES)),
-            replica_identity_full=rule_tables,
+            tables=sorted(rule_tables | tracked.keys() | set(MODEL_TABLES)),
+            replica_identity_full=full,
         )
         if slot_created:
             # A new slot starts now: changes since the store was last updated are lost.
@@ -112,12 +119,13 @@ def run() -> None:
     viewer = None
     if config.get("viewer") is not None:
         try:
-            from erpdoo.viewer import MAX_CHANGES, Viewer, describe
+            from erpdoo.viewer import Viewer, describe
         except ImportError:
             raise ConfigError("the viewer needs FastAPI and uvicorn: pip install 'erpdoo[viewer]'") from None
         viewer = Viewer(**config["viewer"])
         viewer.start()
 
+    confirmed_at = time.monotonic()
     recheck_at: float | None = None  # when to retry activating rules that did not fit
     last_error: str | None = None
     reader.start()
@@ -128,17 +136,12 @@ def run() -> None:
             events = []
             shown = []
             for txn in batch.transactions:
-                previous = []  # for the viewer: each updated row as the store had it
-                for i, change in enumerate(txn.changes):
-                    if viewer and i < MAX_CHANGES:
-                        previous.append(store.get(change.table, change.new["id"])
-                                        if change.op == "update" and change.old is None
-                                        and change.table in store.tables else None)
-                    store.apply(change)
-                txn_events = builder.build(txn)
+                # Also gives updates and deletes their previous row.
+                replay = store.apply_transaction(txn)
+                txn_events = builder.build(txn, replay)
                 events.extend(txn_events)
                 if viewer:
-                    shown.append(describe(txn, txn_events, previous))
+                    shown.append(describe(txn, txn_events))
             store.commit()
             # Every sink must deliver before the slot is confirmed. If one
             # fails, erpdoo stops; after a restart all sinks get the events again.
@@ -149,8 +152,14 @@ def run() -> None:
                 viewer.publish(item)
             if batch.ack_lsn is not None:
                 # After a delivery, confirm right away so a crash does not
-                # resend it. Idle progress can wait for the status interval.
-                reader.ack(batch.ack_lsn, now=bool(events))
+                # resend it. Other progress is confirmed every few seconds;
+                # the store then drops the row versions kept for replays.
+                now = bool(events) or time.monotonic() - confirmed_at >= CONFIRM_SECONDS
+                reader.ack(batch.ack_lsn, now=now)
+                if now:
+                    confirmed_at = time.monotonic()
+                    store.prune(batch.ack_lsn)
+                    store.commit()
             models_changed = any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes)
             if models_changed:
                 registry = ModelRegistry.load(dsn)

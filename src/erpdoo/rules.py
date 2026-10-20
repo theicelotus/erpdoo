@@ -303,7 +303,10 @@ def _include_target(registry: ModelRegistry, model: str, name: str) -> str:
 
 def tracked_tables(rules: list[Rule], registry: ModelRegistry) -> dict[str, set[str]]:
     """Tables the state store must copy for these rules, each with the columns
-    to index for one2many lookups."""
+    to index for one2many lookups: the rules' own tables, which give each
+    change its previous row, and the tables of the records they include or
+    read. The store keeps rows by id, so a rule table without an id column
+    is left out."""
     tables: dict[str, set[str]] = {}
 
     def need_fields(model: str, names) -> None:
@@ -322,6 +325,9 @@ def tracked_tables(rules: list[Rule], registry: ModelRegistry) -> dict[str, set[
             walk(target.name, inc.children)
 
     for rule in rules:
+        model = registry.models[rule.model]
+        if "id" in model.fields and model.fields["id"].column:
+            tables.setdefault(model.table, set())
         need_fields(rule.model, rule.fields)
         need_fields(rule.model, [c.field for c in rule.conditions])
         walk(rule.model, rule.includes)

@@ -17,9 +17,8 @@ def test_update_shows_changed_fields_from_old_row():
     assert describe_change(c)["changed"] == {"state": ["draft", "sale"]}
 
 
-def test_update_uses_previous_store_row_when_old_row_is_missing():
+def test_update_without_old_row_shows_no_changes():
     c = Change("update", "res_partner", "res.partner", None, False, {"id": 10, "name": "New"})
-    assert describe_change(c, {"id": 10, "name": "Old"})["changed"] == {"name": ["Old", "New"]}
     assert describe_change(c)["changed"] is None
 
 
@@ -37,7 +36,7 @@ def test_page_and_recent_items():
     event = Event("id-1", "LeadWon", "crm.lead", 3, {"event_type": "LeadWon", "record_id": 3})
     with TestClient(viewer.app) as client:
         assert "erpdoo live" in client.get("/").text
-        viewer.publish(describe(txn, [event], [None]))
+        viewer.publish(describe(txn, [event]))
         for _ in range(50):
             items = client.get("/recent").json()
             if items:
@@ -58,7 +57,7 @@ def test_field_changes_that_fired_a_rule_link_to_the_event():
     ])
     event = Event("ev-1", "SaleOrderConfirmed", "sale.order", 5,
                   {"event_id": "ev-1", "changes": {"state": {"from": "draft", "to": "sale"}}})
-    item = describe(txn, [event], [None, None, None])
+    item = describe(txn, [event])
     order, internal, line = item["changes"]
     assert order["fires"] == {"state": ["ev-1"]}  # note changed too, but did not fire anything
     assert internal["internal"] and "fires" not in internal

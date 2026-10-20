@@ -31,8 +31,10 @@ class Change:
     op: str  # "insert" | "update" | "delete" | "truncate"
     table: str
     model: str | None  # Odoo model name, if the table belongs to one
-    # Row before the change. For updates it is None unless the table has
-    # REPLICA IDENTITY FULL (or the key changed, then it holds only key columns).
+    # Row before the change. As streamed, for updates it is None unless the
+    # table has REPLICA IDENTITY FULL (or the key changed, then it holds only
+    # key columns), and for deletes it holds only the key. For tables in the
+    # state store, StateStore.apply_transaction fills in the whole row.
     old: dict[str, object] | None
     old_is_key_only: bool
     # Row after the change. Unchanged TOASTed columns are left out.

@@ -43,8 +43,8 @@ def net_changes(txn: Transaction, model: str) -> dict[int, tuple[dict | None, di
     """Per record id of ``model``, the row at the start and at the end of the transaction.
 
     before is {} if the record was created in this transaction, and None if it
-    is unknown (an update without REPLICA IDENTITY FULL). after is None if the
-    record was deleted.
+    is unknown (neither Postgres nor the state store had it). after is None if
+    the record was deleted.
     """
     result: dict[int, tuple[dict | None, dict | None]] = {}
     for change in txn.changes:
@@ -78,10 +78,13 @@ class EventBuilder:
         self.store = store
         self.lang = lang
         self._hops: dict[tuple[str, str], list] = {}
+        self._before_copy_logged: set[str] = set()
 
-    def build(self, txn: Transaction) -> list[Event]:
+    def build(self, txn: Transaction, replay: bool = False) -> list[Event]:
         """Events for one transaction. Apply the transaction to the store
-        first, so related records are as of its commit."""
+        first (StateStore.apply_transaction), so related records are as of
+        its commit and updates and deletes carry their previous row;
+        ``replay`` is what that returned."""
         events = []
         changes_by_model: dict[str, dict] = {}
         for rule in self.rules:
@@ -89,7 +92,7 @@ class EventBuilder:
                 changes_by_model[rule.model] = net_changes(txn, rule.model)
             for record_id, (before, after) in changes_by_model[rule.model].items():
                 if before is None:
-                    log.warning("%s %s: row before the change unknown, needs REPLICA IDENTITY FULL", rule.model, record_id)
+                    self._previous_unknown(rule.model, record_id, txn, replay)
                     continue
                 if not rule.matches(before, self._with_related(rule, after)):
                     continue
@@ -114,6 +117,21 @@ class EventBuilder:
                 }
                 events.append(Event(eid, rule.name, rule.model, record_id, payload))
         return events
+
+    def _previous_unknown(self, model: str, record_id: int, txn: Transaction, replay: bool) -> None:
+        """Say why a record's rules were not checked."""
+        table = self.registry.models[model].table
+        if replay:
+            # Versions are dropped once the slot is confirmed past them.
+            log.debug("%s %s: already delivered in transaction %s, not sent again", model, record_id, txn.xid)
+        elif txn.commit_lsn < self.store.loaded.get(table, 0):
+            if table not in self._before_copy_logged:
+                self._before_copy_logged.add(table)
+                log.info("%s: changes committed before the state store copied the table are not checked"
+                         " against rules", table)
+        else:
+            log.warning("%s %s: its previous row is neither in the state store nor sent by Postgres,"
+                        " so its rules are not checked", model, record_id)
 
     def _with_related(self, rule: Rule, row: dict | None) -> dict | None:
         """The row plus the values of conditions on related fields or paths."""

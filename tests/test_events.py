@@ -94,3 +94,33 @@ def test_condition_on_related_value_reads_the_store():
     assert [e.event_type for e in builder(rules=[line_rule]).build(txn(insert))] == ["ChairLineAdded"]
     other = Change("insert", "sale_order_line", "sale.order.line", None, False, {**line, "product_id": 8})
     assert builder(rules=[line_rule]).build(txn(other)) == []
+
+
+def test_previous_row_from_the_store_without_replica_identity_full():
+    b = builder()
+    b.store.load("sale_order", [order()], lsn=0x100)
+    t = txn(update(None, order(state="sale")))  # Postgres sends no old row
+    replay = b.store.apply_transaction(t)
+    [event] = b.build(t, replay)
+    assert event.payload["changes"] == {"state": {"from": "draft", "to": "sale"}}
+
+
+def test_delete_rule_gets_the_deleted_row_from_the_store():
+    deleted = parse_rule("SaleOrderDeleted", {"model": "sale.order", "on": "delete", "fields": ["name"]})
+    b = builder(rules=[deleted])
+    b.store.load("sale_order", [order()], lsn=0x100)
+    t = txn(Change("delete", "sale_order", "sale.order", {"id": 5}, True, None))  # only the key
+    [event] = b.build(t, b.store.apply_transaction(t))
+    assert event.payload["record"] == {"id": 5, "name": "S00005"}
+
+
+def test_replay_after_a_crash_fires_again_with_the_same_id():
+    b = builder()
+    b.store.load("sale_order", [order()], lsn=0x100)
+    t = txn(update(None, order(state="sale")))
+    [first] = b.build(t, b.store.apply_transaction(t))
+    b.store.commit()  # delivered, then a crash before the slot is confirmed
+    again = txn(update(None, order(state="sale")))
+    [second] = b.build(again, b.store.apply_transaction(again))
+    assert second.event_id == first.event_id
+    assert second.payload["changes"] == first.payload["changes"]
