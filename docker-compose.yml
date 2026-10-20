@@ -36,11 +36,12 @@ services:
       timeout: 3s
       retries: 30
 
-  # Creates the "odoo" database with the Sales app and demo data, then exits.
-  # On later runs the module is already installed and this finishes quickly.
+  # Creates the "odoo" database with demo data and the apps the shipped
+  # event packs use (Sales, Inventory, CRM), then exits. On later runs the
+  # modules are already installed and this finishes quickly.
   odoo-init:
     image: odoo:18.0
-    command: ["odoo", "-d", "odoo", "-i", "sale_management", "--stop-after-init", "--no-http"]
+    command: ["odoo", "-d", "odoo", "-i", "sale_management,sale_stock,crm", "--stop-after-init", "--no-http"]
     environment: &odoo-db
       HOST: postgres
       USER: odoo
