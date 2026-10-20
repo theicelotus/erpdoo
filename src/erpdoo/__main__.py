@@ -17,15 +17,15 @@ import time
 import psycopg2
 from confluent_kafka import KafkaException
 
-from erpdoo.backoff import Stopped, Unreachable, retry
+from erpdoo.backoff import Stopped, Unreachable, reason, retry
 from erpdoo.config import ConfigError, load_config
 from erpdoo.events import EventBuilder
 from erpdoo.models import ModelRegistry
-from erpdoo.replication import PublicationError, ReplicationReader
+from erpdoo.replication import PublicationError, ReplicationReader, StreamError
 from erpdoo.rules import (
     Rule, RuleError, load_rules, missing_model_message, split_by_model, tracked_tables, validate,
 )
-from erpdoo.sinks import make_sink
+from erpdoo.sinks import DeliveryError, make_sink
 from erpdoo.store import StateStore
 
 log = logging.getLogger("erpdoo")
@@ -47,6 +47,11 @@ def main() -> None:
         sys.exit(2)
     except Stopped:
         log.info("stopped")
+    except (DeliveryError, StreamError, psycopg2.OperationalError) as e:
+        # Nothing undelivered was confirmed: after a restart, which waits for
+        # Postgres and Kafka to be back, the events are sent again.
+        log.error("%s; stopping, unconfirmed events are sent again after a restart", reason(e))
+        sys.exit(1)
 
 
 def run() -> None:

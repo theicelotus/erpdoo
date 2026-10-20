@@ -21,6 +21,7 @@ import psycopg2
 import psycopg2.extras
 
 from erpdoo import pgoutput
+from erpdoo.backoff import reason
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +107,10 @@ class TransactionAssembler:
 
 class PublicationError(Exception):
     pass
+
+
+class StreamError(Exception):
+    """The replication stream broke, e.g. Postgres restarted."""
 
 
 @dataclass(frozen=True)
@@ -329,7 +334,11 @@ class ReplicationReader:
         deadline = time.monotonic() + timeout
         # Never stop in the middle of a transaction just because of max_changes.
         while changes < max_changes or self.assembler.in_transaction:
-            msg = self.cur.read_message()
+            try:
+                msg = self.cur.read_message()
+            except psycopg2.DatabaseError as e:
+                # A server that goes away mid-stream shows as "no COPY in progress".
+                raise StreamError(f"lost the replication stream from Postgres ({reason(e)})") from e
             if msg is None:
                 if transactions:
                     break
@@ -365,6 +374,8 @@ class ReplicationReader:
             # Send the last acknowledged position now, so a clean stop does
             # not redeliver events.
             self.cur.send_feedback(force=True)
+        except psycopg2.DatabaseError:
+            pass  # the stream is gone; the slot keeps the last position it got
         finally:
             self.conn.close()
             self.conn = self.cur = None
