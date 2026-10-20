@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e '.[dev,viewer]'
+      - run: pytest -q
+
+  smoke:
+    name: Full stack smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      # Odoo 18 with demo data, Postgres 16, Redpanda and erpdoo. Returns once
+      # Odoo's database is installed and the other services are started.
+      - name: Start the stack
+        run: docker compose up -d --build
+      - run: pip install -e .
+      # Waits for Odoo and erpdoo, then drives every shipped event through Odoo.
+      - name: Smoke test
+        run: python scripts/smoke_test.py
+      - name: Show logs
+        if: failure()
+        run: docker compose logs --no-color --tail=300
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
