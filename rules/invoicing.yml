@@ -16,3 +16,16 @@ InvoicePosted:
       fields: [name, quantity, price_unit, discount, price_subtotal, price_total]
       where: { display_type: product }
     invoice_line_ids.product_id: [name, default_code]
+
+InvoicePaid:
+  model: account.move
+  when:
+    move_type: out_invoice
+    # Fires once when the invoice is fully paid. Companies that book
+    # payments on outstanding accounts go through in_payment (paid, waiting
+    # for bank reconciliation) before paid; in_payment -> paid does not fire again.
+    payment_state: { from: [not_paid, partial], to: [in_payment, paid] }
+  fields: [name, state, invoice_date, invoice_origin, payment_reference, currency_id,
+           amount_total, amount_residual, payment_state, company_id]
+  include:
+    partner_id: [name, email, vat]
