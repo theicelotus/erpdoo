@@ -235,7 +235,10 @@ def validate(rules: list[Rule], registry: ModelRegistry) -> None:
 
 def _validate(rule: Rule, registry: ModelRegistry) -> None:
     if rule.model not in registry.models:
-        raise RuleError(f"unknown model {rule.model} (or it has no table)")
+        raise RuleError(
+            f"unknown model {rule.model} (or it has no table). Is its Odoo app installed?"
+            " Remove the rule or its file if you do not use that app."
+        )
     model = registry.models[rule.model]
     for c in rule.conditions:
         if c.field in model.fields and model.fields[c.field].column:

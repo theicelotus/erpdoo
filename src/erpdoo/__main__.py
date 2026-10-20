@@ -10,12 +10,13 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import sys
 
-from erpdoo.config import load_config
+from erpdoo.config import ConfigError, load_config
 from erpdoo.events import EventBuilder
 from erpdoo.models import ModelRegistry
-from erpdoo.replication import ReplicationReader
-from erpdoo.rules import load_rules, tracked_tables, validate
+from erpdoo.replication import PublicationError, ReplicationReader
+from erpdoo.rules import RuleError, load_rules, tracked_tables, validate
 from erpdoo.sinks import make_sink
 from erpdoo.store import StateStore
 
@@ -29,6 +30,15 @@ def main() -> None:
         level=os.environ.get("ERPDOO_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    try:
+        run()
+    except (ConfigError, RuleError, PublicationError) as e:
+        # Mistakes in the setup: say what is wrong, without a traceback.
+        log.error("%s", e)
+        sys.exit(2)
+
+
+def run() -> None:
     dsn = os.environ.get("ERPDOO_PG_DSN", "host=localhost dbname=odoo user=erpdoo password=erpdoo")
     slot = os.environ.get("ERPDOO_SLOT", "erpdoo")
     publication = os.environ.get("ERPDOO_PUBLICATION", "erpdoo")

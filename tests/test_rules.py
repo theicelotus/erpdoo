@@ -47,7 +47,7 @@ def test_includes_accept_list_and_mapping_forms():
 
 
 @pytest.mark.parametrize("spec, message", [
-    ({"model": "no.such"}, "unknown model no.such"),
+    ({"model": "no.such"}, "unknown model no.such .* Is its Odoo app installed"),
     ({"model": "sale.order", "when": {"tax_country_id": 1}}, "tax_country_id is not stored"),
     ({"model": "sale.order", "fields": ["nope"]}, "has no field nope"),
     ({"model": "sale.order", "include": ["tag_ids"]}, "many2many includes are not supported"),
