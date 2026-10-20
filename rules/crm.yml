@@ -1,0 +1,14 @@
+# CRM events (needs the CRM app). See src/erpdoo/rules.py for the rule format.
+
+LeadWon:
+  model: crm.lead
+  when:
+    # Odoo marks an opportunity won by setting its probability to 100
+    # ("Won" button or a won stage); a lost one is archived (active false).
+    probability: { to: 100 }
+    type: opportunity
+    active: true
+  fields: [name, type, probability, expected_revenue, date_closed, user_id, team_id, company_id]
+  include:
+    partner_id: [name, email, phone]
+    stage_id: [name]
