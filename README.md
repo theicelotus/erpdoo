@@ -23,7 +23,9 @@ Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ 
 
 Requires Docker with Compose v2. The first start downloads about 2 GB of
 images, then installs Odoo's Sales, Inventory and CRM apps with demo data
-(about a minute).
+(about a minute). A one-shot `db-setup` container then prepares Postgres
+the way a database admin would (see [Setting up Postgres](#setting-up-postgres)),
+so erpdoo runs with a role that can stream and read but not write.
 
 ```sh
 docker compose up -d --build
@@ -102,7 +104,8 @@ Numeric values are strings (`"1500.00"`) so no precision is lost.
 
 To check the whole path from a script (drives every shipped event through
 Odoo's API and checks each against Odoo's data, plus actions that must not
-produce an event; CI runs it on every push):
+produce an event, and checks that erpdoo's role cannot write to Odoo's
+tables; CI runs it on every push):
 
 ```sh
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'
@@ -123,8 +126,10 @@ The packs in [rules/](rules/) cover:
 | `LeadWon` | `crm.lead` | an opportunity is marked won |
 
 Each pack is plain YAML. A rule for an app that isn't installed is skipped
-with a warning, and starts working as soon as the app is installed, without
-a restart.
+with a warning, and starts working once the app is installed, without a
+restart: right away if erpdoo's role may publish the app's tables, otherwise
+once an admin has run the SQL erpdoo logs (see
+[Setting up Postgres](#setting-up-postgres)).
 
 ## Sinks
 
@@ -219,6 +224,81 @@ erpdoo checks rules against Odoo's models at startup and lists every
 problem, such as an unknown field. The full reference is at the top of
 [src/erpdoo/rules.py](src/erpdoo/rules.py).
 
+## Setting up Postgres
+
+erpdoo only needs a role with `REPLICATION`, `CONNECT` on Odoo's database
+and `SELECT` on the tables it streams. It never writes to Odoo's tables.
+An admin (a superuser, or the role that owns Odoo's tables) prepares the
+rest once. Postgres must run with `wal_level=logical` (a restart), with a
+replication slot and a WAL sender to spare (`max_replication_slots`,
+`max_wal_senders`). If erpdoo connects from another host, `pg_hba.conf`
+needs an ordinary entry for Odoo's database; logical replication does not
+use the `replication` entries.
+
+For the shipped rules, run this in Odoo's database (named `odoo` here):
+
+```sql
+CREATE ROLE erpdoo WITH LOGIN REPLICATION PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE odoo TO erpdoo;
+
+-- Tables with rules: Postgres sends the whole previous row with each
+-- update, so a rule sees the value a field is leaving.
+ALTER TABLE account_move REPLICA IDENTITY FULL;
+ALTER TABLE crm_lead REPLICA IDENTITY FULL;
+ALTER TABLE sale_order REPLICA IDENTITY FULL;
+ALTER TABLE stock_picking REPLICA IDENTITY FULL;
+
+-- The rules' tables, the related records they include, and ir_model /
+-- ir_model_fields, which tell erpdoo when an Odoo app is installed.
+CREATE PUBLICATION erpdoo FOR TABLE
+  account_move, account_move_line, crm_lead, crm_stage, ir_model, ir_model_fields,
+  product_product, product_template, res_partner, sale_order, sale_order_line,
+  stock_move, stock_picking, stock_picking_type;
+
+GRANT SELECT ON
+  account_move, account_move_line, crm_lead, crm_stage, ir_model, ir_model_fields,
+  product_product, product_template, res_partner, sale_order, sale_order_line,
+  stock_move, stock_picking, stock_picking_type
+  TO erpdoo;
+```
+
+erpdoo creates its replication slot itself, which `REPLICATION` allows. The
+publication and slot names are set with `ERPDOO_PUBLICATION` and
+`ERPDOO_SLOT` (both `erpdoo` by default). The dev stack runs the same steps
+from [docker/postgres/setup-erpdoo.sql](docker/postgres/setup-erpdoo.sql).
+
+With your own rules the list of tables differs, and you don't have to work
+it out: erpdoo checks the publication at startup and, if anything is
+missing, stops with a list and the SQL that fixes it:
+
+```
+ERROR erpdoo: erpdoo needs these changes in Postgres, which its role erpdoo is not allowed to make:
+  need REPLICA IDENTITY FULL, so that updates carry the previous row: purchase_order
+  not in publication erpdoo: purchase_order, purchase_order_line
+  not readable by erpdoo: purchase_order, purchase_order_line
+Run this SQL as an admin (a superuser, or the owner of Odoo's tables and of the publication):
+
+  ALTER TABLE public.purchase_order REPLICA IDENTITY FULL;
+  ALTER PUBLICATION erpdoo ADD TABLE public.purchase_order, public.purchase_order_line;
+  GRANT SELECT ON public.purchase_order, public.purchase_order_line TO erpdoo;
+```
+
+When an Odoo app installed later activates a rule (Purchase, for the rule
+above), erpdoo logs the same message instead of stopping, keeps the other
+rules running, and checks again every 30 seconds; the new rule starts once
+an admin has run the SQL. erpdoo only adds to a publication it did not
+create, so tables an admin published for other uses stay.
+
+If erpdoo's role is allowed to make these changes, for example because it
+owns Odoo's tables, erpdoo makes them itself and no admin step is needed.
+
+One thing the grants above do not cover: when Odoo creates a database it
+runs `GRANT CREATE ON SCHEMA public TO PUBLIC`, so every role, erpdoo's
+included, can create new tables of its own in `public` (not change Odoo's).
+erpdoo never does. On Postgres 15 and later the database's owner also owns
+`public`, so if Odoo's role owns the database you can take this away from
+every other role with `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
+
 ## Performance
 
 Measured with [scripts/benchmark.py](scripts/benchmark.py) on the dev stack,
@@ -260,15 +340,21 @@ erpdoo container for the backlog phase.
 ## Trade-offs, honestly
 
 - **Needs replication access to Odoo's Postgres** (`wal_level=logical` and a
-  role with `REPLICATION`). Hosted Odoo platforms (Odoo Online, Odoo.sh)
-  usually don't give you this. A polling mode over Odoo's API is planned for
-  that case, with its own limits.
+  role with `REPLICATION`), and an admin to run a few statements once (see
+  [Setting up Postgres](#setting-up-postgres)). Hosted Odoo platforms
+  (Odoo Online, Odoo.sh) usually don't give you this. A polling mode over
+  Odoo's API is planned for that case, with its own limits.
 - **`REPLICA IDENTITY FULL` on each rule's table** (`sale_order`,
-  `account_move`, `stock_picking` and `crm_lead` with the shipped rules). erpdoo sets this so Postgres
-  includes the previous row in each update, which is how a rule sees the
-  value a field is leaving. It makes each update to those tables write more WAL.
-- **erpdoo adds tables to Odoo's publication** for its rules and their
-  related records, but first checks that each has a primary key or another
+  `account_move`, `stock_picking` and `crm_lead` with the shipped rules), so
+  Postgres includes the previous row in each update, which is how a rule
+  sees the value a field is leaving. It makes each update to those tables
+  write more WAL.
+- **A new app's rules wait for an admin.** With a read-only role, a rule for
+  an app installed later starts only after an admin runs the SQL erpdoo
+  logs (erpdoo checks every 30 seconds). Changes to the app's records before
+  that produce no events.
+- **Published tables need a replica identity.** Before publishing a table,
+  or asking an admin to, erpdoo checks that it has a primary key or another
   replica identity. Without one, Postgres would reject Odoo's updates and
   deletes on that table, so erpdoo refuses to start and names the table.
 - **The state store copies whole tables.** Each table a rule includes
@@ -288,9 +374,16 @@ erpdoo container for the backlog phase.
   without confirming it and tries again after a restart. Nothing is lost,
   but nothing newer gets through until the receiver accepts it. With a
   dead-letter topic, failed events wait there for you instead.
-- **erpdoo does not undo `REPLICA IDENTITY FULL`.** When a rule is removed,
-  its table keeps the setting; reset it with
-  `ALTER TABLE <table> REPLICA IDENTITY DEFAULT` if you want the smaller WAL back.
+- **Needs something to restart it.** When Postgres or a sink goes away while
+  erpdoo runs, it logs the cause and exits without confirming the
+  undelivered events, and relies on a supervisor (Docker's restart policy,
+  systemd) to start it again. At startup it waits for Postgres and Kafka,
+  retrying after 1 s and then twice as long each time, up to 30 s, so after
+  a reboot it starts cleanly in whatever order the services come up.
+- **erpdoo does not undo `REPLICA IDENTITY FULL`** or remove tables from a
+  publication it did not create. When a rule is removed, its table keeps
+  the setting; reset it with `ALTER TABLE <table> REPLICA IDENTITY DEFAULT`
+  if you want the smaller WAL back.
 - **Table names are inferred.** Odoo does not store a model's table name in
   the database, so erpdoo uses Odoo's naming rule (`sale.order` →
   `sale_order`) plus the core models known to differ (`ir.actions.*`). A
@@ -299,9 +392,6 @@ erpdoo container for the backlog phase.
 - **An unused replication slot keeps WAL.** If erpdoo is stopped for a long
   time, Postgres keeps the WAL it hasn't read yet and disk use grows. Drop the
   slot (`SELECT pg_drop_replication_slot('erpdoo')`) if you remove erpdoo.
-- **The dev stack's database role is broad.** Its `erpdoo` role inherits the
-  privileges of the `odoo` role so it can create its publication. A tighter
-  production setup is still to be documented.
 
 ## License
 
