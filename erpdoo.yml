@@ -1,0 +1,21 @@
+# erpdoo settings. Strings may read environment variables with ${VAR} or
+# ${VAR:-default}. Events go to every sink listed; the replication slot is
+# confirmed only after all of them have delivered.
+
+sinks:
+  - type: kafka
+    bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
+    topic: ${ERPDOO_TOPIC:-erpdoo.events}
+
+  # One JSON event per line on standard output (docker compose logs erpdoo).
+  - type: stdout
+
+  # POST each event as JSON. Retries network errors, 5xx, 408 and 429 with
+  # exponential backoff; other 4xx stop erpdoo without losing the event.
+  # - type: webhook
+  #   url: https://example.com/hooks/erpdoo
+  #   headers: { Authorization: "Bearer ${WEBHOOK_TOKEN}" }
+  #   secret: ${WEBHOOK_SECRET}   # adds X-Erpdoo-Signature: sha256=<HMAC of the body>
+  #   timeout: 10                 # seconds per request
+  #   retries: 5                  # after the first attempt
+  #   backoff: 1                  # seconds before the first retry, doubling up to 60

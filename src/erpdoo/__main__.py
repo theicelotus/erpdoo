@@ -1,21 +1,22 @@
 """Run erpdoo: read Odoo's changes from Postgres and publish events to Kafka.
 
-Event rules are YAML files (ERPDOO_RULES, a file or directory); connection
-settings come from environment variables for now.
+Event rules are YAML files (ERPDOO_RULES, a file or directory). Sinks are
+set in a YAML config file (ERPDOO_CONFIG, default erpdoo.yml); database and
+replication settings come from environment variables.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import signal
 
+from erpdoo.config import load_config
 from erpdoo.events import EventBuilder
-from erpdoo.kafka import KafkaSink
 from erpdoo.models import ModelRegistry
 from erpdoo.replication import ReplicationReader
 from erpdoo.rules import load_rules, tracked_tables, validate
+from erpdoo.sinks import make_sink
 from erpdoo.store import StateStore
 
 log = logging.getLogger("erpdoo")
@@ -29,13 +30,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     dsn = os.environ.get("ERPDOO_PG_DSN", "host=localhost dbname=odoo user=erpdoo password=erpdoo")
-    bootstrap = os.environ.get("ERPDOO_KAFKA_BOOTSTRAP", "127.0.0.1:19092")
-    topic = os.environ.get("ERPDOO_TOPIC", "erpdoo.events")
     slot = os.environ.get("ERPDOO_SLOT", "erpdoo")
     publication = os.environ.get("ERPDOO_PUBLICATION", "erpdoo")
     rules_path = os.environ.get("ERPDOO_RULES", "rules")
     state_path = os.environ.get("ERPDOO_STATE", "erpdoo-state.db")
     lang = os.environ.get("ERPDOO_LANG", "en_US")
+    config = load_config(os.environ.get("ERPDOO_CONFIG"))
 
     stopping = False
 
@@ -53,8 +53,7 @@ def main() -> None:
     log.info("loaded %d rules (%s) against %d Odoo models",
              len(rules), ", ".join(r.name for r in rules), len(registry.models))
 
-    sink = KafkaSink(bootstrap, topic)
-    sink.ensure_topic()
+    sinks = [make_sink(spec) for spec in config["sinks"]]
 
     # Rule models get REPLICA IDENTITY FULL so Postgres sends the row before
     # each update, which is how a rule sees the value a field is leaving.
@@ -74,7 +73,7 @@ def main() -> None:
     builder = EventBuilder(rules, registry, store, lang)
 
     reader.start()
-    log.info("streaming to %s topic %s", bootstrap, topic)
+    log.info("streaming to %s", ", ".join(spec["type"] for spec in config["sinks"]))
     try:
         while not stopping:
             batch = reader.poll(timeout=1.0)
@@ -84,10 +83,11 @@ def main() -> None:
                     store.apply(change)
                 events.extend(builder.build(txn))
             store.commit()
+            # Every sink must deliver before the slot is confirmed. If one
+            # fails, erpdoo stops; after a restart all sinks get the events again.
             if events:
-                sink.send(events)
-                for event in events:
-                    print(json.dumps(event.payload), flush=True)
+                for sink in sinks:
+                    sink.send(events)
             if batch.ack_lsn is not None:
                 # After a delivery, confirm right away so a crash does not
                 # resend it. Idle progress can wait for the status interval.
@@ -99,7 +99,8 @@ def main() -> None:
                 log.info("Odoo models changed, reloaded %d models", len(registry.models))
     finally:
         reader.close()
-        sink.close()
+        for sink in sinks:
+            sink.close()
     log.info("stopped")
 
 

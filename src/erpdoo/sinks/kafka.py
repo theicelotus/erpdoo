@@ -9,16 +9,15 @@ from confluent_kafka import KafkaError, KafkaException, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
 from erpdoo.events import Event
+from erpdoo.sinks import DeliveryError
 
 log = logging.getLogger(__name__)
 
 
-class DeliveryError(Exception):
-    pass
-
-
 class KafkaSink:
-    def __init__(self, bootstrap_servers: str, topic: str, flush_timeout: float = 30.0) -> None:
+    def __init__(
+        self, bootstrap_servers: str, topic: str, partitions: int = 3, flush_timeout: float = 30.0
+    ) -> None:
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
         self.flush_timeout = flush_timeout
@@ -28,6 +27,7 @@ class KafkaSink:
             "acks": "all",
             "linger.ms": 5,
         })
+        self.ensure_topic(partitions)
 
     def ensure_topic(self, partitions: int = 3) -> None:
         admin = AdminClient({"bootstrap.servers": self.bootstrap_servers})

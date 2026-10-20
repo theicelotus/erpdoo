@@ -41,17 +41,17 @@ class RuleError(Exception):
     pass
 
 
-class _Loader(yaml.SafeLoader):
+class YamlLoader(yaml.SafeLoader):
     """YAML 1.2 booleans only: PyYAML follows YAML 1.1, where on, off, yes and
     no are booleans. That would turn the key "on" into True and an Odoo
     selection value such as invoice_status "no" into False."""
 
 
-_Loader.yaml_implicit_resolvers = {
+YamlLoader.yaml_implicit_resolvers = {
     first: [(tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:bool"]
     for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
 }
-_Loader.add_implicit_resolver(
+YamlLoader.add_implicit_resolver(
     "tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
 )
 
@@ -129,7 +129,7 @@ def load_rules(path: str | Path) -> list[Rule]:
     files = sorted(p for p in path.iterdir() if p.suffix in (".yml", ".yaml")) if path.is_dir() else [path]
     rules: dict[str, Rule] = {}
     for file in files:
-        doc = yaml.load(file.read_text(), Loader=_Loader) or {}
+        doc = yaml.load(file.read_text(), Loader=YamlLoader) or {}
         if not isinstance(doc, dict):
             raise RuleError(f"{file}: expected a mapping of event names to rules")
         for name, spec in doc.items():

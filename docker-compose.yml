@@ -114,8 +114,9 @@ services:
       ERPDOO_KAFKA_BOOTSTRAP: redpanda:9092
       ERPDOO_TOPIC: erpdoo.events
     volumes:
-      # Edit rules here and restart erpdoo; no rebuild needed.
+      # Edit rules and sinks here and restart erpdoo; no rebuild needed.
       - ./rules:/app/rules:ro
+      - ./erpdoo.yml:/app/erpdoo.yml:ro
       - erpdoo-state:/var/lib/erpdoo
     restart: unless-stopped
     depends_on:

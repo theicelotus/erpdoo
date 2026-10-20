@@ -2,11 +2,11 @@ import pytest
 import yaml
 
 import fake_odoo
-from erpdoo.rules import Condition, RuleError, _Loader, parse_rule, tracked_tables, validate
+from erpdoo.rules import Condition, RuleError, YamlLoader, parse_rule, tracked_tables, validate
 
 
 def test_yaml_keeps_on_and_no_as_strings():
-    doc = yaml.load("on: [create]\nwhen: {invoice_status: no, active: true}", Loader=_Loader)
+    doc = yaml.load("on: [create]\nwhen: {invoice_status: no, active: true}", Loader=YamlLoader)
     assert doc == {"on": ["create"], "when": {"invoice_status": "no", "active": True}}
 
 
