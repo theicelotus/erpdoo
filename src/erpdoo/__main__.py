@@ -16,7 +16,7 @@ from erpdoo.config import ConfigError, load_config
 from erpdoo.events import EventBuilder
 from erpdoo.models import ModelRegistry
 from erpdoo.replication import PublicationError, ReplicationReader
-from erpdoo.rules import RuleError, load_rules, tracked_tables, validate
+from erpdoo.rules import Rule, RuleError, load_rules, split_by_model, tracked_tables, validate
 from erpdoo.sinks import make_sink
 from erpdoo.store import StateStore
 
@@ -58,29 +58,41 @@ def run() -> None:
 
     rules = load_rules(rules_path)
     registry = ModelRegistry.load(dsn)
-    validate(rules, registry)
-    tracked = tracked_tables(rules, registry)
-    log.info("loaded %d rules (%s) against %d Odoo models",
-             len(rules), ", ".join(r.name for r in rules), len(registry.models))
-
-    sinks = [make_sink(spec) for spec in config["sinks"]]
-
-    # Rule models get REPLICA IDENTITY FULL so Postgres sends the row before
-    # each update, which is how a rule sees the value a field is leaving.
-    # ir_model and ir_model_fields are streamed so the registry follows
-    # module installs.
-    rule_tables = sorted({registry.models[r.model].table for r in rules})
     reader = ReplicationReader(dsn, slot, publication, lambda table: registry.model_for_table(table))
-    slot_created = reader.setup(
-        tables=sorted(set(rule_tables) | tracked.keys() | set(MODEL_TABLES)),
-        replica_identity_full=rule_tables,
-    )
     store = StateStore(state_path)
-    if slot_created:
-        # A new slot starts now: changes since the store was last updated are lost.
-        store.reset()
-    store.sync(dsn, tracked)
-    builder = EventBuilder(rules, registry, store, lang)
+
+    def activate(registry: ModelRegistry) -> tuple[EventBuilder, list[Rule]]:
+        """Publish and track what the rules of installed apps need. Rule
+        models get REPLICA IDENTITY FULL so Postgres sends the row before each
+        update, which is how a rule sees the value a field is leaving.
+        ir_model and ir_model_fields are streamed so the registry follows
+        module installs."""
+        active, skipped = split_by_model(rules, registry)
+        validate(active, registry)
+        tracked = tracked_tables(active, registry)
+        rule_tables = sorted({registry.models[r.model].table for r in active})
+        slot_created = reader.setup(
+            tables=sorted(set(rule_tables) | tracked.keys() | set(MODEL_TABLES)),
+            replica_identity_full=rule_tables,
+        )
+        if slot_created:
+            # A new slot starts now: changes since the store was last updated are lost.
+            store.reset()
+        store.sync(dsn, tracked)
+        return EventBuilder(active, registry, store, lang), skipped
+
+    def report(skipped: list[Rule], previous: set[str]) -> None:
+        for rule in skipped:
+            if rule.name not in previous:
+                log.warning("rule %s skipped: model %s not found (is its Odoo app installed?);"
+                            " it is activated when the model appears", rule.name, rule.model)
+
+    builder, skipped = activate(registry)
+    report(skipped, set())
+    log.info("active rules: %s", ", ".join(r.name for r in builder.rules) or "none")
+    # Sinks start after the slot exists, so once the Kafka topic exists no
+    # change is missed (the smoke test relies on this).
+    sinks = [make_sink(spec) for spec in config["sinks"]]
 
     reader.start()
     log.info("streaming to %s", ", ".join(spec["type"] for spec in config["sinks"]))
@@ -104,8 +116,19 @@ def run() -> None:
                 reader.ack(batch.ack_lsn, now=bool(events))
             if any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes):
                 registry = ModelRegistry.load(dsn)
-                validate(rules, registry)
-                builder.registry = registry
+                before = {r.name for r in builder.rules}
+                try:
+                    builder, new_skipped = activate(registry)
+                except (RuleError, PublicationError) as e:
+                    # Keep streaming with the rules that worked; a module
+                    # install should not stop erpdoo.
+                    builder.registry = registry
+                    log.error("Odoo models changed and the rules no longer fit, keeping the active ones: %s", e)
+                    continue
+                report(new_skipped, {r.name for r in skipped})
+                skipped = new_skipped
+                for name in sorted({r.name for r in builder.rules} - before):
+                    log.info("rule %s activated", name)
                 log.info("Odoo models changed, reloaded %d models", len(registry.models))
     finally:
         reader.close()

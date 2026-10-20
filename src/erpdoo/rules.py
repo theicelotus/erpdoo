@@ -221,6 +221,13 @@ def related_hops(registry: ModelRegistry, model: str, name: str, depth: int = 0)
     raise RuleError(f"{model}.{name} is not stored and is not a related field of stored many2one fields")
 
 
+def split_by_model(rules: list[Rule], registry: ModelRegistry) -> tuple[list[Rule], list[Rule]]:
+    """The rules whose model exists, and those whose model does not, usually
+    because its Odoo app is not installed."""
+    active = [r for r in rules if r.model in registry.models]
+    return active, [r for r in rules if r.model not in registry.models]
+
+
 def validate(rules: list[Rule], registry: ModelRegistry) -> None:
     """Check rules against the Odoo models; raise one RuleError listing every problem."""
     problems = []

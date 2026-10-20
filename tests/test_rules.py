@@ -2,7 +2,7 @@ import pytest
 import yaml
 
 import fake_odoo
-from erpdoo.rules import Condition, RuleError, YamlLoader, parse_rule, tracked_tables, validate
+from erpdoo.rules import Condition, RuleError, YamlLoader, parse_rule, split_by_model, tracked_tables, validate
 
 
 def test_yaml_keeps_on_and_no_as_strings():
@@ -83,3 +83,9 @@ def test_conditions_on_related_paths():
         validate([parse_rule("R", {"model": "sale.order.line", "when": {"product_id.name": {"to": "x"}}})], registry)
     with pytest.raises(RuleError, match="not a stored many2one"):
         validate([parse_rule("R", {"model": "sale.order.line", "when": {"name.x": "y"}})], registry)
+
+
+def test_split_by_model_sets_aside_rules_for_missing_apps():
+    rules = [parse_rule("A", {"model": "sale.order"}), parse_rule("B", {"model": "crm.lead"})]
+    active, skipped = split_by_model(rules, fake_odoo.registry())
+    assert [r.name for r in active] == ["A"] and [r.name for r in skipped] == ["B"]

@@ -152,6 +152,7 @@ class ReplicationReader:
         self.conn = None
         self.cur = None
         self.assembler: TransactionAssembler | None = None
+        self._resume_logged = False
 
     def setup(self, tables: list[str], replica_identity_full: list[str] = ()) -> bool:
         """Create or update the publication and create the slot if missing.
@@ -198,7 +199,9 @@ class ReplicationReader:
             return True
         if row[0] != "pgoutput":
             raise RuntimeError(f"slot {self.slot} uses plugin {row[0]}, expected pgoutput")
-        log.info("resuming slot %s from %s", self.slot, row[1])
+        # setup() runs again when Odoo's models change; say this once.
+        log.log(logging.DEBUG if self._resume_logged else logging.INFO, "resuming slot %s from %s", self.slot, row[1])
+        self._resume_logged = True
         return False
 
     def start(self) -> None:
