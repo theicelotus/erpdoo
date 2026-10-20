@@ -21,12 +21,13 @@ REVOKE odoo FROM erpdoo;
 
 GRANT CONNECT ON DATABASE odoo TO erpdoo;
 
--- Tables with rules: Postgres sends the whole previous row with each
--- update, so a rule sees the value a field is leaving.
-ALTER TABLE account_move REPLICA IDENTITY FULL;
-ALTER TABLE crm_lead REPLICA IDENTITY FULL;
-ALTER TABLE sale_order REPLICA IDENTITY FULL;
-ALTER TABLE stock_picking REPLICA IDENTITY FULL;
+-- Earlier dev stacks set REPLICA IDENTITY FULL on the rule tables. erpdoo
+-- now takes each change's previous row from its state store, so they go
+-- back to the default (the primary key), which writes less WAL.
+SELECT format('ALTER TABLE %I REPLICA IDENTITY DEFAULT', relname)
+  FROM pg_class
+ WHERE relname IN ('account_move', 'crm_lead', 'sale_order', 'stock_picking')
+   AND relnamespace = 'public'::regnamespace AND relreplident = 'f' \gexec
 
 SELECT NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'erpdoo') AS create_publication \gset
 \if :create_publication

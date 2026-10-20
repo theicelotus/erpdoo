@@ -219,6 +219,10 @@ def main() -> int:
 
     # DeliveryDone: validate the order's delivery (skip_sms answers the SMS opt-in prompt).
     picking = odoo("stock.picking", "search", [("sale_id", "=", order), ("picking_type_code", "=", "outgoing")])[0]
+    # Deliver the ordered quantity even if the demo stock has run out.
+    moves = odoo("stock.move", "search_read", [("picking_id", "=", picking)], fields=["product_uom_qty"])
+    for move in moves:
+        odoo("stock.move", "write", [move["id"]], {"quantity": move["product_uom_qty"], "picked": True})
     odoo("stock.picking", "button_validate", [picking], context={"skip_sms": True})
     state = odoo("stock.picking", "read", [picking], ["state"])[0]["state"]
     check("validate delivery", "stock.picking", picking, "DeliveryDone", time.monotonic(),
