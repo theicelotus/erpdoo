@@ -219,6 +219,44 @@ erpdoo checks rules against Odoo's models at startup and lists every
 problem, such as an unknown field. The full reference is at the top of
 [src/erpdoo/rules.py](src/erpdoo/rules.py).
 
+## Performance
+
+Measured with [scripts/benchmark.py](scripts/benchmark.py) on the dev stack,
+everything on one laptop: Intel Core i9-11900H (8 cores, 16 threads),
+15.4 GiB RAM, Samsung NVMe SSD, Fedora 42 (kernel 6.19), Docker 29.5.3.
+Odoo, Postgres, Redpanda, Redpanda Console and erpdoo all share that machine.
+erpdoo runs the six shipped rules with the dev config (Kafka and stdout
+sinks, viewer on), and each event includes the partner and order lines from
+the state store. Latency is from the Postgres commit to the moment a Kafka
+consumer receives the event. Results from two consecutive runs:
+
+| | Run 1 | Run 2 |
+|---|---|---|
+| Latency, one order at a time (200 orders), p50 / p95 / p99 | 13.5 / 20.0 / 26.2 ms | 13.2 / 14.5 / 20.2 ms |
+| Burst while erpdoo runs (3,000 orders, 25 per transaction, 8 concurrent clients) | 155 events/s | 152 events/s |
+| Latency during that burst, p50 / p95 / p99 | 31 / 55 / 60 ms | 28 / 76 / 88 ms |
+| Last event after the last commit | 0.03 s | 0.03 s |
+| Backlog of 3,000 confirmed orders, erpdoo started afterwards | 2,020 events/s (1.49 s) | 2,012 events/s (1.49 s) |
+| erpdoo startup (container start to streaming) | 0.80 s | 0.75 s |
+
+How to read it:
+
+- In the burst, Odoo is the limit: it committed about 150 confirmations a
+  second, and erpdoo delivered each within tens of milliseconds, finishing
+  30 ms after the last commit.
+- The backlog run takes Odoo out of the picture: erpdoo works through 3,000
+  waiting confirmations at about 2,000 events a second, including the
+  state store lookups for each event's partner and order lines.
+- No events were missing or duplicated in any phase.
+- This is one machine with no network between the services, and small
+  demo tables. Expect higher latency across real networks, and a longer
+  first start on a large database while the state store copies its tables.
+  The orders use a service product, so no deliveries are created.
+
+To reproduce, start the stack and run `.venv/bin/python scripts/benchmark.py`.
+It creates about 6,200 orders in the dev database and stops and starts the
+erpdoo container for the backlog phase.
+
 ## Trade-offs, honestly
 
 - **Needs replication access to Odoo's Postgres** (`wal_level=logical` and a
