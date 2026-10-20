@@ -241,13 +241,6 @@ For the shipped rules, run this in Odoo's database (named `odoo` here):
 CREATE ROLE erpdoo WITH LOGIN REPLICATION PASSWORD 'change-me';
 GRANT CONNECT ON DATABASE odoo TO erpdoo;
 
--- Tables with rules: Postgres sends the whole previous row with each
--- update, so a rule sees the value a field is leaving.
-ALTER TABLE account_move REPLICA IDENTITY FULL;
-ALTER TABLE crm_lead REPLICA IDENTITY FULL;
-ALTER TABLE sale_order REPLICA IDENTITY FULL;
-ALTER TABLE stock_picking REPLICA IDENTITY FULL;
-
 -- The rules' tables, the related records they include, and ir_model /
 -- ir_model_fields, which tell erpdoo when an Odoo app is installed.
 CREATE PUBLICATION erpdoo FOR TABLE
@@ -262,7 +255,10 @@ GRANT SELECT ON
   TO erpdoo;
 ```
 
-erpdoo creates its replication slot itself, which `REPLICATION` allows. The
+Tables keep their default replica identity (the primary key): erpdoo takes
+the previous row of each update and delete from its state store, so
+`REPLICA IDENTITY FULL` is not needed. erpdoo creates its replication slot
+itself, which `REPLICATION` allows. The
 publication and slot names are set with `ERPDOO_PUBLICATION` and
 `ERPDOO_SLOT` (both `erpdoo` by default). The dev stack runs the same steps
 from [docker/postgres/setup-erpdoo.sql](docker/postgres/setup-erpdoo.sql).
@@ -273,12 +269,10 @@ missing, stops with a list and the SQL that fixes it:
 
 ```
 ERROR erpdoo: erpdoo needs these changes in Postgres, which its role erpdoo is not allowed to make:
-  need REPLICA IDENTITY FULL, so that updates carry the previous row: purchase_order
   not in publication erpdoo: purchase_order, purchase_order_line
   not readable by erpdoo: purchase_order, purchase_order_line
 Run this SQL as an admin (a superuser, or the owner of Odoo's tables and of the publication):
 
-  ALTER TABLE public.purchase_order REPLICA IDENTITY FULL;
   ALTER PUBLICATION erpdoo ADD TABLE public.purchase_order, public.purchase_order_line;
   GRANT SELECT ON public.purchase_order, public.purchase_order_line TO erpdoo;
 ```
@@ -337,6 +331,28 @@ To reproduce, start the stack and run `.venv/bin/python scripts/benchmark.py`.
 It creates about 6,200 orders in the dev database and stops and starts the
 erpdoo container for the backlog phase.
 
+### WAL per order confirmation
+
+Earlier versions of erpdoo needed `REPLICA IDENTITY FULL` on the rule tables,
+so that Postgres wrote each updated row's previous version into the WAL.
+erpdoo now takes that row from its state store instead. Measured with
+[scripts/wal_cost.py](scripts/wal_cost.py) on the same machine: 300 sale
+orders, each with one stocked product (so confirming also creates a
+delivery), confirmed one at a time through Odoo's API, three runs each.
+
+| | `REPLICA IDENTITY FULL` | Default (primary key) |
+|---|---|---|
+| WAL on the rule tables (`sale_order`, `stock_picking`, ...) | 1,356 / 1,357 / 1,403 bytes | 963 / 966 / 986 bytes |
+| All WAL, without full-page images | 15,956 / 15,966 / 17,455 bytes | 15,657 / 15,734 / 17,212 bytes |
+| All WAL, with full-page images | 16,166 / 16,151 / 18,268 bytes | 22,477 / 16,041 / 19,603 bytes |
+
+Dropping `REPLICA IDENTITY FULL` saves about 390 bytes per confirmation,
+29% of the WAL written to the rule tables. That is only about 2% of all the
+WAL a confirmation writes: most of it goes to Odoo's chatter
+(`mail_message`, `mail_followers`) and to indexes. The totals vary from run
+to run by more than the saving, mostly through full-page images, which
+depend on when checkpoints happen; the rule-table figure is the steady one.
+
 ## Trade-offs, honestly
 
 - **Needs replication access to Odoo's Postgres** (`wal_level=logical` and a
@@ -344,11 +360,18 @@ erpdoo container for the backlog phase.
   [Setting up Postgres](#setting-up-postgres)). Hosted Odoo platforms
   (Odoo Online, Odoo.sh) usually don't give you this. A polling mode over
   Odoo's API is planned for that case, with its own limits.
-- **`REPLICA IDENTITY FULL` on each rule's table** (`sale_order`,
-  `account_move`, `stock_picking` and `crm_lead` with the shipped rules), so
-  Postgres includes the previous row in each update, which is how a rule
-  sees the value a field is leaving. It makes each update to those tables
-  write more WAL.
+- **The rules' own tables are copied too.** A rule sees the value a field
+  is leaving by comparing with the row before the change, and Postgres only
+  sends that row with `REPLICA IDENTITY FULL`. erpdoo instead keeps the
+  rule tables (`sale_order`, `account_move`, `stock_picking` and `crm_lead`
+  with the shipped rules) in its state store, with the previous version of
+  each changed row until the slot is confirmed past it. That costs disk
+  space and a longer first copy on a large database (`account_move` holds
+  every invoice and journal entry), to save little WAL (see
+  [Performance](#wal-per-order-confirmation)). Changes committed before a
+  table was copied are not checked against rules. A rule table without an
+  `id` column would still need `REPLICA IDENTITY FULL`; erpdoo says so in
+  its log and asks for it in its SQL, but Odoo's models always have one.
 - **A new app's rules wait for an admin.** With a read-only role, a rule for
   an app installed later starts only after an admin runs the SQL erpdoo
   logs (erpdoo checks every 30 seconds). Changes to the app's records before
@@ -380,10 +403,10 @@ erpdoo container for the backlog phase.
   systemd) to start it again. At startup it waits for Postgres and Kafka,
   retrying after 1 s and then twice as long each time, up to 30 s, so after
   a reboot it starts cleanly in whatever order the services come up.
-- **erpdoo does not undo `REPLICA IDENTITY FULL`** or remove tables from a
-  publication it did not create. When a rule is removed, its table keeps
-  the setting; reset it with `ALTER TABLE <table> REPLICA IDENTITY DEFAULT`
-  if you want the smaller WAL back.
+- **erpdoo does not undo `REPLICA IDENTITY FULL`** set for earlier versions,
+  or remove tables from a publication it did not create. Reset a table with
+  `ALTER TABLE <table> REPLICA IDENTITY DEFAULT` for the smaller WAL (the
+  dev stack's setup script does this).
 - **Table names are inferred.** Odoo does not store a model's table name in
   the database, so erpdoo uses Odoo's naming rule (`sale.order` →
   `sale_order`) plus the core models known to differ (`ir.actions.*`). A
