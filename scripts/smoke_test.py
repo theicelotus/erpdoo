@@ -3,7 +3,8 @@
 Drives Odoo through its API the way the UI buttons do (confirm, cancel, post,
 register payment, validate delivery, mark won) and checks that exactly one
 matching event arrives on Kafka for each, with related records that match
-Odoo's own data. Also checks actions that must not produce an event.
+Odoo's own data. Also checks actions that must not produce an event, and
+that erpdoo's database role cannot change any of Odoo's tables.
 
     python scripts/smoke_test.py
 """
@@ -16,9 +17,11 @@ import sys
 import time
 import urllib.request
 import uuid
+from contextlib import closing
 from datetime import date
 from decimal import Decimal
 
+import psycopg2
 from confluent_kafka import Consumer, TopicPartition
 
 
@@ -99,12 +102,58 @@ class Events:
         return matches()
 
 
+def write_access(dsn: str) -> tuple[list[str], list[str]]:
+    """Ways erpdoo's role could change Odoo's data or schema (none expected),
+    and other privileges worth knowing about."""
+    problems, notes = [], []
+    with closing(psycopg2.connect(dsn)) as conn, conn.cursor() as cur:
+        cur.execute("SELECT rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls FROM pg_roles"
+                    " WHERE rolname = current_user")
+        if cur.fetchone()[0]:
+            problems.append("role is superuser or may create roles or databases, or bypass RLS")
+        cur.execute(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')"
+            " AND (pg_has_role(c.relowner, 'USAGE')"
+            "      OR has_table_privilege(c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))"
+            " ORDER BY 1")
+        if writable := [r[0] for r in cur.fetchall()]:
+            problems.append(f"may write or alter {len(writable)} tables: {', '.join(writable[:5])}")
+        cur.execute("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+                    " WHERE n.nspname = 'public'"
+                    " AND CASE WHEN c.relkind = 'S' THEN has_sequence_privilege(c.oid, 'UPDATE') END")
+        if cur.fetchone()[0]:
+            problems.append("may advance Odoo's sequences")
+        cur.execute("SELECT has_database_privilege(current_database(), 'CREATE')")
+        if cur.fetchone()[0]:
+            problems.append("may create schemas in Odoo's database")
+        cur.execute("SELECT has_schema_privilege('public', 'CREATE')")
+        if cur.fetchone()[0]:
+            # Odoo grants this to PUBLIC when it creates a database.
+            notes.append("may create new tables in schema public, as every role may (Odoo's default)")
+        # The catalog says no; Postgres must refuse in practice too.
+        for statement in ("UPDATE sale_order SET state = state WHERE false",
+                          "DELETE FROM res_partner WHERE false",
+                          "ALTER TABLE sale_order REPLICA IDENTITY DEFAULT",
+                          "ALTER PUBLICATION erpdoo DROP TABLE sale_order"):
+            try:
+                cur.execute(statement)
+                problems.append(f"allowed: {statement}")
+            except psycopg2.errors.InsufficientPrivilege:
+                pass
+            finally:
+                conn.rollback()
+    return problems, notes
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--odoo", default="http://localhost:8069")
     p.add_argument("--db", default="odoo")
     p.add_argument("--kafka", default="127.0.0.1:19092")
     p.add_argument("--topic", default="erpdoo.events")
+    p.add_argument("--pg", default="host=localhost dbname=odoo user=erpdoo password=erpdoo",
+                   help="erpdoo's connection, to check that it cannot write")
     p.add_argument("--timeout", type=float, default=30)
     args = p.parse_args()
 
@@ -112,6 +161,13 @@ def main() -> int:
     odoo = Odoo(args.odoo, args.db, "admin", "admin")
     events = Events(args.kafka, args.topic)
     results: list[tuple[str, bool, str]] = []
+
+    problems, notes = write_access(args.pg)
+    detail = "; ".join(problems) or "no write access to Odoo's tables"
+    results.append(("erpdoo's role is read-only", not problems, detail))
+    print(f"{'ok  ' if not problems else 'FAIL'} erpdoo's role is read-only: {detail}")
+    for note in notes:
+        print(f"     note: {note}")
 
     def check(name: str, model: str, record_id: int, event_type: str | None, since: float, verify=None):
         """Expect exactly one event_type event for the record (or none if

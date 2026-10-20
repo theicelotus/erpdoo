@@ -7,7 +7,7 @@
 # Console:  http://localhost:8080  (topic erpdoo.events)
 # Viewer:   http://localhost:8000  (live changes and events)
 # Kafka:    127.0.0.1:19092        Schema registry: http://localhost:18081
-# Postgres: localhost:5432         (odoo / odoo)
+# Postgres: localhost:5432         (odoo / odoo; erpdoo's read-only role: erpdoo / erpdoo)
 
 name: erpdoo
 
@@ -28,7 +28,6 @@ services:
       POSTGRES_DB: postgres
     volumes:
       - pg-data:/var/lib/postgresql/data
-      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
@@ -52,6 +51,23 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # What a database admin does once for erpdoo, after Odoo's tables exist:
+  # create its role, its publication and read-only grants. erpdoo itself
+  # can then only stream and read; it cannot write to Odoo's tables.
+  db-setup:
+    image: postgres:16
+    command: ["psql", "-q", "-f", "/setup-erpdoo.sql"]
+    environment:
+      PGHOST: postgres
+      PGDATABASE: odoo
+      PGUSER: odoo
+      PGPASSWORD: odoo
+    volumes:
+      - ./docker/postgres/setup-erpdoo.sql:/setup-erpdoo.sql:ro
+    depends_on:
+      odoo-init:
+        condition: service_completed_successfully
 
   odoo:
     image: odoo:18.0
@@ -128,8 +144,8 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
-      # Odoo's tables must exist before erpdoo creates its publication.
-      odoo-init:
+      # The publication erpdoo streams from is created by db-setup.
+      db-setup:
         condition: service_completed_successfully
 
 volumes:
