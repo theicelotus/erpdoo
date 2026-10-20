@@ -11,7 +11,7 @@ permissions:
 jobs:
   unit:
     name: Unit tests (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python: ["3.11", "3.13"]
@@ -25,7 +25,7 @@ jobs:
 
   smoke:
     name: Full stack smoke test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
