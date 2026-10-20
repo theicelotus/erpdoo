@@ -1,0 +1,17 @@
+# Inventory events (needs the Inventory app). See src/erpdoo/rules.py for the rule format.
+
+DeliveryDone:
+  model: stock.picking
+  when:
+    state: { to: done }
+    # Odoo keeps the operation type's code on stock.picking.type, so this
+    # condition is read from erpdoo's state store.
+    picking_type_id.code: outgoing
+  fields: [name, origin, state, scheduled_date, date_done, company_id]
+  include:
+    partner_id: [name, email]
+    sale_id: [name, client_order_ref]
+    move_ids:
+      fields: [product_uom_qty, quantity, state]
+      where: { state: done }
+    move_ids.product_id: [name, default_code]
