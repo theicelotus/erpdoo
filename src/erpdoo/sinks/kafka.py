@@ -8,10 +8,16 @@ import logging
 from confluent_kafka import KafkaError, KafkaException, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
+from erpdoo.backoff import Unreachable
 from erpdoo.events import Event
 from erpdoo.sinks import DeliveryError
 
 log = logging.getLogger(__name__)
+
+# Receives librdkafka's own log lines during check_reachable(), and drops them.
+_probe_log = logging.getLogger(f"{__name__}.probe")
+_probe_log.addHandler(logging.NullHandler())
+_probe_log.propagate = False
 
 # key, value, headers
 Record = tuple[bytes, bytes, list[tuple[str, bytes]]]
@@ -24,6 +30,7 @@ class KafkaSink:
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
         self.flush_timeout = flush_timeout
+        check_reachable(bootstrap_servers)
         self.producer = Producer({
             "bootstrap.servers": bootstrap_servers,
             "enable.idempotence": True,
@@ -81,3 +88,22 @@ class KafkaSink:
 
     def close(self) -> None:
         self.producer.flush(self.flush_timeout)
+
+
+def check_reachable(bootstrap_servers: str, timeout: float = 5.0) -> None:
+    """Raise Unreachable unless a broker answers within ``timeout`` seconds.
+    librdkafka would print several lines per failed connection; instead its
+    first error (e.g. a host name that does not resolve) goes in the message."""
+    errors: list[str] = []
+    admin = AdminClient({
+        "bootstrap.servers": bootstrap_servers,
+        "logger": _probe_log,
+        "error_cb": lambda err: errors.append(err.str()),
+    })
+    try:
+        admin.list_topics(timeout=timeout)
+    except KafkaException:
+        admin.poll(0)  # runs error_cb for the errors so far
+        detail = next((m for m in errors if "brokers are down" not in m),
+                      f"{bootstrap_servers}: no answer within {timeout:g} s")
+        raise Unreachable(detail) from None

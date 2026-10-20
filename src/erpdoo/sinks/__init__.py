@@ -120,4 +120,8 @@ def make_sink(spec: dict) -> Sink:
     unknown = dead_letter.keys() - {"topic", "bootstrap_servers"}
     if unknown:
         raise ConfigError(f"sink {kind}: dead_letter has unknown keys {sorted(unknown)}")
-    return DeadLetterSink(sink, name, dead_letter["topic"], dead_letter["bootstrap_servers"])
+    try:
+        return DeadLetterSink(sink, name, dead_letter["topic"], dead_letter["bootstrap_servers"])
+    except Exception:
+        sink.close()  # e.g. Kafka is unreachable and the caller tries again
+        raise

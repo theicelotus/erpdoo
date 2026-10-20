@@ -157,3 +157,11 @@ def test_dead_letter_still_blocks_when_no_event_is_at_fault():
 def test_dead_letter_blocks_if_the_dead_letter_topic_fails():
     with pytest.raises(DeliveryError, match="could not write to dead-letter topic dlq"):
         DeadLetterSink(FakeSink(reject={1}), "webhook x", "dlq", "unused", queue=FakeQueue(fail=True)).send([event(1)])
+
+
+def test_unreachable_kafka_names_the_cause():
+    from erpdoo.backoff import Unreachable
+    from erpdoo.sinks.kafka import check_reachable
+
+    with pytest.raises(Unreachable, match="127.0.0.1:1.*Connection refused"):
+        check_reachable("127.0.0.1:1", timeout=1)

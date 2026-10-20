@@ -11,7 +11,12 @@ import logging
 import os
 import signal
 import sys
+import threading
 
+import psycopg2
+from confluent_kafka import KafkaException
+
+from erpdoo.backoff import Stopped, Unreachable, retry
 from erpdoo.config import ConfigError, load_config
 from erpdoo.events import EventBuilder
 from erpdoo.models import ModelRegistry
@@ -38,6 +43,8 @@ def main() -> None:
         # Mistakes in the setup: say what is wrong, without a traceback.
         log.error("%s", e)
         sys.exit(2)
+    except Stopped:
+        log.info("stopped")
 
 
 def run() -> None:
@@ -49,17 +56,13 @@ def run() -> None:
     lang = os.environ.get("ERPDOO_LANG", "en_US")
     config = load_config(os.environ.get("ERPDOO_CONFIG"))
 
-    stopping = False
-
-    def stop(_signum, _frame):
-        nonlocal stopping
-        stopping = True
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
+    signal.signal(signal.SIGINT, lambda _signum, _frame: stop.set())
 
     rules = load_rules(rules_path)
-    registry = ModelRegistry.load(dsn)
+    # After a reboot erpdoo may start before Postgres and Kafka: wait for them.
+    registry = retry("Postgres", lambda: ModelRegistry.load(dsn), (psycopg2.OperationalError,), stop)
     reader = ReplicationReader(dsn, slot, publication, lambda table: registry.model_for_table(table))
     store = StateStore(state_path)
 
@@ -96,7 +99,9 @@ def run() -> None:
              f" ({', '.join(f'{r.name}: {r.model} not found' for r in skipped)})" if skipped else "")
     # Sinks start after the slot exists, so once the Kafka topic exists no
     # change is missed (the smoke test relies on this).
-    sinks = [make_sink(spec) for spec in config["sinks"]]
+    sinks = [retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec),
+                   (Unreachable, KafkaException, TimeoutError), stop)
+             for spec in config["sinks"]]
     viewer = None
     if config.get("viewer") is not None:
         try:
@@ -109,7 +114,7 @@ def run() -> None:
     reader.start()
     log.info("streaming to %s", ", ".join(spec["type"] for spec in config["sinks"]))
     try:
-        while not stopping:
+        while not stop.is_set():
             batch = reader.poll(timeout=1.0)
             events = []
             shown = []
