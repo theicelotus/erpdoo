@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import psycopg2
 from confluent_kafka import KafkaException
@@ -30,6 +31,7 @@ from erpdoo.store import StateStore
 log = logging.getLogger("erpdoo")
 
 MODEL_TABLES = ("ir_model", "ir_model_fields")
+RECHECK_SECONDS = 30
 
 
 def main() -> None:
@@ -111,6 +113,8 @@ def run() -> None:
         viewer = Viewer(**config["viewer"])
         viewer.start()
 
+    recheck_at: float | None = None  # when to retry activating rules that did not fit
+    last_error: str | None = None
     reader.start()
     log.info("streaming to %s", ", ".join(spec["type"] for spec in config["sinks"]))
     try:
@@ -142,21 +146,31 @@ def run() -> None:
                 # After a delivery, confirm right away so a crash does not
                 # resend it. Idle progress can wait for the status interval.
                 reader.ack(batch.ack_lsn, now=bool(events))
-            if any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes):
+            models_changed = any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes)
+            if models_changed:
                 registry = ModelRegistry.load(dsn)
-                before = {r.name for r in builder.rules}
-                try:
-                    builder, new_skipped = activate(registry)
-                except (RuleError, PublicationError) as e:
-                    # Keep streaming with the rules that worked; a module
-                    # install should not stop erpdoo.
-                    builder.registry = registry
-                    log.error("Odoo models changed and the rules no longer fit, keeping the active ones: %s", e)
-                    continue
-                report(new_skipped, {r.name for r in skipped}, registry)
-                skipped = new_skipped
-                for name in sorted({r.name for r in builder.rules} - before):
-                    log.info("rule %s activated", name)
+            elif recheck_at is None or time.monotonic() < recheck_at:
+                continue
+            before = {r.name for r in builder.rules}
+            try:
+                builder, new_skipped = activate(registry)
+            except (RuleError, PublicationError) as e:
+                # Keep streaming with the rules that worked; a module
+                # install should not stop erpdoo. If Postgres needs an
+                # admin's SQL first, check again until it has been run.
+                builder.registry = registry
+                recheck_at = time.monotonic() + RECHECK_SECONDS if isinstance(e, PublicationError) else None
+                if str(e) != last_error:
+                    log.error("Odoo models changed and the rules no longer fit, keeping the active ones%s: %s",
+                              f" (checking again every {RECHECK_SECONDS} s)" if recheck_at else "", e)
+                last_error = str(e)
+                continue
+            recheck_at = last_error = None
+            report(new_skipped, {r.name for r in skipped}, registry)
+            skipped = new_skipped
+            for name in sorted({r.name for r in builder.rules} - before):
+                log.info("rule %s activated", name)
+            if models_changed:
                 log.info("Odoo models changed, reloaded %d models", len(registry.models))
     finally:
         reader.close()

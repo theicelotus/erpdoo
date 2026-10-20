@@ -19,7 +19,6 @@ from datetime import datetime
 
 import psycopg2
 import psycopg2.extras
-from psycopg2 import sql
 
 from erpdoo import pgoutput
 
@@ -109,7 +108,33 @@ class PublicationError(Exception):
     pass
 
 
-def _replica_identity_problem(cur, table: str) -> str | None:
+@dataclass(frozen=True)
+class TableState:
+    quoted: str  # the table's name as SQL, quoted if it needs to be
+    replica_identity: str  # pg_class.relreplident: d (default), f (full), i (index) or n (nothing)
+    has_primary_key: bool
+    has_identity_index: bool  # a valid index chosen with REPLICA IDENTITY USING INDEX
+    may_alter: bool  # erpdoo's role owns the table, directly or through another role
+    readable: bool  # erpdoo's role may SELECT from it
+
+
+@dataclass(frozen=True)
+class PublicationState:
+    owned: bool  # owned by erpdoo's own role: erpdoo keeps it to exactly the tables it needs
+    may_alter: bool  # erpdoo's role may alter it (owner, member of the owner, or superuser)
+    all_tables: bool  # FOR ALL TABLES
+    publishes_changes: bool  # publishes inserts, updates and deletes
+    tables: frozenset[str]
+
+
+@dataclass(frozen=True)
+class Step:
+    sql: str
+    allowed: bool  # erpdoo's role may run it
+    done: str  # log message once run
+
+
+def replica_identity_problem(table: str, state: TableState | None) -> str | None:
     """Why ``table`` cannot be published safely, or None if it can.
 
     A published table must identify the rows of an UPDATE or DELETE: by its
@@ -117,24 +142,75 @@ def _replica_identity_problem(cur, table: str) -> str | None:
     INDEX) or the whole row (FULL). Otherwise Postgres rejects those
     statements on the table, which would break Odoo.
     """
-    cur.execute(
-        "SELECT c.relreplident,"
-        " EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary),"
-        " EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident AND i.indisvalid)"
-        " FROM pg_class c WHERE c.oid = to_regclass(%s)",
-        [f"public.{table}"],
-    )
-    row = cur.fetchone()
-    if row is None:
+    if state is None:
         return f"{table}: no such table"
-    ident, has_pk, has_ident_index = row
-    if ident == "f" or (ident == "d" and has_pk) or (ident == "i" and has_ident_index):
+    ident = state.replica_identity
+    if ident == "f" or (ident == "d" and state.has_primary_key) or (ident == "i" and state.has_identity_index):
         return None
     if ident == "n":
         return f"{table}: REPLICA IDENTITY NOTHING"
     if ident == "i":
         return f"{table}: REPLICA IDENTITY USING INDEX, but the index is missing or invalid"
     return f"{table}: no primary key (REPLICA IDENTITY DEFAULT needs one)"
+
+
+def plan_setup(
+    publication: str,
+    role: str,
+    tables: list[str],
+    replica_identity_full: list[str],
+    states: dict[str, TableState],
+    pub: PublicationState | None,
+    may_create: bool,
+) -> tuple[list[Step], list[str]]:
+    """The statements that make ``publication`` stream ``tables`` with the
+    replica identities erpdoo needs, and what is missing, in words.
+
+    ``publication`` and ``role`` are SQL-quoted names; ``states`` covers
+    ``tables`` and the tables already in the publication. A publication
+    owned by erpdoo's role is kept to exactly ``tables``; one created by an
+    admin is only ever added to.
+    """
+    steps: list[Step] = []
+    missing: list[str] = []
+
+    def table_list(names):
+        return ", ".join(f"public.{states[t].quoted}" for t in names)
+
+    need_full = [t for t in replica_identity_full if states[t].replica_identity != "f"]
+    for t in need_full:
+        steps.append(Step(f"ALTER TABLE public.{states[t].quoted} REPLICA IDENTITY FULL",
+                          states[t].may_alter, f"set REPLICA IDENTITY FULL on {t}"))
+    if need_full:
+        missing.append("need REPLICA IDENTITY FULL, so that updates carry the previous row: "
+                       + ", ".join(need_full))
+
+    if pub is None:
+        steps.append(Step(f"CREATE PUBLICATION {publication} FOR TABLE {table_list(tables)}",
+                          may_create and all(states[t].may_alter for t in tables),
+                          f"created publication {publication}: {', '.join(tables)}"))
+        missing.append(f"publication {publication} does not exist")
+    else:
+        absent = [] if pub.all_tables else [t for t in tables if t not in pub.tables]
+        if absent:
+            steps.append(Step(f"ALTER PUBLICATION {publication} ADD TABLE {table_list(absent)}",
+                              pub.may_alter and all(states[t].may_alter for t in absent),
+                              f"added to publication {publication}: {', '.join(absent)}"))
+            missing.append(f"not in publication {publication}: " + ", ".join(absent))
+        extra = sorted(pub.tables - set(tables)) if pub.owned and not pub.all_tables else []
+        if extra:
+            steps.append(Step(f"ALTER PUBLICATION {publication} DROP TABLE {table_list(extra)}",
+                              True, f"removed from publication {publication}: {', '.join(extra)}"))
+        if not pub.publishes_changes:
+            steps.append(Step(f"ALTER PUBLICATION {publication} SET (publish = 'insert, update, delete, truncate')",
+                              pub.may_alter, f"publication {publication} now publishes all changes"))
+            missing.append(f"publication {publication} does not publish every insert, update and delete")
+
+    unreadable = [t for t in tables if not states[t].readable]
+    if unreadable:
+        steps.append(Step(f"GRANT SELECT ON {table_list(unreadable)} TO {role}", False, ""))
+        missing.append(f"not readable by {role}: " + ", ".join(unreadable))
+    return steps, missing
 
 
 class ReplicationReader:
@@ -163,13 +239,37 @@ class ReplicationReader:
                 return self._setup(cur, tables, replica_identity_full)
 
     def _setup(self, cur, tables, replica_identity_full) -> bool:
-        for table in replica_identity_full:
-            cur.execute("SELECT relreplident FROM pg_class WHERE oid = %s::regclass", [f"public.{table}"])
-            if cur.fetchone()[0] != "f":
-                cur.execute(sql.SQL("ALTER TABLE {} REPLICA IDENTITY FULL").format(sql.Identifier("public", table)))
-                log.info("set REPLICA IDENTITY FULL on %s", table)
+        cur.execute(
+            "SELECT quote_ident(%s), quote_ident(current_user),"
+            " has_database_privilege(current_database(), 'CREATE')",
+            [self.publication],
+        )
+        publication, role, may_create = cur.fetchone()
+        cur.execute(
+            "SELECT p.pubowner = r.oid, pg_has_role(p.pubowner, 'USAGE'), p.puballtables,"
+            " p.pubinsert AND p.pubupdate AND p.pubdelete,"
+            " ARRAY(SELECT tablename FROM pg_publication_tables t"
+            "       WHERE t.pubname = p.pubname AND t.schemaname = 'public')"
+            " FROM pg_publication p, pg_roles r WHERE p.pubname = %s AND r.rolname = current_user",
+            [self.publication],
+        )
+        row = cur.fetchone()
+        pub = PublicationState(*row[:4], frozenset(row[4])) if row else None
 
-        problems = [p for t in tables if (p := _replica_identity_problem(cur, t))]
+        cur.execute(
+            "SELECT c.relname, quote_ident(c.relname), c.relreplident,"
+            " EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary),"
+            " EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisreplident AND i.indisvalid),"
+            " pg_has_role(c.relowner, 'USAGE'), has_table_privilege(c.oid, 'SELECT')"
+            " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'"
+            " WHERE c.relname = ANY(%s) AND c.relkind IN ('r', 'p')",
+            [sorted(set(tables) | (pub.tables if pub else set()))],
+        )
+        states = {row[0]: TableState(*row[1:]) for row in cur.fetchall()}
+        full = set(replica_identity_full)
+        # Tables that get REPLICA IDENTITY FULL need nothing else.
+        problems = [p for t in tables
+                    if not (t in full and t in states) and (p := replica_identity_problem(t, states.get(t)))]
         if problems:
             raise PublicationError(
                 "refusing to publish these tables, because Postgres would then reject Odoo's"
@@ -177,17 +277,17 @@ class ReplicationReader:
                 + "\nGive each table a primary key, or set REPLICA IDENTITY FULL or USING INDEX."
             )
 
-        table_list = sql.SQL(", ").join(sql.Identifier("public", t) for t in tables)
-        pub = sql.Identifier(self.publication)
-        cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", [self.publication])
-        if cur.fetchone():
-            cur.execute("SELECT tablename FROM pg_publication_tables WHERE pubname = %s", [self.publication])
-            if {r[0] for r in cur.fetchall()} != set(tables):
-                cur.execute(sql.SQL("ALTER PUBLICATION {} SET TABLE {}").format(pub, table_list))
-                log.info("updated publication %s: %s", self.publication, ", ".join(tables))
-        else:
-            cur.execute(sql.SQL("CREATE PUBLICATION {} FOR TABLE {}").format(pub, table_list))
-            log.info("created publication %s: %s", self.publication, ", ".join(tables))
+        steps, missing = plan_setup(publication, role, tables, replica_identity_full, states, pub, may_create)
+        if not all(step.allowed for step in steps):
+            raise PublicationError(
+                f"erpdoo needs these changes in Postgres, which its role {role} is not allowed to make:\n  "
+                + "\n  ".join(missing)
+                + "\nRun this SQL as an admin (a superuser, or the owner of Odoo's tables and of the"
+                " publication):\n\n" + "\n".join(f"  {step.sql};" for step in steps)
+            )
+        for step in steps:
+            cur.execute(step.sql)
+            log.info("%s", step.done)
 
         cur.execute(
             "SELECT plugin, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = %s", [self.slot]
@@ -196,6 +296,7 @@ class ReplicationReader:
         if row is None:
             cur.execute("SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", [self.slot])
             log.info("created replication slot %s", self.slot)
+            self._resume_logged = True
             return True
         if row[0] != "pgoutput":
             raise RuntimeError(f"slot {self.slot} uses plugin {row[0]}, expected pgoutput")
