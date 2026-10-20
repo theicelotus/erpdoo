@@ -93,6 +93,14 @@ def run() -> None:
     # Sinks start after the slot exists, so once the Kafka topic exists no
     # change is missed (the smoke test relies on this).
     sinks = [make_sink(spec) for spec in config["sinks"]]
+    viewer = None
+    if config.get("viewer") is not None:
+        try:
+            from erpdoo.viewer import MAX_CHANGES, Viewer, describe
+        except ImportError:
+            raise ConfigError("the viewer needs FastAPI and uvicorn: pip install 'erpdoo[viewer]'") from None
+        viewer = Viewer(**config["viewer"])
+        viewer.start()
 
     reader.start()
     log.info("streaming to %s", ", ".join(spec["type"] for spec in config["sinks"]))
@@ -100,16 +108,27 @@ def run() -> None:
         while not stopping:
             batch = reader.poll(timeout=1.0)
             events = []
+            shown = []
             for txn in batch.transactions:
-                for change in txn.changes:
+                previous = []  # for the viewer: each updated row as the store had it
+                for i, change in enumerate(txn.changes):
+                    if viewer and i < MAX_CHANGES:
+                        previous.append(store.get(change.table, change.new["id"])
+                                        if change.op == "update" and change.old is None
+                                        and change.table in store.tables else None)
                     store.apply(change)
-                events.extend(builder.build(txn))
+                txn_events = builder.build(txn)
+                events.extend(txn_events)
+                if viewer:
+                    shown.append(describe(txn, txn_events, previous))
             store.commit()
             # Every sink must deliver before the slot is confirmed. If one
             # fails, erpdoo stops; after a restart all sinks get the events again.
             if events:
                 for sink in sinks:
                     sink.send(events)
+            for item in shown:
+                viewer.publish(item)
             if batch.ack_lsn is not None:
                 # After a delivery, confirm right away so a crash does not
                 # resend it. Idle progress can wait for the status interval.
@@ -134,6 +153,8 @@ def run() -> None:
         reader.close()
         for sink in sinks:
             sink.close()
+        if viewer:
+            viewer.stop()
     log.info("stopped")
 
 

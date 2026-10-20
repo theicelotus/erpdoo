@@ -16,7 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+viewer = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8", "httpx2>=2"]
 
 [project.scripts]
 erpdoo = "erpdoo.__main__:main"

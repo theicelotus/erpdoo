@@ -1,0 +1,233 @@
+"""Live event viewer: a small web page that shows each transaction's raw
+changes next to the events erpdoo built from it, as they are delivered.
+
+Enabled with ``viewer:`` in erpdoo.yml. It has no authentication and shows
+business data, so bind it to localhost or a private network only.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import threading
+from collections import deque
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+from erpdoo.events import Event
+from erpdoo.pgoutput import format_lsn
+from erpdoo.replication import Change, Transaction
+
+log = logging.getLogger(__name__)
+
+MAX_CHANGES = 50  # per transaction; a module install writes thousands of rows
+HISTORY = 200  # transactions a newly opened page starts with
+MAX_VALUES = 8  # fields shown for an inserted row
+NOISE = {"create_uid", "create_date", "write_uid", "write_date"}
+
+
+def describe_change(change: Change, previous: dict | None = None) -> dict:
+    """A change for display. For updates, the fields that changed; the old
+    values come from the change itself (REPLICA IDENTITY FULL tables) or from
+    ``previous``, the row the state store held before the change."""
+    row = change.new or change.old or {}
+    item = {"op": change.op, "table": change.table, "model": change.model, "id": row.get("id")}
+    if change.op == "update":
+        before = change.old if change.old is not None and not change.old_is_key_only else previous
+        item["changed"] = None if before is None else {
+            k: [before.get(k), v] for k, v in change.new.items() if k not in NOISE and before.get(k) != v
+        }
+    elif change.op == "insert":
+        values = {k: v for k, v in change.new.items() if v is not None and k not in NOISE and k != "id"}
+        item["values"] = dict(list(values.items())[:MAX_VALUES])
+        item["more"] = max(0, len(values) - MAX_VALUES)
+    return item
+
+
+def describe(txn: Transaction, events: list[Event], previous: list[dict | None]) -> dict:
+    return {
+        "xid": txn.xid,
+        "commit_lsn": format_lsn(txn.commit_lsn),
+        "commit_time": txn.commit_time.isoformat(),
+        "change_count": len(txn.changes),
+        "changes": [describe_change(c, p) for c, p in zip(txn.changes[:MAX_CHANGES], previous)],
+        "events": [e.payload for e in events],
+    }
+
+
+class Viewer:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+        self.host, self.port = host, port
+        self.history: deque[dict] = deque(maxlen=HISTORY)
+        self.clients: set[asyncio.Queue] = set()
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.server: uvicorn.Server | None = None
+        self.app = self._build_app()
+
+    def _build_app(self) -> FastAPI:
+        @asynccontextmanager
+        async def lifespan(_app):
+            self.loop = asyncio.get_running_loop()
+            yield
+
+        app = FastAPI(title="erpdoo viewer", lifespan=lifespan, docs_url=None, redoc_url=None)
+
+        @app.get("/", response_class=HTMLResponse)
+        async def page():
+            return PAGE
+
+        @app.get("/recent")
+        async def recent():
+            return list(self.history)
+
+        @app.get("/stream")
+        async def stream(request: Request):
+            queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+            self.clients.add(queue)
+
+            async def messages():
+                try:
+                    while not await request.is_disconnected():
+                        try:
+                            item = await asyncio.wait_for(queue.get(), timeout=15)
+                            yield f"data: {json.dumps(item, default=str)}\n\n"
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                finally:
+                    self.clients.discard(queue)
+
+            return StreamingResponse(messages(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+        return app
+
+    def start(self) -> None:
+        """Serve the page from a background thread."""
+        self.server = uvicorn.Server(uvicorn.Config(self.app, host=self.host, port=self.port, log_level="warning"))
+        threading.Thread(target=self.server.run, name="erpdoo-viewer", daemon=True).start()
+        log.info("viewer on http://%s:%d", self.host, self.port)
+
+    def publish(self, item: dict) -> None:
+        """Called from erpdoo's main loop; hands the item to the server thread."""
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(self._broadcast, item)
+
+    def _broadcast(self, item: dict) -> None:
+        self.history.append(item)
+        for queue in list(self.clients):
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass  # a page that stopped reading; it catches up on reload
+
+    def stop(self) -> None:
+        if self.server is not None:
+            self.server.should_exit = True
+
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>erpdoo live</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6eb;
+          --ins: #1a7f37; --upd: #9a6700; --del: #cf222e; --event: #0b5cad; --event-bg: #eaf2fc; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #11151c; --card: #1a2029; --text: #e3e7ee; --muted: #8e97a8; --line: #2a313c;
+            --ins: #4ac26b; --upd: #d4a72c; --del: #f47067; --event: #6cb6ff; --event-bg: #1b2a3d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { position: sticky; top: 0; background: var(--bg); padding: 12px 16px; border-bottom: 1px solid var(--line);
+           display: flex; gap: 16px; align-items: center; flex-wrap: wrap; z-index: 1; }
+  h1 { font-size: 16px; margin: 0; }
+  .status { color: var(--muted); }
+  .status.live::before { content: "\\25CF "; color: var(--ins); }
+  label { color: var(--muted); user-select: none; }
+  main { padding: 12px 16px; display: grid; gap: 10px; }
+  .txn { background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .txn.has-events { border-color: var(--event); }
+  .meta { padding: 6px 12px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; }
+  .col { padding: 8px 12px; min-width: 0; }
+  .col + .col { border-left: 1px solid var(--line); }
+  .col h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 6px; }
+  .change { margin: 0 0 6px; overflow-wrap: anywhere; }
+  .op { font-weight: 600; font-size: 12px; }
+  .op.insert { color: var(--ins); } .op.update { color: var(--upd); } .op.delete, .op.truncate { color: var(--del); }
+  .fields { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
+  .event { background: var(--event-bg); border-radius: 6px; padding: 6px 8px; margin: 0 0 6px; }
+  .event b { color: var(--event); }
+  .event pre { margin: 6px 0 0; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .none { color: var(--muted); font-style: italic; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+  @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } .col + .col { border-left: 0; border-top: 1px solid var(--line); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>erpdoo live</h1>
+  <span id="status" class="status">connecting</span>
+  <label><input type="checkbox" id="only-events"> only transactions with events</label>
+  <label><input type="checkbox" id="pause"> pause</label>
+</header>
+<main id="list"><p class="empty">Waiting for changes. Confirm a sale order in Odoo.</p></main>
+<script>
+const list = document.getElementById("list"), statusEl = document.getElementById("status");
+const onlyEvents = document.getElementById("only-events"), pause = document.getElementById("pause");
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const short = v => { const s = typeof v === "object" && v !== null ? JSON.stringify(v) : String(v); return s.length > 60 ? s.slice(0, 57) + "..." : s; };
+let queued = [];
+
+function changeHtml(c) {
+  let detail = "";
+  if (c.op === "update") {
+    detail = c.changed === null ? "previous row not known"
+      : Object.entries(c.changed).map(([k, [a, b]]) => `${esc(k)}: ${esc(short(a))} \\u2192 ${esc(short(b))}`).join(", ") || "no visible change";
+  } else if (c.op === "insert") {
+    detail = Object.entries(c.values).map(([k, v]) => `${esc(k)}=${esc(short(v))}`).join(", ") + (c.more ? `, +${c.more} more` : "");
+  }
+  const what = c.model ? `${esc(c.model)} <span class="fields">(${esc(c.table)})</span>` : esc(c.table);
+  return `<div class="change"><span class="op ${c.op}">${c.op.toUpperCase()}</span> ${what}${c.id != null ? " #" + c.id : ""}`
+    + (detail ? `<div class="fields">${detail}</div>` : "") + `</div>`;
+}
+
+function render(t) {
+  const el = document.createElement("section");
+  el.className = "txn" + (t.events.length ? " has-events" : "");
+  el.dataset.events = t.events.length;
+  const hidden = t.change_count - t.changes.length;
+  el.innerHTML = `<div class="meta">transaction ${t.xid} \\u00b7 ${new Date(t.commit_time).toLocaleTimeString()} \\u00b7 LSN ${esc(t.commit_lsn)} \\u00b7 ${t.change_count} change${t.change_count === 1 ? "" : "s"}</div>
+    <div class="cols"><div class="col"><h2>Raw changes</h2>${t.changes.map(changeHtml).join("")}${hidden > 0 ? `<div class="none">+${hidden} more</div>` : ""}</div>
+    <div class="col"><h2>Events</h2>${t.events.length ? t.events.map(e => `<div class="event"><b>${esc(e.event_type)}</b> ${esc(e.model)}:${e.record_id}<details><summary>payload</summary><pre>${esc(JSON.stringify(e, null, 2))}</pre></details></div>`).join("") : '<div class="none">no event</div>'}</div></div>`;
+  el.hidden = onlyEvents.checked && !t.events.length;
+  return el;
+}
+
+function add(t) {
+  if (pause.checked) { queued.push(t); return; }
+  const empty = list.querySelector(".empty"); if (empty) empty.remove();
+  list.prepend(render(t));
+  while (list.children.length > 300) list.lastChild.remove();
+}
+
+onlyEvents.onchange = () => { for (const el of list.querySelectorAll(".txn")) el.hidden = onlyEvents.checked && el.dataset.events === "0"; };
+pause.onchange = () => { if (!pause.checked) { const q = queued; queued = []; q.forEach(add); } };
+
+fetch("recent").then(r => r.json()).then(items => {
+  items.forEach(add);
+  const source = new EventSource("stream");
+  source.onopen = () => { statusEl.textContent = "live"; statusEl.className = "status live"; };
+  source.onerror = () => { statusEl.textContent = "reconnecting"; statusEl.className = "status"; };
+  source.onmessage = m => add(JSON.parse(m.data));
+});
+</script>
+</body>
+</html>
+"""

@@ -9,6 +9,9 @@ to read environment variables, e.g. for webhook tokens:
         url: https://example.com/hooks/erpdoo
         headers: { Authorization: "Bearer ${WEBHOOK_TOKEN}" }
       - type: stdout
+    viewer:                       # optional live page of changes and events
+      host: 127.0.0.1
+      port: 8000
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import yaml
 from erpdoo.rules import YamlLoader
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-SETTINGS = {"sinks"}
+SETTINGS = {"sinks", "viewer"}
 
 
 class ConfigError(Exception):
@@ -70,4 +73,7 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
     sinks = config.get("sinks")
     if not isinstance(sinks, list) or not sinks or not all(isinstance(s, dict) and "type" in s for s in sinks):
         raise ConfigError(f"{path}: 'sinks' must be a non-empty list of entries with a type")
+    viewer = config.get("viewer")
+    if viewer is not None and (not isinstance(viewer, dict) or viewer.keys() - {"host", "port"}):
+        raise ConfigError(f"{path}: 'viewer' takes host and port")
     return config

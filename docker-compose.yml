@@ -5,6 +5,7 @@
 #
 # Odoo:     http://localhost:8069  (admin / admin)
 # Console:  http://localhost:8080  (topic erpdoo.events)
+# Viewer:   http://localhost:8000  (live changes and events)
 # Kafka:    127.0.0.1:19092        Schema registry: http://localhost:18081
 # Postgres: localhost:5432         (odoo / odoo)
 
@@ -114,6 +115,8 @@ services:
       ERPDOO_PG_DSN: host=postgres dbname=odoo user=erpdoo password=erpdoo
       ERPDOO_KAFKA_BOOTSTRAP: redpanda:9092
       ERPDOO_TOPIC: erpdoo.events
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
       # Edit rules and sinks here and restart erpdoo; no rebuild needed.
       - ./rules:/app/rules:ro

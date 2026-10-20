@@ -23,3 +23,9 @@ sinks:
   #   dead_letter:                # optional, any sink: park failed events and continue
   #     topic: erpdoo.dead-letter
   #     bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
+
+# Live page of each transaction's changes next to its events. No login: in
+# the dev stack compose publishes it on 127.0.0.1 only.
+viewer:
+  host: 0.0.0.0
+  port: 8000
