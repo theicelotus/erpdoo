@@ -37,11 +37,11 @@ services:
       retries: 30
 
   # Creates the "odoo" database with demo data and the apps the shipped
-  # event packs use (Sales, Inventory, CRM), then exits. On later runs the
-  # modules are already installed and this finishes quickly.
+  # event packs use (Sales, Inventory, CRM), then exits. Later runs (Compose
+  # starts it again with erpdoo) find the apps installed and do nothing.
   odoo-init:
     image: odoo:18.0
-    command: ["odoo", "-d", "odoo", "-i", "sale_management,sale_stock,crm", "--stop-after-init", "--no-http"]
+    command: ["python3", "/init.py"]
     environment: &odoo-db
       HOST: postgres
       USER: odoo
@@ -50,6 +50,7 @@ services:
       - odoo-data:/var/lib/odoo
       # A test module (not installed by default) for scripts/custom_table_test.py.
       - ./tests/odoo_addons:/mnt/extra-addons:ro
+      - ./docker/odoo/init.py:/init.py:ro
     depends_on:
       postgres:
         condition: service_healthy
