@@ -516,9 +516,19 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   dev stack's setup script does this).
 - **Table names are inferred.** Odoo does not store a model's table name in
   the database, so erpdoo uses Odoo's naming rule (`sale.order` →
-  `sale_order`) plus the core models known to differ (`ir.actions.*`). A
-  model from another module that sets its own `_table` is not recognised
-  yet. `python -m erpdoo.models <model>` shows how a model is mapped.
+  `sale_order`) plus the core models known to differ (`ir.actions.*`). For
+  a model that sets its own `_table`, erpdoo looks for the table by its
+  columns: a table no other model uses, with an `id`, whose columns include
+  every stored field of the model. It logs which table it found, and does
+  not guess when two tables fit equally well. To be sure, or for a model it
+  cannot find, set the table in [erpdoo.yml](erpdoo.yml):
+  ```yaml
+  tables:
+    x_custom.gadget: x_custom_gadgets
+  ```
+  `python -m erpdoo.models <model>` shows how a model is mapped, and
+  `scripts/custom_table_test.py` checks both with a small test module
+  ([tests/odoo_addons](tests/odoo_addons)) that sets its own `_table`.
 - **An unused replication slot keeps WAL.** If erpdoo is stopped for a long
   time, Postgres keeps the WAL it hasn't read yet and disk use grows, without
   limit unless `max_slot_wal_keep_size` is set (see
