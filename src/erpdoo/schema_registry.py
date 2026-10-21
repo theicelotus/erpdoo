@@ -177,7 +177,9 @@ class Plan:
                 log.info("registered the %s schema of %s as subject %s (id %d)", self.target.format, rule.name,
                          subject, schema_id)
             registered[rule.name] = Registered(schema_id, shape, parsed)
-        self.target.registered = registered
+        # Merged, so that the rules still in use keep their schema if
+        # another sink's registration fails and the new rules are not used.
+        self.target.registered = {**self.target.registered, **registered}
 
 
 class Schemas:
