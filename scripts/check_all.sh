@@ -8,7 +8,7 @@
 # PYTHON overrides the interpreter (default: .venv/bin/python if it exists).
 cd "$(dirname "$0")/.." || exit 1
 PYTHON=${PYTHON:-$( [ -x .venv/bin/python ] && echo .venv/bin/python || echo python )}
-checks=(unit smoke replay delivery inbound custom_table backfill)
+checks=(unit smoke replay delivery inbound custom_table backfill polling)
 declare -A command=(
   [unit]="$PYTHON -m pytest -q"
   [smoke]="$PYTHON scripts/smoke_test.py"
@@ -17,6 +17,7 @@ declare -A command=(
   [inbound]="$PYTHON scripts/inbound_test.py"
   [custom_table]="$PYTHON scripts/custom_table_test.py"
   [backfill]="$PYTHON scripts/backfill_test.py"
+  [polling]="$PYTHON scripts/polling_test.py"
 )
 declare -A result
 docker compose up -d --build erpdoo >/dev/null 2>&1 || { echo "could not rebuild erpdoo"; exit 1; }

@@ -1,0 +1,44 @@
+# erpdoo in polling mode, for scripts/polling_test.py: the dev stack's Odoo
+# through its API only, as the read-only erpdoo-reader user, next to the dev
+# stack's erpdoo (replication mode), with its own topics, schema namespaces,
+# consumer group and inbound topics (polling-test.*, see the test).
+
+source:
+  type: polling
+  interval: 2
+  deletes: 10
+  odoo:
+    url: http://odoo:8069
+    db: odoo
+    login: erpdoo-reader
+    api_key: ${ERPDOO_POLL_API_KEY}
+
+sinks:
+  - type: kafka
+    bootstrap_servers: redpanda:9092
+    topic: erpdoo.polling-test
+    format: json
+    schema_registry:
+      url: http://redpanda:8081
+      namespace: erpdoo.polling_test
+  - type: kafka
+    bootstrap_servers: redpanda:9092
+    topic: erpdoo.polling-test.avro
+    format: avro
+    schema_registry:
+      url: http://redpanda:8081
+      namespace: erpdoo.polling_test.avro
+
+inbound:
+  bootstrap_servers: redpanda:9092
+  group_id: erpdoo-polling-test
+  dead_letter_topic: erpdoo.polling-test.inbound.dead-letter
+  odoo:
+    url: http://odoo:8069
+    db: odoo
+    login: erpdoo-integration
+    api_key: ${ERPDOO_ODOO_API_KEY}
+
+viewer:
+  host: 0.0.0.0
+  port: 8000
