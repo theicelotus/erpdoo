@@ -52,8 +52,8 @@ def test_includes_accept_list_and_mapping_forms():
     ({"model": "no.such"}, "unknown model no.such .* Is its Odoo app installed"),
     ({"model": "sale.order", "when": {"tax_country_id": 1}}, "tax_country_id is not stored"),
     ({"model": "sale.order", "fields": ["nope"]}, "has no field nope"),
-    ({"model": "sale.order", "include": ["tag_ids"]}, "many2many includes are not supported"),
-    ({"model": "sale.order", "include": ["name"]}, "not a many2one or one2many"),
+    ({"model": "sale.order", "include": ["tag_preview_ids"]}, "many2many is not stored"),
+    ({"model": "sale.order", "include": ["name"]}, "not a relational field"),
     ({"model": "sale.order", "include": {"order_line": {"where": {"nope": 1}}}}, "where field nope"),
 ])
 def test_validation_errors(spec, message):
@@ -87,6 +87,13 @@ def test_conditions_on_related_paths():
         validate([parse_rule("R", {"model": "sale.order.line", "when": {"product_id.name": {"to": "x"}}})], registry)
     with pytest.raises(RuleError, match="not a stored many2one"):
         validate([parse_rule("R", {"model": "sale.order.line", "when": {"name.x": "y"}})], registry)
+
+
+def test_many2many_include_tracks_the_join_table():
+    rule = parse_rule("R", {"model": "sale.order", "include": {"tag_ids": ["name"]}})
+    validate([rule], fake_odoo.registry())
+    assert tracked_tables([rule], fake_odoo.registry()) == {
+        "sale_order": set(), "sale_order_tag_rel": {"order_id"}, "crm_tag": set()}
 
 
 def test_rule_table_without_id_is_not_tracked():

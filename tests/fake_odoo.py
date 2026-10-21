@@ -21,6 +21,7 @@ FIELDS = [
     f("sale.order", "order_line", "one2many", "sale.order.line", inverse="order_id"),
     f("sale.order", "tag_ids", "many2many", "crm.tag", rel_table="sale_order_tag_rel", c1="order_id", c2="tag_id"),
     f("sale.order", "tax_country_id", "many2one", "res.country", store=False),
+    f("sale.order", "tag_preview_ids", "many2many", "crm.tag", store=False),
     f("sale.order.line", "id", "integer"),
     f("sale.order.line", "order_id", "many2one", "sale.order"),
     f("sale.order.line", "name", "text"),
@@ -37,6 +38,7 @@ FIELDS = [
     f("product.template", "id", "integer"),
     f("product.template", "name", translate=True),
     f("crm.tag", "id", "integer"),
+    f("crm.tag", "name"),
 ]
 
 TABLES = {
@@ -45,7 +47,7 @@ TABLES = {
     "res_partner": {"id", "name", "email"},
     "product_product": {"id", "default_code", "product_tmpl_id"},
     "product_template": {"id", "name"},
-    "crm_tag": {"id"},
+    "crm_tag": {"id", "name"},
     "sale_order_tag_rel": {"order_id", "tag_id"},
 }
 

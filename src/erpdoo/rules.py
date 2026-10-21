@@ -9,6 +9,7 @@
         partner_id: [name, email]          # many2one, with the fields to keep
         order_line: [name, price_subtotal] # one2many
         order_line.product_id: [name]      # nested; related fields like name work
+        order_line.tax_id: [name, amount]  # many2many, ordered by id
         invoice_line_ids:                  # with a filter on the related rows
           fields: [name]
           where: { display_type: product }
@@ -288,10 +289,10 @@ def _include_target(registry: ModelRegistry, model: str, name: str) -> str:
     f = registry.models[model].fields.get(name)
     if f is None:
         raise RuleError(f"{model} has no field {name}")
-    if f.type == "many2many":
-        raise RuleError(f"include {model}.{name}: many2many includes are not supported yet")
-    if f.type not in ("many2one", "one2many") or f.relation not in registry.models:
-        raise RuleError(f"include {model}.{name}: not a many2one or one2many field to a model with a table")
+    if f.type not in ("many2one", "one2many", "many2many") or f.relation not in registry.models:
+        raise RuleError(f"include {model}.{name}: not a relational field to a model with a table")
+    if f.type == "many2many" and not f.relation_table:
+        raise RuleError(f"include {model}.{name}: many2many is not stored (no join table)")
     if f.type == "many2one" and not f.column:
         raise RuleError(f"include {model}.{name}: many2one is not stored")
     if f.type == "one2many":
@@ -303,7 +304,7 @@ def _include_target(registry: ModelRegistry, model: str, name: str) -> str:
 
 def tracked_tables(rules: list[Rule], registry: ModelRegistry) -> dict[str, set[str]]:
     """Tables the state store must copy for these rules, each with the columns
-    to index for one2many lookups: the rules' own tables, which give each
+    to index for one2many and many2many lookups: the rules' own tables, which give each
     change its previous row, and the tables of the records they include or
     read. The store keeps rows by id, so a rule table without an id column
     is left out."""
@@ -321,6 +322,8 @@ def tracked_tables(rules: list[Rule], registry: ModelRegistry) -> dict[str, set[
             columns = tables.setdefault(target.table, set())
             if f.type == "one2many":
                 columns.add(registry.models[f.relation].fields[f.inverse].column)
+            elif f.type == "many2many":
+                tables.setdefault(f.relation_table, set()).add(f.column1)
             need_fields(target.name, inc.fields)
             walk(target.name, inc.children)
 

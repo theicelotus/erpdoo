@@ -36,6 +36,16 @@ _COLUMN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _UNKNOWN = object()  # no stored version: the slot was confirmed past it, or the table was not tracked
 
 
+def row_key(row: dict) -> int:
+    """A row's id. Rows of many2many join tables have none, only the ids of
+    the two records they link (both are their primary key, so Postgres sends
+    them for deletes too); their key combines the two, in column name order."""
+    if "id" in row:
+        return row["id"]
+    first, second = sorted(row)
+    return (row[first] << 32) | row[second]
+
+
 class StateStore:
     def __init__(self, path: str) -> None:
         self.db = sqlite3.connect(path)
@@ -92,7 +102,7 @@ class StateStore:
         count = 0
         batch = []
         for row in rows:
-            batch.append((table, row["id"], json.dumps(row)))
+            batch.append((table, row_key(row), json.dumps(row)))
             if len(batch) >= 1000:
                 self.db.executemany("INSERT INTO records VALUES (?, ?, ?)", batch)
                 count += len(batch)
@@ -133,7 +143,7 @@ class StateStore:
                 if not replay:
                     self.db.execute("DELETE FROM records WHERE tbl = ?", [table])
                 continue
-            record_id = (change.new or change.old)["id"]
+            record_id = row_key(change.new or change.old)
             if replay:
                 key = (table, record_id)
                 if key not in rows:
@@ -163,13 +173,13 @@ class StateStore:
 
     def _apply(self, change: Change, previous: dict | None) -> None:
         if change.op == "delete":
-            self.db.execute("DELETE FROM records WHERE tbl = ? AND id = ?", [change.table, change.old["id"]])
+            self.db.execute("DELETE FROM records WHERE tbl = ? AND id = ?", [change.table, row_key(change.old)])
             return
         # Unchanged TOASTed columns are not in the new row of an update; keep the stored value.
         row = {**(previous or {}), **change.new} if change.op == "update" else change.new
         self.db.execute(
             "INSERT INTO records VALUES (?, ?, ?) ON CONFLICT (tbl, id) DO UPDATE SET data = excluded.data",
-            [change.table, row["id"], json.dumps(row)],
+            [change.table, row_key(row), json.dumps(row)],
         )
 
     def _version(self, table: str, record_id: int, lsn: int):

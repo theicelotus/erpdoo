@@ -144,3 +144,31 @@ def test_replay_shows_related_records_as_they_were():
     assert second.event_id == first.event_id
     assert second.payload == first.payload
     assert second.payload["record"]["partner_id"]["name"] == "Azure Interior"
+
+
+def test_many2many_include_through_the_join_table():
+    tagged = parse_rule("SaleOrderConfirmed", {
+        "model": "sale.order", "when": {"state": {"to": "sale"}}, "fields": ["name"],
+        "include": {"tag_ids": ["name"]}})
+    b = builder(rules=[tagged])
+    b.store.load("sale_order", [order()], lsn=0x100)
+    b.store.load("crm_tag", [{"id": 1, "name": "VIP"}, {"id": 2, "name": "Export"}], lsn=0x100)
+    b.store.load("sale_order_tag_rel", [{"order_id": 5, "tag_id": 2}, {"order_id": 5, "tag_id": 1},
+                                        {"order_id": 6, "tag_id": 1}], lsn=0x100)
+    b.store.index("order_id")
+    t = txn(update(None, order(state="sale")))
+    [event] = b.build(t, b.store.apply_transaction(t))
+    assert event.payload["record"]["tag_ids"] == [{"id": 1, "name": "VIP"}, {"id": 2, "name": "Export"}]
+
+    # Untagged later (Postgres sends the whole join row of a delete): a
+    # replay of the confirmation still shows both tags.
+    untag = Transaction(901, 0x3000, 0x3100, datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        [Change("delete", "sale_order_tag_rel", None, {"order_id": 5, "tag_id": 2}, True, None)])
+    b.store.apply_transaction(untag)
+    again = txn(update(None, order(state="sale")))
+    [replayed] = b.build(again, b.store.apply_transaction(again))
+    assert replayed.payload == event.payload
+    later = Transaction(902, 0x4000, 0x4100, datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        [update(None, order(state="sale", name="S00005-B"))])
+    b.store.apply_transaction(later)
+    assert b.render("sale.order", order(), ("name",), tagged.includes)["tag_ids"] == [{"id": 1, "name": "VIP"}]

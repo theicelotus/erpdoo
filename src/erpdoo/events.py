@@ -88,6 +88,12 @@ class EventBuilder:
         are read as of the transaction's commit, also when it is streamed
         again after a crash and the store is already further on."""
         self._as_of = txn.end_lsn
+        try:
+            return self._build(txn, replay)
+        finally:
+            self._as_of = None
+
+    def _build(self, txn: Transaction, replay: bool) -> list[Event]:
         events = []
         changes_by_model: dict[str, dict] = {}
         for rule in self.rules:
@@ -163,13 +169,21 @@ class EventBuilder:
                     out[inc.field] = {"id": target_id}  # not in the store (yet)
                 else:
                     out[inc.field] = self.render(target.name, related, inc.fields, inc.children)
-            else:
-                inverse = target.fields[f.inverse].column
-                rows = self.store.find(target.table, inverse, row["id"], self._as_of)
+            elif f.type == "one2many":
+                rows = self.store.find(target.table, target.fields[f.inverse].column, row["id"], self._as_of)
                 out[inc.field] = [
                     self.render(target.name, r, inc.fields, inc.children)
                     for r in rows if all(c.matches({}, r) for c in inc.where)
                 ]
+            else:  # many2many: the join table's rows for this record, by id of the linked record
+                links = self.store.find(f.relation_table, f.column1, row["id"], self._as_of)
+                out[inc.field] = []
+                for target_id in sorted(link[f.column2] for link in links):
+                    related = self.store.get(target.table, target_id, self._as_of)
+                    if related is None:
+                        out[inc.field].append({"id": target_id})  # not in the store (yet)
+                    elif all(c.matches({}, related) for c in inc.where):
+                        out[inc.field].append(self.render(target.name, related, inc.fields, inc.children))
         return out
 
     def value(self, model: str, row: dict, name: str) -> object:
