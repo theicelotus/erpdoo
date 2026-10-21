@@ -144,6 +144,9 @@ event sent again after the restart must be identical to the first,
 customer name included. It uses a test hook (`ERPDOO_TEST_HOLD_ACK` in
 [docker-compose.yml](docker-compose.yml)) and also runs in CI.
 
+`scripts/check_all.sh` rebuilds erpdoo and runs every check (unit tests and
+the test scripts) against the dev stack, with a summary at the end.
+
 `scripts/delivery_test.py`, also in CI, checks outages: it confirms orders
 while erpdoo is stopped, then while Redpanda is down. Each event must
 arrive exactly once on both topics once the service is back, and while
