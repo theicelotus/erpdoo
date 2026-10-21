@@ -126,6 +126,11 @@ def run() -> None:
         viewer.start()
 
     confirmed_at = time.monotonic()
+    # For tests only (scripts/replay_test.py): while this file exists, events
+    # are delivered but the slot is not confirmed; once it is removed, erpdoo
+    # exits at once, as if it had crashed.
+    hold_ack = os.environ.get("ERPDOO_TEST_HOLD_ACK")
+    holding = False
     recheck_at: float | None = None  # when to retry activating rules that did not fit
     last_error: str | None = None
     reader.start()
@@ -150,7 +155,13 @@ def run() -> None:
                     sink.send(events)
             for item in shown:
                 viewer.publish(item)
-            if batch.ack_lsn is not None:
+            if hold_ack and os.path.exists(hold_ack):
+                holding = True  # test hook: delivered, not confirmed
+            elif holding:
+                # Test hook: crash between delivery and confirmation.
+                log.warning("%s removed: exiting without confirming delivered events (test hook)", hold_ack)
+                os._exit(70)
+            elif batch.ack_lsn is not None:
                 # After a delivery, confirm right away so a crash does not
                 # resend it. Other progress is confirmed every few seconds;
                 # the store then drops the row versions kept for replays.

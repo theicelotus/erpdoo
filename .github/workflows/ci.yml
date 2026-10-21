@@ -40,6 +40,10 @@ jobs:
       # Waits for Odoo and erpdoo, then drives every shipped event through Odoo.
       - name: Smoke test
         run: python scripts/smoke_test.py
+      # Crashes erpdoo between delivery and confirmation, with a customer
+      # rename in between, and checks the replayed event is unchanged.
+      - name: Replay test
+        run: python scripts/replay_test.py
       - name: Show logs
         if: failure()
         run: docker compose logs --no-color --tail=300

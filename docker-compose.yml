@@ -131,6 +131,8 @@ services:
       ERPDOO_PG_DSN: host=postgres dbname=odoo user=erpdoo password=erpdoo
       ERPDOO_KAFKA_BOOTSTRAP: redpanda:9092
       ERPDOO_TOPIC: erpdoo.events
+      # Test hook for scripts/replay_test.py; does nothing unless the file exists.
+      ERPDOO_TEST_HOLD_ACK: /var/lib/erpdoo/test-hold-ack
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
