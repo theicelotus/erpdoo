@@ -27,6 +27,9 @@ def test_tracked_values():
     assert _value({"type": "boolean"}, {"new_value_integer": 0}, "new") is False
     assert _value({"type": "many2one"}, {"new_value_integer": 4, "new_value_char": "Won"}, "new") == 4
     assert _value({"type": "float"}, {"new_value_float": 100.0}, "new") == 100
+    # A numeric column is text in streamed events; so is its tracked value.
+    assert _value({"type": "monetary", "column_type": "numeric"}, {"new_value_float": 1500.5}, "new") == "1500.5"
+    assert _value({"type": "monetary", "column_type": "numeric"}, {"new_value_float": None}, "new") is None
     assert _value({"type": "datetime"}, {"new_value_datetime": datetime(2026, 1, 1, 8, 30)}, "new") == "2026-01-01 08:30:00"
 
 

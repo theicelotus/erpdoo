@@ -150,7 +150,9 @@ def _value(f: dict, row: dict, side: str):
         value = row[f"{side}_value_integer"]
         return None if value is None else bool(value)
     if kind in ("float", "monetary"):
-        return row[f"{side}_value_float"]
+        value = row[f"{side}_value_float"]
+        # Odoo tracks a float; streamed rows hold a numeric column as text.
+        return str(value) if value is not None and f.get("column_type") == "numeric" else value
     if kind in ("date", "datetime"):
         value = row[f"{side}_value_datetime"]
         return None if value is None else str(value.date() if kind == "date" else value)
@@ -164,6 +166,9 @@ def _value(f: dict, row: dict, side: str):
 
 
 def _from_tracking(cur, builder: EventBuilder, rule: Rule, tracked: dict, since, until, result: Backfill) -> None:
+    columns = builder.registry.models[rule.model].fields
+    for name, f in tracked.items():
+        f["column_type"] = columns[name].column_type
     by_id = {f["id"]: (name, f) for name, f in tracked.items()}
     cur.execute(
         "SELECT m.id AS message_id, m.res_id, m.date, v.*"
