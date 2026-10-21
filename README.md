@@ -177,7 +177,9 @@ Each pack is plain YAML. A rule for an app that isn't installed is skipped
 with a warning, and starts working once the app is installed, without a
 restart: right away if erpdoo's role may publish the app's tables, otherwise
 once an admin has run the SQL erpdoo logs (see
-[Setting up Postgres](#setting-up-postgres)).
+[Setting up Postgres](#setting-up-postgres)). Changes to the app's records
+from its install until then are backfilled, each exactly once (see
+[Apps installed later](#apps-installed-later)).
 
 ## Sinks
 
@@ -430,9 +432,9 @@ erpdoo backfill --since 2026-10-21T01:28:55Z --until 2026-10-21T01:29:06Z [--dry
 rebuilds the events the active rules would have produced in that window
 and sends them to the configured sinks (`--dry-run` prints them instead).
 In the dev stack: `docker compose exec erpdoo erpdoo backfill ...`. erpdoo
-runs it by itself for the window of an invalidated slot. It reads what
-Odoo recorded, not the WAL, so it also covers time erpdoo was not
-running at all.
+runs it by itself for the window of an invalidated slot, and for rules
+that activate late (below). It reads what Odoo recorded, not the WAL, so it
+also covers time erpdoo was not running at all.
 
 - **Rules on fields Odoo tracks** (those whose changes appear in a
   record's chatter: a sale order's or invoice's `state`, an invoice's
@@ -464,7 +466,8 @@ Limits:
 - **Ids differ from streamed events.** A change that was streamed and is
   also in a backfill window is sent twice, with two ids. erpdoo widens the
   window to whole seconds (Odoo stores times without fractions), so a
-  change in the first second of an automatic backfill can be one.
+  change in the first second of a lost slot's backfill can be one. The
+  backfill of a rule that activates late has no such overlap (below).
 - **Approximate events can be wrong.** A record written in the window for
   another reason, one that already matched the rule before, gives an
   event too: a lead won last month and edited today counts as won today,
@@ -478,7 +481,50 @@ Limits:
   backfilled, and deleted records are skipped.
 - **It needs read access to Odoo's tracking:** `mail_tracking_value`,
   `ir_model_fields_selection`, and four columns of `mail_message` (the
-  record and the time, not the message text); see the SQL below.
+  record and the time, not the message text), and for apps installed later
+  `ir_model_data`; see the SQL below.
+
+### Apps installed later
+
+A rule whose app is installed after erpdoo started streaming, while it runs
+or while it is stopped, activates right away or once an admin has run the
+SQL erpdoo logs. erpdoo then backfills the rule from when the app's model
+was created up to the moment it starts streaming the model's table
+(polling mode does the same through Odoo's API, see
+[How it works](#how-it-works)):
+
+```
+INFO erpdoo: erpdoo.test.ticket was created at 2026-10-21T12:22:59.310396+00:00 (its app was installed since erpdoo started streaming); backfilled TicketOpened, TicketEscalated, up to 2026-10-21T12:23:30.226393+00:00 when erpdoo copied its table: 4 events
+```
+
+- **No gap and no overlap.** erpdoo copies the new table into its state
+  store and reads the backfill in one Postgres snapshot. A transaction that
+  snapshot saw committed is backfilled; any other is checked against the
+  rule when it is streamed. Which side a transaction is on comes from the
+  snapshot's transaction ids, not from times, so each change is sent once.
+- **When the model was created** comes from Odoo's external ids
+  (`ir_model_data`, created when the app is installed); Odoo leaves
+  `ir_model`'s own `create_date` empty. Records the install itself creates,
+  such as demo data, are included.
+- **Not for older models.** A rule added to the YAML for an app that was
+  installed before erpdoo started streaming is not backfilled: run `erpdoo
+  backfill` for the window you want.
+- **Crash safe.** The backfilled events are saved in the state store in the
+  same commit as the table's copy, and sent before anything streamed after
+  it. If erpdoo stops before they are delivered, it sends them when it starts.
+- The events are like any other backfilled ones, with the limits above.
+  Without read access to `ir_model_data`, erpdoo logs the grant it needs and
+  the `erpdoo backfill` command to run once granted, and streams on.
+
+`scripts/late_app_test.py`, also run in CI, checks this in both modes. It
+runs a replication and a polling erpdoo with rules for a test app
+([tests/odoo_addons/erpdoo_late_app](tests/odoo_addons/erpdoo_late_app)),
+installs the app while they run, and opens and escalates tickets (Odoo
+tracks a ticket's state, not its priority) before the replication erpdoo's
+admin SQL is run and while the polling one is paused. Each change must
+arrive once, backfilled and valid against its schema, with the same ids in
+both modes for tracked changes; a ticket opened afterwards must be streamed
+(or polled), and restarting both must send nothing again.
 
 ## Writing rules
 
@@ -751,16 +797,18 @@ polls (`write_date` says which write), or it is a delete.
 
 The user erpdoo polls as needs to read the rule models and their related
 models, Odoo's model list (`ir.model`, `ir.model.fields`, which Odoo shows
-only to administrators by default) and Odoo's field tracking
-(`mail.tracking.value`, administrators only by default). In developer mode:
+only to administrators by default), its external ids (`ir.model.data`, to
+tell when an app installed later was installed; administrators only by
+default) and Odoo's field tracking (`mail.tracking.value`, administrators
+only by default). In developer mode:
 
 1. **Settings → Users & Companies → Groups → New**, e.g. `erpdoo: read only`,
    and under **Access Rights** add one line per model with only **Read**
    checked. For the shipped rules: `sale.order`, `sale.order.line`,
    `account.tax`, `account.move`, `account.move.line`, `stock.picking`,
    `stock.move`, `stock.picking.type`, `crm.lead`, `crm.stage`, `ir.model`,
-   `ir.model.fields` and `mail.tracking.value` (partners, products,
-   currencies and languages every internal user may read).
+   `ir.model.fields`, `ir.model.data` and `mail.tracking.value` (partners,
+   products, currencies and languages every internal user may read).
 2. **Settings → Users & Companies → Users → New**: login `erpdoo-reader`,
    type **Internal User**, no application rights, plus that group. It must
    see every company whose records the rules cover.
@@ -772,7 +820,9 @@ At startup erpdoo checks the user cannot write, create or delete any model
 it reads, and logs a warning naming those it can. Every internal user can
 post chatter messages, which erpdoo never does. Without read access to
 `mail.tracking.value`, erpdoo still runs, but every rule compares values
-between polls (all events approximate), and it says so in its log.
+between polls (all events approximate), and it says so in its log. Without
+`ir.model.data`, an app installed later gets a baseline when erpdoo finds
+it, so changes made before give no event, and erpdoo says so too.
 
 ### How it works
 
@@ -794,7 +844,11 @@ requests after `limit_time_real`, 120 s by default, in worker mode).
   poll. A lead won and lost again between two polls gives no event.
 - **The first poll** of a model stores its records' current values as a
   baseline, as replication mode copies the rule tables; earlier changes
-  give no event. A restart resumes from the cursor.
+  give no event. A restart resumes from the cursor. A model created after
+  erpdoo started polling (an app installed later) gets no baseline: its
+  first poll reads every change since the model was created, as if erpdoo
+  had polled it all along, and the events of changes from before erpdoo
+  noticed the app (it checks every minute) say `"backfill": true`.
 - **Event ids** come from the rule, the record and the tracking message
   (the id `erpdoo backfill` gives the same change) or the `write_date`, so
   a poll delivered but not noted (erpdoo stopped in between) sends the same
@@ -907,9 +961,10 @@ GRANT SELECT ON
   TO erpdoo;
 
 -- For backfill: Odoo's field tracking. Of mail_message only which record
--- changed when, not the messages themselves.
+-- changed when, not the messages themselves. ir_model_data says when an
+-- app installed later was installed (see "Apps installed later").
 GRANT SELECT (id, model, res_id, date) ON mail_message TO erpdoo;
-GRANT SELECT ON mail_tracking_value, ir_model_fields_selection TO erpdoo;
+GRANT SELECT ON mail_tracking_value, ir_model_fields_selection, ir_model_data TO erpdoo;
 ```
 
 Tables keep their default replica identity (the primary key): erpdoo takes
@@ -937,8 +992,10 @@ Run this SQL as an admin (a superuser, or the owner of Odoo's tables and of the 
 When an Odoo app installed later activates a rule (Purchase, for the rule
 above), erpdoo logs the same message instead of stopping, keeps the other
 rules running, and checks again every 30 seconds; the new rule starts once
-an admin has run the SQL. erpdoo only adds to a publication it did not
-create, so tables an admin published for other uses stay.
+an admin has run the SQL, and the changes made since the install are
+backfilled (see [Apps installed later](#apps-installed-later)). erpdoo only
+adds to a publication it did not create, so tables an admin published for
+other uses stay.
 
 If erpdoo's role is allowed to make these changes, for example because it
 owns Odoo's tables, erpdoo makes them itself and no admin step is needed.
@@ -1062,13 +1119,14 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   space and a longer first copy on a large database (`account_move` holds
   every invoice and journal entry), to save little WAL (see
   [Performance](#wal-per-order-confirmation)). Changes committed before a
-  table was copied are not checked against rules. A rule table without an
+  table was copied are not checked against rules, except those of an app
+  installed later, which are backfilled. A rule table without an
   `id` column would still need `REPLICA IDENTITY FULL`; erpdoo says so in
   its log and asks for it in its SQL, but Odoo's models always have one.
 - **A new app's rules wait for an admin.** With a read-only role, a rule for
   an app installed later starts only after an admin runs the SQL erpdoo
   logs (erpdoo checks every 30 seconds). Changes to the app's records before
-  that produce no events.
+  that are backfilled from Odoo's records then, with backfill's limits.
 - **Published tables need a replica identity.** Before publishing a table,
   or asking an admin to, erpdoo checks that it has a primary key or another
   replica identity. Without one, Postgres would reject Odoo's updates and

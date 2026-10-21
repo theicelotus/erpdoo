@@ -104,6 +104,14 @@ class EventBuilder:
         for rule in self.rules:
             if rule.model not in changes_by_model:
                 changes_by_model[rule.model] = net_changes(txn, rule.model)
+            table = self.registry.models[rule.model].table
+            if changes_by_model[rule.model] and self.store.before_copy(table, txn):
+                # In the table's copy already; a backfill covers it if one does.
+                if table not in self._before_copy_logged:
+                    self._before_copy_logged.add(table)
+                    log.info("%s: changes the state store's copy of the table already has are not checked"
+                             " against rules", table)
+                continue
             for record_id, (before, after) in changes_by_model[rule.model].items():
                 if before is None:
                     self._previous_unknown(rule.model, record_id, txn, replay)
@@ -146,15 +154,9 @@ class EventBuilder:
 
     def _previous_unknown(self, model: str, record_id: int, txn: Transaction, replay: bool) -> None:
         """Say why a record's rules were not checked."""
-        table = self.registry.models[model].table
         if replay:
             # Versions are dropped once the slot is confirmed past them.
             log.debug("%s %s: already delivered in transaction %s, not sent again", model, record_id, txn.xid)
-        elif txn.commit_lsn < self.store.loaded.get(table, 0):
-            if table not in self._before_copy_logged:
-                self._before_copy_logged.add(table)
-                log.info("%s: changes committed before the state store copied the table are not checked"
-                         " against rules", table)
         else:
             log.warning("%s %s: its previous row is neither in the state store nor sent by Postgres,"
                         " so its rules are not checked", model, record_id)

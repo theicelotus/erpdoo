@@ -25,7 +25,7 @@ from erpdoo import backfill
 from erpdoo.backfill import BackfillError
 from erpdoo.backoff import Stopped, Unreachable, reason, retry
 from erpdoo.config import ConfigError, load_config
-from erpdoo.events import EventBuilder
+from erpdoo.events import Event, EventBuilder
 from erpdoo.inbound import load_inbound_rules, validate_inbound
 from erpdoo.inbound_consumer import Inbound, InboundFailed
 from erpdoo.models import ModelRegistry
@@ -93,15 +93,21 @@ def run() -> None:
     reader = ReplicationReader(dsn, slot, publication, lambda table: registry.model_for_table(table))
     store = StateStore(state_path)
     store.use_source("replication")
+    if store.streaming_since is None:  # a store from before this was kept
+        store.set_streaming_since(datetime.now(timezone.utc))
 
-    def activate(registry: ModelRegistry) -> tuple[EventBuilder, list[Rule]]:
+    def activate(registry: ModelRegistry, check=None) -> tuple[EventBuilder, list[Rule]]:
         """Publish and track what the rules of installed apps need. The
         rules' own tables are kept in the state store, which gives each
         update and delete the row it replaces, so a rule sees the value a
         field is leaving. Only a rule table whose rows the store cannot keep
         needs REPLICA IDENTITY FULL, so that Postgres sends that row instead.
         ir_model and ir_model_fields are streamed so the registry follows
-        module installs."""
+        module installs. ``check(active)`` runs before anything is copied.
+
+        A rule table copied for a model created since erpdoo started
+        streaming (its app was installed later) is backfilled from the
+        model's creation, in the snapshot of the copy (see catch_up)."""
         active, skipped = split_by_model(rules, registry)
         validate(active, registry)
         tracked = tracked_tables(active, registry)
@@ -131,10 +137,34 @@ def run() -> None:
                     datetime.fromtimestamp(lost[1] / 1e6, timezone.utc).isoformat(), after)
             # A new slot starts now: changes since the store was last updated are lost.
             store.reset()
+            store.set_streaming_since(datetime.now(timezone.utc))
             if lost and lost[0] and config["backfill"]["after_lost_slot"]:
                 store.set_pending_backfill(*lost)
-        store.sync(dsn, tracked)
+        if check is not None:
+            check(active)
+        store.sync(dsn, tracked, lambda conn, tables, snapshot: catch_up(conn, active, registry, tables, snapshot))
         return EventBuilder(active, registry, store, lang), skipped
+
+    def catch_up(conn, active: list[Rule], registry: ModelRegistry, tables: list[str], snapshot) -> list[Event]:
+        """The backfilled events of rules that activate late, found in the
+        snapshot their tables were just copied in."""
+        until = snapshot.time.isoformat()
+        try:
+            result, late = backfill.catch_up(conn, active, registry, tables, store.streaming_since, lang)
+        except BackfillError as e:
+            names = ", ".join(r.name for r in active if registry.models[r.model].table in tables)
+            log.error("could not backfill the changes from before erpdoo copied the tables of %s at %s: %s\nThen"
+                      " run: erpdoo backfill --since <when the app was installed> --until %s (a change streamed"
+                      " since may then be sent twice)", names, until, e, until)
+            return []
+        for reason_ in result.skipped:
+            log.warning("backfill: %s", reason_)
+        for model, since in sorted(late.items()):
+            mine = [e for e in result.events if e.model == model]
+            log.info("%s was created at %s (its app was installed since erpdoo started streaming); backfilled"
+                     " %s, up to %s when erpdoo copied its table: %d events", model, since.isoformat(),
+                     ", ".join(r.name for r in active if r.model == model), until, len(mine))
+        return result.events
 
     def report(skipped: list[Rule], previous: set[str], registry: ModelRegistry) -> None:
         for rule in skipped:
@@ -155,6 +185,7 @@ def run() -> None:
     # Each event type's schema, for sinks with a schema registry. A rule
     # change that would break compatibility stops erpdoo here.
     retry("schema registry", lambda: prepare(sinks, builder.rules, registry), (Unreachable,), stop)
+    send_pending(store, sinks, builder.rules)
     pending = store.pending_backfill()
     if pending:
         since, until = (datetime.fromtimestamp(t / 1e6, timezone.utc) for t in pending)
@@ -238,8 +269,8 @@ def run() -> None:
                 continue
             before = {r.name for r in builder.rules}
             try:
-                new_builder, new_skipped = activate(registry)
-                prepare(sinks, new_builder.rules, registry)
+                # Schemas first: a rule the registry refuses copies nothing.
+                new_builder, new_skipped = activate(registry, lambda active: prepare(sinks, active, registry))
             except (RuleError, PublicationError, SchemaError, Unreachable) as e:
                 # Keep streaming with the rules that worked; a module
                 # install should not stop erpdoo. If Postgres needs an
@@ -254,6 +285,8 @@ def run() -> None:
                 last_error = str(e)
                 continue
             builder, recheck_at, last_error = new_builder, None, None
+            # Before anything streamed after the copy.
+            send_pending(store, sinks, builder.rules)
             report(new_skipped, {r.name for r in skipped}, registry)
             skipped = new_skipped
             for name in sorted({r.name for r in builder.rules} - before):
@@ -436,6 +469,20 @@ def start_inbound(config: dict, rules_path: str, registry: ModelRegistry, state_
     inbound = Inbound(config["inbound"], active, state_path, dsn, stop)
     inbound.start()
     return inbound
+
+
+def send_pending(store: StateStore, sinks: list, rules: list[Rule]) -> None:
+    """Deliver the backfilled events the state store keeps (see catch_up),
+    then forget them. Those of rules not active now wait."""
+    names = {r.name for r in rules}
+    ready = [(seq, Event(**fields)) for seq, fields in store.pending_events() if fields["event_type"] in names]
+    if not ready:
+        return
+    for start in range(0, len(ready), 500):
+        for sink in sinks:
+            sink.send([event for _, event in ready[start:start + 500]])
+    store.clear_pending_events(seq for seq, _ in ready)
+    log.info("sent %d backfilled events", len(ready))
 
 
 def send_backfill(result: backfill.Backfill, sinks: list) -> None:

@@ -1,0 +1,18 @@
+# erpdoo.yml for scripts/late_app_test.py, polling mode, as the dev stack's
+# read-only erpdoo-reader user: its own topic and schema namespace.
+source:
+  type: polling
+  interval: 2
+  odoo:
+    url: http://odoo:8069
+    db: odoo
+    login: erpdoo-reader
+    api_key: ${ERPDOO_POLL_API_KEY}
+
+sinks:
+  - type: kafka
+    bootstrap_servers: redpanda:9092
+    topic: erpdoo.late-app-test.polling
+    schema_registry:
+      url: http://redpanda:8081
+      namespace: erpdoo.late_app_test.polling

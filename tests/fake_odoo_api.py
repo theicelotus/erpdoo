@@ -29,7 +29,8 @@ SCHEMA = {
         ("product_uom_qty", "float", None, {"digits": [16, 2]}),
     ],
     "crm.lead": [("name", "char"), ("probability", "float"), ("active", "boolean"),
-                 ("partner_id", "many2one", "res.partner")],
+                 ("partner_id", "many2one", "res.partner"),
+                 ("priority", "selection", None, {"tracking": 1, "selection": [("0", "Normal"), ("1", "High")]})],
     "res.partner": [("name", "char")],
     "product.product": [("default_code", "char"), ("product_tmpl_id", "many2one", "product.template"),
                         ("name", "char", None, {"store": False, "related": "product_tmpl_id.name"})],
@@ -48,6 +49,8 @@ class FakeApi:
         self.calls = 0
         self.log: list[tuple[str, str]] = []
         self.writable: set[str] = set()  # models the user may change besides reading
+        self.hidden: set[str] = set()  # models whose app is not installed (yet)
+        self.installed: dict[str, datetime] = {}  # model -> when its app was installed
         self.fields: list[dict] = []
         for model, fields in SCHEMA.items():
             for name, ttype, *rest in [*MAGIC, *fields]:
@@ -155,11 +158,20 @@ class FakeApi:
             return len(found)
         return [self._out(model, r, kwargs["fields"]) for r in found]
 
+    def install(self, model: str) -> None:
+        """Install the app of a hidden model now."""
+        self.hidden.discard(model)
+        self.installed[model] = self.now
+
     def _table(self, model: str) -> dict[int, dict]:
         if model == "ir.model":
-            return {i: {"id": i, "model": m} for i, m in enumerate(SCHEMA, 1)}
+            return {i: {"id": i, "model": m} for i, m in enumerate(SCHEMA, 1) if m not in self.hidden}
+        if model == "ir.model.data":  # each model's external id, created with it
+            return {i: {"id": i, "model": "ir.model", "res_id": i,
+                        "create_date": self.installed.get(m, datetime(2026, 1, 1))}
+                    for i, m in enumerate(SCHEMA, 1) if m not in self.hidden}
         if model == "ir.model.fields":
-            return {f["id"]: f for f in self.fields}
+            return {f["id"]: f for f in self.fields if f["model"] not in self.hidden}
         if model == "mail.tracking.value":
             return {v["id"]: v for v in self.tracking}
         if model == "mail.message":
@@ -189,7 +201,7 @@ class FakeApi:
         out = {"id": row["id"]}
         for name in fields:
             f = self.field(model, name)
-            if model in ("ir.model", "ir.model.fields", "mail.tracking.value", "mail.message"):
+            if model in ("ir.model", "ir.model.data", "ir.model.fields", "mail.tracking.value", "mail.message"):
                 value = row[name]
                 if isinstance(value, datetime):
                     value = value.strftime(FMT)

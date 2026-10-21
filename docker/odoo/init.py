@@ -37,11 +37,12 @@ print("created integration user", user.login, user.id)
 
 # The read-only user polling mode reads as (see "Polling mode" in the README):
 # an internal user, plus a group that may only read the models the shipped
-# rules use, Odoo's model list and its field tracking (which Odoo otherwise
-# shows administrators only), with a fixed API key. Dev stack only.
+# rules use, Odoo's model list, its external ids (when a model was created)
+# and its field tracking (which Odoo otherwise shows administrators only),
+# with a fixed API key. Dev stack only.
 READER_LOGIN = "erpdoo-reader"
 DEV_READER_KEY = "dev-only-reader-key-not-secret"
-READ_MODELS = ["ir.model", "ir.model.fields", "mail.tracking.value", "sale.order", "sale.order.line", "account.tax",
+READ_MODELS = ["ir.model", "ir.model.fields", "ir.model.data", "mail.tracking.value", "sale.order", "sale.order.line", "account.tax",
                "account.move", "account.move.line", "stock.picking", "stock.move", "stock.picking.type", "crm.lead",
                "crm.stage"]
 CREATE_READER = f"""
@@ -57,6 +58,16 @@ env.cr.execute("INSERT INTO res_users_apikeys (name, user_id, scope, expiration_
                 "{DEV_READER_KEY}"[:INDEX_SIZE]])
 env.cr.commit()
 print("created read-only user", user.login, user.id)
+"""
+# Dev stacks created before the group had every model in READ_MODELS.
+READER_GROUP = "erpdoo: read only"
+ADD_READER_ACCESS = f"""
+group = env["res.groups"].search([("name", "=", "{READER_GROUP}")])
+have = set(group.model_access.mapped("model_id.model"))
+group.model_access = [(0, 0, {{"name": f"erpdoo read {{model}}", "model_id": env["ir.model"]._get_id(model),
+                                "perm_read": True}}) for model in {READ_MODELS!r} if model not in have]
+env.cr.commit()
+print("read-only user may now also read", ", ".join(m for m in {READ_MODELS!r} if m not in have))
 """
 
 
@@ -85,4 +96,8 @@ if not query("SELECT 1 FROM res_users WHERE login = %s", [INTEGRATION_LOGIN]):
     subprocess.run([*ODOO, "shell", "-d", "odoo", "--no-http"], input=CREATE_USER, text=True, check=True)
 if not query("SELECT 1 FROM res_users WHERE login = %s", [READER_LOGIN]):
     subprocess.run([*ODOO, "shell", "-d", "odoo", "--no-http"], input=CREATE_READER, text=True, check=True)
+elif query("SELECT count(DISTINCT m.model) FROM ir_model_access a JOIN res_groups g ON g.id = a.group_id"
+           " JOIN ir_model m ON m.id = a.model_id WHERE g.name->>'en_US' = %s AND m.model = ANY(%s)",
+           [READER_GROUP, READ_MODELS])[0][0] < len(READ_MODELS):
+    subprocess.run([*ODOO, "shell", "-d", "odoo", "--no-http"], input=ADD_READER_ACCESS, text=True, check=True)
 sys.exit(0)

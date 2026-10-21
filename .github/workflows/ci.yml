@@ -62,6 +62,11 @@ jobs:
       # checks that the missed window is backfilled (about a minute).
       - name: Backfill test
         run: python scripts/backfill_test.py
+      # Installs a test app while two erpdoos run, replication and polling,
+      # and changes its records before they may read them; each change must
+      # arrive once, backfilled (about two minutes).
+      - name: Late app test
+        run: python scripts/late_app_test.py
       # Runs a second erpdoo in polling mode (Odoo's API only, no Postgres)
       # through the smoke test's scenarios, a restart, changes between two
       # polls, an inbound message and a delete, and compares its events with

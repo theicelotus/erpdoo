@@ -14,7 +14,9 @@ is about when erpdoo is behind.
 
 Changes from before a snapshot or fetch can be streamed again after it (the
 slot may be behind); applying them in order still ends at the current rows,
-so the copy converges.
+so the copy converges. Which transactions a snapshot holds is decided by
+Postgres' own visibility (the snapshot's transaction ids), so each one is
+either in the copy or checked against rules when streamed, never both.
 
 The store also gives each change the row it replaces when Postgres does not
 send it (updates and deletes without REPLICA IDENTITY FULL). For that it
@@ -32,8 +34,10 @@ import re
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import psycopg2
 from psycopg2 import sql
@@ -127,6 +131,10 @@ class StateStore:
             -- record they point to was created after tracking started).
             CREATE TABLE IF NOT EXISTS lookups (
                 tbl TEXT NOT NULL, col TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (tbl, col, value));
+            -- Backfilled events not delivered yet, oldest first. They are
+            -- written with the table copy they were found next to, so a crash
+            -- before they are delivered does not lose them.
+            CREATE TABLE IF NOT EXISTS pending_events (seq INTEGER PRIMARY KEY, data TEXT NOT NULL);
             """
         )
         columns = [r[1] for r in self.db.execute("PRAGMA table_info(loaded_tables)")]
@@ -134,12 +142,17 @@ class StateStore:
             self.db.execute("ALTER TABLE loaded_tables ADD COLUMN lsn INTEGER NOT NULL DEFAULT 0")
         if "spec" not in columns:  # stores that kept whole tables; NULL reads as that
             self.db.execute("ALTER TABLE loaded_tables ADD COLUMN spec TEXT")
+        if "snapshot" not in columns:  # copies from before snapshots were kept: by WAL position
+            self.db.execute("ALTER TABLE loaded_tables ADD COLUMN snapshot TEXT")
         # Table -> the WAL position its snapshot was taken at (0 for tables
-        # fetched on demand), and what is kept of it.
+        # fetched on demand), the snapshot's transaction ids, and what is kept of it.
         self.loaded: dict[str, int] = {}
+        self.snapshots: dict[str, Xids] = {}
         self.specs: dict[str, TableSpec] = {}
-        for table, lsn, spec in self.db.execute("SELECT tbl, lsn, spec FROM loaded_tables"):
+        for table, lsn, spec, xids in self.db.execute("SELECT tbl, lsn, spec, snapshot FROM loaded_tables"):
             self.loaded[table] = lsn
+            if xids:
+                self.snapshots[table] = Xids.parse(xids)
             shape = json.loads(spec) if spec else {"columns": None, "full": True}
             columns = frozenset(shape["columns"]) if shape["columns"] is not None else None
             self.specs[table] = TableSpec(columns, shape["full"])
@@ -149,7 +162,10 @@ class StateStore:
             log.info("state store: written by an older erpdoo, copying it again")
             for name in ("records", "loaded_tables", "versions", "lookups"):
                 self.db.execute(f"DELETE FROM {name}")
+            # Tables copied again now: changes made before are not backfilled.
+            self.db.execute("DELETE FROM meta WHERE key = 'streaming_since'")
             self.loaded.clear()
+            self.snapshots.clear()
             self.specs.clear()
         self.db.execute("INSERT OR REPLACE INTO meta VALUES ('format', ?)", [FORMAT])
         self.db.commit()
@@ -174,15 +190,29 @@ class StateStore:
 
     def reset(self) -> None:
         """Forget everything, e.g. when the replication slot was recreated and
-        changes since the last run are lost."""
+        changes since the last run are lost. Backfilled events not delivered
+        yet are kept."""
         for table in ("records", "loaded_tables", "versions", "meta", "lookups"):
             self.db.execute(f"DELETE FROM {table}")
         self.db.execute("INSERT INTO meta VALUES ('format', ?)", [FORMAT])
         self.db.commit()
         self.loaded.clear()
+        self.snapshots.clear()
         self.specs.clear()
         self.applied_lsn = 0
         self.applied_time = None
+
+    @property
+    def streaming_since(self) -> datetime | None:
+        """Since when the store has followed every change: a model created
+        after this was installed while erpdoo ran (or was stopped), so its
+        records' changes before its table was copied are backfilled."""
+        row = self.db.execute("SELECT value FROM meta WHERE key = 'streaming_since'").fetchone()
+        return datetime.fromtimestamp(row[0] / 1e6, timezone.utc) if row else None
+
+    def set_streaming_since(self, at: datetime) -> None:
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('streaming_since', ?)", [int(at.timestamp() * 1e6)])
+        self.db.commit()
 
     def use_source(self, source: str) -> None:
         """Start over if the store was built by the other source: rows read
@@ -203,23 +233,39 @@ class StateStore:
             self.db.execute(f"DELETE FROM {name} WHERE tbl = ?", [table])
         self.db.commit()
         self.loaded.pop(table, None)
+        self.snapshots.pop(table, None)
         self.specs.pop(table, None)
 
-    def track(self, table: str, spec: TableSpec, lsn: int = 0) -> None:
-        """Start tracking a table, empty."""
-        self.db.execute("INSERT OR REPLACE INTO loaded_tables (tbl, lsn, spec) VALUES (?, ?, ?)",
-                        [table, lsn, json.dumps(spec.shape)])
+    def track(self, table: str, spec: TableSpec, lsn: int = 0, xids: Xids | None = None) -> None:
+        """Start tracking a table, empty, or as copied in a snapshot taken
+        at WAL position ``lsn`` that saw the transactions ``xids`` allows."""
+        if xids is None and lsn and table in self.snapshots and self.loaded.get(table) == lsn:
+            xids = self.snapshots[table]  # tracked again, as copied
+        self.db.execute("INSERT OR REPLACE INTO loaded_tables (tbl, lsn, spec, snapshot) VALUES (?, ?, ?, ?)",
+                        [table, lsn, json.dumps(spec.shape), str(xids) if xids else None])
         self.loaded[table] = lsn
+        if xids:
+            self.snapshots[table] = xids
+        else:
+            self.snapshots.pop(table, None)
         self.specs[table] = spec
         for column, parent in spec.lookups:
             self.index(column)
             if (table, column) not in self._children.setdefault(parent, []):
                 self._children[parent].append((table, column))
 
-    def load(self, table: str, rows: Iterable[dict], lsn: int = 0, spec: TableSpec | None = None) -> int:
+    def load(self, table: str, rows: Iterable[dict], lsn: int = 0, spec: TableSpec | None = None,
+             xids: Xids | None = None) -> int:
         """Replace a table's rows with a snapshot taken at WAL position
         ``lsn`` and start tracking it."""
         spec = spec or TableSpec()
+        count = self._copy(table, rows, spec)
+        self.track(table, spec, lsn, xids)
+        self.db.commit()
+        return count
+
+    def _copy(self, table: str, rows: Iterable[dict], spec: TableSpec) -> int:
+        """Replace a table's rows, without tracking it yet."""
         self.db.execute("DELETE FROM records WHERE tbl = ?", [table])
         self.db.execute("DELETE FROM versions WHERE tbl = ?", [table])
         count = 0
@@ -227,9 +273,16 @@ class StateStore:
             self.db.executemany("INSERT INTO records VALUES (?, ?, ?)", batch)
             count += len(batch)
             self.db.commit()  # lets SQLite checkpoint its WAL during a long copy
-        self.track(table, spec, lsn)
-        self.db.commit()
         return count
+
+    def before_copy(self, table: str, txn: Transaction) -> bool:
+        """Whether a transaction's changes to ``table`` are in its copy
+        already: the snapshot saw it committed. Such changes are not checked
+        against rules (a backfill covers them, if any does)."""
+        xids = self.snapshots.get(table)
+        if xids is not None:
+            return xids.visible(txn.xid)
+        return txn.commit_lsn < self.loaded.get(table, 0)  # copied before snapshots were kept
 
     def index(self, column: str) -> None:
         """Index a column so find() on it is fast (one2many lookups)."""
@@ -246,8 +299,7 @@ class StateStore:
         transaction, because it is streamed again after a restart; it is
         then not applied twice, and previous rows come from the versions.
 
-        Changes committed before a table's snapshot get no previous row: the
-        snapshot may already include them.
+        Changes the table's snapshot already includes get no previous row.
         """
         replay = txn.end_lsn <= self.applied_lsn
         # Each row as of this point in the transaction, during a replay.
@@ -276,7 +328,7 @@ class StateStore:
                 else:
                     self.db.execute("INSERT OR IGNORE INTO versions VALUES (?, ?, ?, ?)",
                                     [table, record_id, txn.commit_lsn, json.dumps(previous)])
-            if change.op != "insert" and txn.commit_lsn >= self.loaded[table]:
+            if change.op != "insert" and not self.before_copy(table, txn):
                 known = previous is not None and previous is not _UNKNOWN
                 if known and (change.old is None or change.old_is_key_only):
                     change.old, change.old_is_key_only = previous, False
@@ -336,6 +388,21 @@ class StateStore:
 
     def clear_pending_backfill(self) -> None:
         self.db.execute("DELETE FROM meta WHERE key IN ('backfill_since', 'backfill_until')")
+        self.db.commit()
+
+    def add_pending_events(self, events: Iterable) -> None:
+        """Keep backfilled events until they are delivered (not committed)."""
+        self.db.executemany("INSERT INTO pending_events (data) VALUES (?)", [
+            (json.dumps({"event_id": e.event_id, "event_type": e.event_type, "model": e.model,
+                         "record_id": e.record_id, "payload": e.payload}),) for e in events])
+
+    def pending_events(self) -> list[tuple[int, dict]]:
+        """Backfilled events not delivered yet, as (seq, fields of the Event)."""
+        return [(seq, json.loads(data)) for seq, data in self.db.execute(
+            "SELECT seq, data FROM pending_events ORDER BY seq")]
+
+    def clear_pending_events(self, seqs: Iterable[int]) -> None:
+        self.db.executemany("DELETE FROM pending_events WHERE seq = ?", [(s,) for s in seqs])
         self.db.commit()
 
     def prune(self, lsn: int) -> None:
@@ -463,10 +530,15 @@ class StateStore:
             cur.execute(query, [value])
             return [{name: pgoutput.convert(oid, v) for (name, oid), v in zip(columns, values)} for values in cur]
 
-    def sync(self, dsn: str, specs: dict[str, TableSpec]) -> None:
+    def sync(self, dsn: str, specs: dict[str, TableSpec],
+             during_copy: Callable[[object, list[str], Snapshot], list] | None = None) -> None:
         """Track exactly the tables in ``specs``: drop tables no longer
         needed, start over with tables whose kept columns changed, and copy
-        the tables to be copied whole."""
+        the tables to be copied whole, all in one snapshot.
+
+        ``during_copy(conn, tables, snapshot)`` runs in that snapshot after
+        the copy, on its connection; the events it returns are kept as
+        pending in the same commit that starts tracking the copied tables."""
         self.dsn = dsn
         self._types.clear()
         for table in sorted(self.tables - specs.keys()):
@@ -494,11 +566,17 @@ class StateStore:
         if missing:
             with closing(psycopg2.connect(dsn, application_name="erpdoo-snapshot")) as conn:
                 conn.set_session(isolation_level="REPEATABLE READ")
+                snap = take_snapshot(conn)
                 for table in missing:
                     started = time.monotonic()
-                    lsn, rows = snapshot(conn, table, specs[table].columns)
-                    count = self.load(table, rows, lsn, specs[table])
+                    count = self._copy(table, table_rows(conn, table, specs[table].columns), specs[table])
                     log.info("state store: copied %d rows of %s in %.1f s", count, table, time.monotonic() - started)
+                events = during_copy(conn, missing, snap) if during_copy else []
+                conn.rollback()  # only read
+            for table in missing:
+                self.track(table, specs[table], snap.lsn, snap.xids)
+            self.add_pending_events(events)
+            self.db.commit()
 
 
 def _covers(have: TableSpec, want: TableSpec) -> bool:
@@ -532,18 +610,55 @@ def _column_types(conn, table: str, columns: frozenset[str] | None) -> list[tupl
         return [(name, oid) for name, oid in cur.fetchall() if columns is None or name in columns]
 
 
-def snapshot(conn, table: str, columns: frozenset[str] | None = None) -> tuple[int, Iterator[dict]]:
-    """The WAL position of a snapshot of a table, and its rows (only
-    ``columns``, if given), converted exactly like streamed rows: every
-    column is read as text and converted by its type, as pgoutput values are.
-    ``conn`` must use REPEATABLE READ, so the rows are as of that position."""
+@dataclass(frozen=True)
+class Xids:
+    """Which transactions a Postgres snapshot saw committed, from
+    pg_current_snapshot() ("xmin:xmax:xip,..."), with 64-bit ids."""
+
+    xmin: int
+    xmax: int
+    xip: frozenset[int]
+
+    @classmethod
+    def parse(cls, text: str) -> Xids:
+        xmin, xmax, xip = text.split(":")
+        return cls(int(xmin), int(xmax), frozenset(int(x) for x in xip.split(",") if x))
+
+    def __str__(self) -> str:
+        return f"{self.xmin}:{self.xmax}:{','.join(str(x) for x in sorted(self.xip))}"
+
+    def visible(self, xid: int) -> bool:
+        """Whether the snapshot saw transaction ``xid`` (32 bits, as the
+        stream gives it) committed. Ids are compared within 2^31 of xmax."""
+        full = self.xmax + (xid - self.xmax + 2**31) % 2**32 - 2**31
+        return full < self.xmin or (full < self.xmax and full not in self.xip)
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    lsn: int  # WAL position right after it was taken: everything it saw committed is before
+    xids: Xids
+    time: datetime  # Postgres' clock when it was taken
+
+
+def take_snapshot(conn) -> Snapshot:
+    """Take the snapshot of ``conn``'s transaction, which must use
+    REPEATABLE READ: every later query in it reads as of this point."""
     with conn.cursor() as cur:
-        # The first statement takes the snapshot; every transaction it sees
-        # committed before this position.
-        cur.execute("SELECT pg_current_wal_insert_lsn() - '0/0', reltuples FROM pg_class"
-                    " WHERE oid = %s::regclass", [f"public.{table}"])
-        lsn, estimate = cur.fetchone()
-    return int(lsn), _rows(conn, table, columns, max(int(estimate), 0))
+        # The first statement takes the snapshot.
+        cur.execute("SELECT pg_current_wal_insert_lsn() - '0/0', pg_current_snapshot()::text, now()")
+        lsn, xids, at = cur.fetchone()
+    return Snapshot(int(lsn), Xids.parse(xids), at.astimezone(timezone.utc))
+
+
+def table_rows(conn, table: str, columns: frozenset[str] | None = None) -> Iterator[dict]:
+    """A table's rows (only ``columns``, if given) in ``conn``'s snapshot,
+    converted exactly like streamed rows: every column is read as text and
+    converted by its type, as pgoutput values are."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT reltuples FROM pg_class WHERE oid = %s::regclass", [f"public.{table}"])
+        estimate = cur.fetchone()[0]
+    return _rows(conn, table, columns, max(int(estimate), 0))
 
 
 def _rows(conn, table: str, columns: frozenset[str] | None, estimate: int) -> Iterator[dict]:
@@ -563,7 +678,6 @@ def _rows(conn, table: str, columns: frozenset[str] | None, estimate: int) -> It
                 logged = time.monotonic()
                 total = f" of about {estimate:,}" if estimate else ""
                 log.info("state store: copying %s, %s%s rows so far", table, f"{count:,}", total)
-    conn.commit()
 
 
 class InboundLog:

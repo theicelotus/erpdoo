@@ -30,7 +30,10 @@ A record created since the previous poll is a create; its tracked fields
 start at the old value of their first tracking message. When a model is
 first polled, erpdoo stores the current values of all its records as a
 baseline (as replication mode copies the rule tables); earlier changes give
-no event.
+no event. Except for a model created since erpdoo started polling (its app
+was installed later): its first poll goes back to when the model was
+created (Odoo's ir.model.data says), as if erpdoo had polled it all along,
+and the events of changes from before it was activated say "backfill": true.
 
 Events carry "source": {"polling": true, "approximate": ..., and
 "mail_message_id" or "write_date"}, and an id from the rule, the record and
@@ -365,6 +368,7 @@ class Poll:
     rows: dict[str, dict[int, dict]] = field(default_factory=dict)  # table -> rows to store
     deleted: dict[str, list[int]] = field(default_factory=dict)  # table -> ids gone from Odoo
     cursors: dict[str, int] = field(default_factory=dict)
+    caught_up: list[str] = field(default_factory=list)  # meta keys of catch-ups this poll completes
     message_cursor: int | None = None
     messages: dict[int, int] = field(default_factory=dict)  # handled tracking messages: id -> date
     calls: int = 0  # API calls
@@ -399,6 +403,9 @@ class Poller:
         self.polls = 0
         self.deletes_at = 0.0  # when deletes were last looked for (monotonic)
         self.fields_mark: tuple | None = None  # ir.model.fields' count and newest write_date
+        self.catching_up: dict[str, int] = {}  # model -> when its catch-up started, for this poll
+        self.created_logged = False  # the warning that ir.model.data cannot be read
+        self.clock = time.time  # erpdoo's clock, compared with Odoo's (keep them in sync)
 
     def load(self) -> ModelRegistry:
         """Log in and read Odoo's models."""
@@ -456,12 +463,20 @@ class Poller:
                            and set(t) <= tracked.keys() and "update" in r.on}
             columns = [*self.columns[model], *(m for m in META if m not in self.columns[model])]
             plans[model] = Plan(model, table, specs[table], columns, rules_, tracked, by_tracking)
+        now = int(self.clock() * SECOND)
+        first = self._meta("poll_since") is None
+        if first:  # every model there now predates polling
+            self._set_meta("poll_since", now)
+        fresh = [plan for plan in plans.values() if plan.table not in self.store.specs]
+        created = self._created([plan.model for plan in fresh]) if fresh and not first else {}
         for plan in plans.values():
             have = self.store.specs.get(plan.table)
-            if have is None or not _covers(have, plan.spec) or self._meta(f"poll_cursor:{plan.model}") is None:
+            if plan in fresh and created.get(plan.model, -1) >= self._meta("poll_since"):
+                self._catch_up(plan, created[plan.model], now)
+            elif have is None or not _covers(have, plan.spec) or self._meta(f"poll_cursor:{plan.model}") is None:
                 self._baseline(plan)
         # Tracked fields not followed before (a new rule or model): their
-        # messages so far are the baseline.
+        # messages so far are the baseline, unless the model is caught up.
         new_fields = {f["id"] for plan in plans.values() for f in plan.tracked.values()
                       if self._meta(f"poll_tracking:{f['id']}") is None}
         for table in set(self.store.specs) - {p.table for p in plans.values()}:
@@ -557,6 +572,47 @@ class Poller:
                  " from now on give events", count, plan.model, time.monotonic() - started,
                  self.client.calls - calls)
 
+    def _created(self, models: list[str]) -> dict[str, int]:
+        """When each model was created (microseconds since 1970), from its
+        first external id, which its module's install creates: Odoo leaves
+        ir.model's create_date empty. Two API calls."""
+        if not self.client.call("ir.model.data", "has_access", [], "read"):
+            if not self.created_logged:
+                self.created_logged = True
+                log.warning("polling: Odoo user %s may not read ir.model.data, so erpdoo cannot tell when an app"
+                            " installed later was installed: its records' values when erpdoo finds it are the"
+                            " baseline, and changes before give no event; give it read access (see \"Polling"
+                            " mode\" in the README)", self.client.login)
+            return {}
+        ids = {r["id"]: r["model"] for r in self.client.call("ir.model", "search_read", [("model", "in", models)],
+                                                              fields=["model"])}
+        created: dict[str, int] = {}
+        for r in self.client.call("ir.model.data", "search_read", [("model", "=", "ir.model"),
+                                                                   ("res_id", "in", sorted(ids))],
+                                  fields=["res_id", "create_date"]):
+            if r["create_date"]:
+                model = ids[r["res_id"]]
+                created[model] = min(created.get(model, micros(r["create_date"])), micros(r["create_date"]))
+        return created
+
+    def _catch_up(self, plan: Plan, since: int, now: int) -> None:
+        """A model created after erpdoo started polling: nothing stored, and
+        its cursors at its creation, so the next poll reads every change
+        since then, its tracking messages included."""
+        self.store.forget(plan.table)
+        self.store.track(plan.table, plan.spec)
+        self._set_meta(f"poll_cursor:{plan.model}", since)
+        self._set_meta(f"poll_baseline:{plan.model}", since)
+        self._set_meta(f"poll_catch_up:{plan.model}", now)
+        for f in plan.tracked.values():
+            self._set_meta(f"poll_tracking:{f['id']}", 1)
+            self._set_meta(f"poll_tracking_since:{f['id']}", since)
+        self.store.commit()
+        log.info("polling: %s was created at %s (its app was installed since erpdoo started polling); its first"
+                 " poll reads every change since then, and backfills the events of %s", plan.model,
+                 datetime.fromtimestamp(since / SECOND, timezone.utc).isoformat(),
+                 ", ".join(r.name for r in plan.rules))
+
     def _baseline_tracking(self, field_ids: set[int]) -> None:
         """Note the tracking messages of these fields in the window as
         handled, so that changes from before polling started give no event."""
@@ -600,6 +656,11 @@ class Poller:
         started, calls = time.monotonic(), self.client.calls
         self.polls += 1
         result = Poll(self.polls)
+        self.catching_up = {plan.model: at for plan in self.plans.values()
+                            if (at := self._meta(f"poll_catch_up:{plan.model}")) is not None}
+        result.caught_up = [f"poll_catch_up:{m}" for m in self.catching_up] + [
+            f"poll_tracking_since:{f['id']}" for plan in self.plans.values() for f in plan.tracked.values()
+            if self._meta(f"poll_tracking_since:{f['id']}") is not None]
         related = Related(self.reader, dict(self.columns))
         self.builder.store = related
         rows = {}
@@ -672,11 +733,18 @@ class Poller:
         if not fields:
             return []
         cursor = self._meta("poll_messages_cursor") or 0
-        values = self._tracking_values(fields, cursor - self.overlap)
+        # Fields of a model being caught up are read from its creation.
+        starts = {i: self._meta(f"poll_tracking_since:{i}") for i in fields}
+        since = min([cursor - self.overlap, *(s for s in starts.values() if s is not None)])
+        values = []
+        for start in sorted({s for s in starts.values() if s is not None}):
+            values += self._tracking_values([i for i, s in starts.items() if s == start], start)
+        normal = [i for i, s in starts.items() if s is None]
+        if normal:
+            values += self._tracking_values(normal, cursor - self.overlap)
         by_message: dict[int, list[dict]] = {}
         for v in values:
             by_message.setdefault(v["mail_message_id"][0], []).append(v)
-        since = cursor - self.overlap
         handled = {r[0] for r in self.store.db.execute("SELECT id FROM polled_messages WHERE at >= ?", [since])}
         new = sorted(by_message.keys() - handled)
         messages = self.client.call("mail.message", "read", new, ["model", "res_id", "date", "create_uid"],
@@ -802,6 +870,8 @@ class Poller:
         record_id = row["id"]
         name = what if namespace is BACKFILL_NAMESPACE else f"{rule.name}/{rule.model}/{record_id}/{what}"
         source = {"polling": True, "approximate": approximate, **detail}
+        if at < self.catching_up.get(rule.model, 0):
+            source["backfill"] = True  # from before the model's rules were activated
         cause = self.store.inbound_cause_at(at, uid, rule.model, record_id, SLACK) if uid else None
         if cause:
             source["inbound"] = {"message_id": cause["message_id"], "topic": cause["topic"], "rule": cause["rule"]}
@@ -816,6 +886,8 @@ class Poller:
             self.store.db.executemany("DELETE FROM records WHERE tbl = ? AND id = ?", [(table, i) for i in ids])
         for model, cursor in result.cursors.items():
             self._set_meta(f"poll_cursor:{model}", cursor)
+        for key in result.caught_up:
+            self._set_meta(key, None)
         if result.messages:
             self.store.db.executemany("INSERT OR IGNORE INTO polled_messages VALUES (?, ?)",
                                       list(result.messages.items()))

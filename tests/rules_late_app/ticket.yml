@@ -1,0 +1,15 @@
+# Rules for the test module in tests/odoo_addons/erpdoo_late_app, used by
+# scripts/late_app_test.py: one on a field Odoo tracks, one on a field it does not.
+TicketOpened:
+  model: erpdoo.test.ticket
+  when:
+    state: { to: open }
+  fields: [name, state, priority]
+  include:
+    partner_id: [name]
+
+TicketEscalated:
+  model: erpdoo.test.ticket
+  when:
+    priority: { to: high }
+  fields: [name, priority]

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from erpdoo.replication import Change, Transaction
-from erpdoo.store import StateStore, TableSpec
+from erpdoo.store import StateStore, TableSpec, Xids
 
 
 def store() -> StateStore:
@@ -57,6 +57,60 @@ def test_changes_before_the_snapshot_get_no_previous_row():
     s.apply_transaction(txn(0x80, update))
     assert update.old is None
     assert s.get("sale_order_line", 1)["name"] == "Desk XL"
+
+
+def test_snapshot_ids_tell_which_transactions_a_copy_has():
+    xids = Xids.parse("1000:1005:1002,1004")
+    assert str(xids) == "1000:1005:1002,1004"
+    assert [x for x in range(998, 1008) if xids.visible(x)] == [998, 999, 1000, 1001, 1003]
+    # The stream gives 32-bit ids; the snapshot 64-bit ones, here in a later epoch.
+    later = Xids.parse(f"{2**32 + 10}:{2**32 + 20}:")
+    assert later.visible(15) and not later.visible(25)
+    assert later.visible(2**32 - 5)  # from just before the wraparound
+
+
+def test_the_snapshot_not_the_wal_position_decides(tmp_path):
+    path = str(tmp_path / "state.db")
+    s = StateStore(path)
+    s.load("sale_order_line", [{"id": 1, "order_id": 7, "name": "Desk"}], lsn=0x100, xids=Xids.parse("1000:1005:1002"))
+    # Committed before the copy's position, but still committing when the
+    # snapshot was taken (1002), so not in the copy: it gets its previous row.
+    committing = change("update", new={"id": 1, "order_id": 7, "name": "Desk XL"})
+    t = Transaction(1002, 0x80, 0x90, datetime(2026, 1, 1, tzinfo=timezone.utc), [committing])
+    assert not s.before_copy("sale_order_line", t)
+    s.apply_transaction(t)
+    assert committing.old == {"id": 1, "order_id": 7, "name": "Desk"}
+    # Seen by the snapshot, though streamed after the copy: already in it.
+    assert s.before_copy("sale_order_line", Transaction(1001, 0x80, 0x90, t.commit_time, []))
+    s.commit()
+    reopened = StateStore(path)
+    assert reopened.snapshots["sale_order_line"] == Xids.parse("1000:1005:1002")
+    assert not reopened.before_copy("sale_order_line", Transaction(1005, 0x200, 0x210, t.commit_time, []))
+
+
+def test_backfilled_events_wait_until_delivered(tmp_path):
+    from erpdoo.events import Event
+
+    path = str(tmp_path / "state.db")
+    s = StateStore(path)
+    event = Event("e1", "LeadWon", "crm.lead", 4, {"event_id": "e1", "source": {"backfill": True}})
+    s.add_pending_events([event, Event("e2", "LeadWon", "crm.lead", 5, {"event_id": "e2"})])
+    s.commit()
+    s.reset()  # a lost slot keeps them
+    [(seq, first), _] = StateStore(path).pending_events()
+    assert Event(**first) == event
+    s.clear_pending_events([seq])
+    assert [e["event_id"] for _, e in StateStore(path).pending_events()] == ["e2"]
+
+
+def test_streaming_since_is_forgotten_with_the_copy(tmp_path):
+    path = str(tmp_path / "state.db")
+    s = StateStore(path)
+    assert s.streaming_since is None
+    s.set_streaming_since(datetime(2026, 10, 21, 8, 0, tzinfo=timezone.utc))
+    assert StateStore(path).streaming_since == datetime(2026, 10, 21, 8, 0, tzinfo=timezone.utc)
+    s.reset()
+    assert s.streaming_since is None
 
 
 def test_replayed_transaction_gets_previous_rows_from_versions():

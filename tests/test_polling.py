@@ -1,4 +1,5 @@
 from collections import Counter
+from datetime import timezone
 
 import pytest
 from jsonschema import Draft7Validator
@@ -309,3 +310,63 @@ def test_an_idle_poll_costs_one_call_per_model_and_one_for_tracking(api):
     result = run(p)  # reads the same records again (the overlap), nothing changed
     assert (result.events, result.changes) == ([], [])
     assert api.calls - calls == result.calls == 4  # sale.order, sale.order.line, crm.lead, tracking
+
+
+def test_a_model_installed_later_is_polled_from_its_creation(api):
+    """An app installed while erpdoo polls: changes made before erpdoo
+    notices it are backfilled, exactly once, then polling goes on."""
+    raised = parse_rule("PriorityRaised", {"model": "crm.lead", "when": {"priority": {"to": "1"}}, "fields": ["name"]})
+    api.hidden = {"crm.lead"}
+    p = Poller(api, SETTINGS, StateStore(":memory:"))
+    p.clock = lambda: api.now.replace(tzinfo=timezone.utc).timestamp()  # Odoo time is UTC
+    p.load()
+    assert [r.name for r in p.activate([CONFIRMED, raised, WON])] == ["PriorityRaised", "LeadWon"]
+    run(p)
+    api.tick()
+    api.install("crm.lead")
+    api.tick()
+    lead = api.create("crm.lead", {"name": "Late deal", "probability": 10.0, "active": True, "priority": "0"})
+    for priority in ("1", "0", "1"):  # raised twice, tracked
+        api.tick()
+        api.write("crm.lead", lead, {"priority": priority})
+    api.tick()
+    api.write("crm.lead", lead, {"probability": 100.0})  # won, not tracked
+    api.tick()
+    assert p.models_changed()
+    p.load()
+    assert p.activate([CONFIRMED, raised, WON]) == []
+    api.tick()
+    api.write("crm.lead", lead, {"priority": "0"})
+    api.tick()
+    api.write("crm.lead", lead, {"priority": "1"})  # after the activation: polled as usual
+    api.tick()
+    events = run(p).events
+    got = [(e.event_type, e.payload["source"].get("backfill", False), e.payload["source"]["approximate"])
+           for e in events]
+    # The lead is new to erpdoo, so its win is a create, dated when it was
+    # created, as for any record created between two polls.
+    assert got == [("LeadWon", True, True), ("PriorityRaised", True, False), ("PriorityRaised", True, False),
+                   ("PriorityRaised", False, False)]
+    assert events[0].payload["changes"] == {"probability": {"from": None, "to": 100.0}}
+    # Ids from the tracking messages, as erpdoo backfill gives them.
+    assert len({e.event_id for e in events}) == 4
+    api.tick(70)
+    assert run(p).events == []  # nothing again, past the overlap too
+    api.write("crm.lead", lead, {"priority": "0"})
+    api.tick()
+    api.write("crm.lead", lead, {"priority": "1"})
+    api.tick()
+    assert [e.payload["source"].get("backfill", False) for e in run(p).events] == [False]
+
+
+def test_a_model_from_before_polling_started_gets_a_baseline(api):
+    api.hidden = {"crm.lead"}
+    store = StateStore(":memory:")
+    p = poller(api, store, rules=[CONFIRMED])
+    api.installed["crm.lead"] = api.now.replace(year=2025)  # installed long ago, its rule added now
+    api.hidden = set()
+    api.write("crm.lead", api.lead, {"probability": 100.0})
+    api.tick()
+    p.load()
+    p.activate([CONFIRMED, WON])
+    assert run(p).events == []

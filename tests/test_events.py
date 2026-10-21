@@ -105,6 +105,22 @@ def test_previous_row_from_the_store_without_replica_identity_full():
     assert event.payload["changes"] == {"state": {"from": "draft", "to": "sale"}}
 
 
+def test_changes_already_in_the_copy_are_not_checked():
+    from erpdoo.store import Xids
+
+    created = parse_rule("QuotationCreated", {"model": "sale.order", "on": "create", "fields": ["name"]})
+    b = builder(rules=[CONFIRMED, created])
+    b.store.load("sale_order", [order()], lsn=0x100, xids=Xids.parse("1000:1005:1002"))
+    # Seen by the copy's snapshot (a backfill covers them): neither the
+    # confirmation nor the new order gives an event, though streamed later.
+    seen = txn(update(None, order(state="sale")), Change("insert", "sale_order", "sale.order", None, False,
+                                                         order(id=6)), xid=1001)
+    assert b.build(seen, b.store.apply_transaction(seen)) == []
+    # Still committing when the snapshot was taken: not in the copy, checked.
+    late = txn(Change("insert", "sale_order", "sale.order", None, False, order(id=7)), xid=1002)
+    assert [e.event_type for e in b.build(late, b.store.apply_transaction(late))] == ["QuotationCreated"]
+
+
 def test_delete_rule_gets_the_deleted_row_from_the_store():
     deleted = parse_rule("SaleOrderDeleted", {"model": "sale.order", "on": "delete", "fields": ["name"]})
     b = builder(rules=[deleted])

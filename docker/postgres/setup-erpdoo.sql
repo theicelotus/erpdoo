@@ -48,3 +48,7 @@ GRANT SELECT ON :tables TO erpdoo;
 -- columns that say which record changed when, not the messages themselves.
 GRANT SELECT (id, model, res_id, date) ON mail_message TO erpdoo;
 GRANT SELECT ON mail_tracking_value, ir_model_fields_selection TO erpdoo;
+-- For rules of apps installed later: when their model was created (Odoo's
+-- external ids; ir_model's own create_date is empty), so the changes from
+-- before erpdoo started streaming the app's tables are backfilled.
+GRANT SELECT ON ir_model_data TO erpdoo;

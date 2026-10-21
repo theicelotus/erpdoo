@@ -1,0 +1,9 @@
+# erpdoo.yml for scripts/late_app_test.py, replication mode: its own topic
+# and schema namespace, next to the dev stack's erpdoo.
+sinks:
+  - type: kafka
+    bootstrap_servers: redpanda:9092
+    topic: erpdoo.late-app-test
+    schema_registry:
+      url: http://redpanda:8081
+      namespace: erpdoo.late_app_test
