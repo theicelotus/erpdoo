@@ -22,10 +22,11 @@ from pathlib import Path
 
 import yaml
 
+from erpdoo.health import DEFAULTS, parse_size
 from erpdoo.rules import YamlLoader
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-SETTINGS = {"sinks", "viewer"}
+SETTINGS = {"sinks", "viewer", "slot"}
 
 
 class ConfigError(Exception):
@@ -62,7 +63,7 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
             "type": "kafka",
             "bootstrap_servers": env.get("ERPDOO_KAFKA_BOOTSTRAP", "127.0.0.1:19092"),
             "topic": env.get("ERPDOO_TOPIC", "erpdoo.events"),
-        }]}
+        }], "slot": slot_settings(None)}
     doc = yaml.load(Path(path).read_text(), Loader=YamlLoader) or {}
     if not isinstance(doc, dict):
         raise ConfigError(f"{path}: expected a mapping")
@@ -76,4 +77,18 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
     viewer = config.get("viewer")
     if viewer is not None and (not isinstance(viewer, dict) or viewer.keys() - {"host", "port"}):
         raise ConfigError(f"{path}: 'viewer' takes host and port")
+    config["slot"] = slot_settings(config.get("slot"), path)
     return config
+
+
+def slot_settings(spec, path=None) -> dict:
+    """The ``slot`` settings with defaults: warn when the slot is more than
+    ``lag_warning`` bytes (or "1GB") or ``lag_warning_seconds`` behind, and
+    report its lag every ``report_seconds``."""
+    spec = spec or {}
+    if not isinstance(spec, dict) or spec.keys() - DEFAULTS.keys():
+        raise ConfigError(f"{path}: 'slot' takes {', '.join(sorted(DEFAULTS))}")
+    try:
+        return {**DEFAULTS, **{k: parse_size(v) if k == "lag_warning" else float(v) for k, v in spec.items()}}
+    except ValueError as e:
+        raise ConfigError(f"{path}: slot: {e}") from None

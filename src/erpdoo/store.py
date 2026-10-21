@@ -114,6 +114,9 @@ class StateStore:
         row = self.db.execute("SELECT value FROM meta WHERE key = 'applied_lsn'").fetchone()
         # End of the last transaction applied; anything up to here is in the store.
         self.applied_lsn = row[0] if row else 0
+        row = self.db.execute("SELECT value FROM meta WHERE key = 'applied_time'").fetchone()
+        # When that transaction committed, in microseconds since 1970 (UTC).
+        self.applied_time: int | None = row[0] if row else None
         self.dsn = dsn
         self.fetches = 0  # queries to Postgres for rows not in the store
         self._pg = None
@@ -136,6 +139,7 @@ class StateStore:
         self.loaded.clear()
         self.specs.clear()
         self.applied_lsn = 0
+        self.applied_time = None
 
     def forget(self, table: str) -> None:
         """Stop tracking a table. Its rows would go stale, so they are dropped."""
@@ -229,7 +233,9 @@ class StateStore:
                 self._apply(change, None if previous is _UNKNOWN else previous, spec)
         if not replay:
             self.applied_lsn = txn.end_lsn
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('applied_lsn', ?)", [txn.end_lsn])
+            self.applied_time = int(txn.commit_time.timestamp() * 1_000_000)
+            self.db.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                                [("applied_lsn", txn.end_lsn), ("applied_time", self.applied_time)])
         return replay
 
     def _apply(self, change: Change, previous: dict | None, spec: TableSpec) -> None:

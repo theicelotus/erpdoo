@@ -20,8 +20,9 @@ from datetime import datetime
 import psycopg2
 import psycopg2.extras
 
-from erpdoo import pgoutput
+from erpdoo import health, pgoutput
 from erpdoo.backoff import reason
+from erpdoo.health import SlotHealth
 
 log = logging.getLogger(__name__)
 
@@ -236,6 +237,9 @@ class ReplicationReader:
         self.cur = None
         self.assembler: TransactionAssembler | None = None
         self._resume_logged = False
+        # Set by setup() when Postgres had invalidated the slot and it was created again.
+        self.slot_was_lost = False
+        self._health_conn = None
 
     def setup(self, tables: list[str], replica_identity_full: list[str] = ()) -> bool:
         """Create or update the publication and create the slot if missing.
@@ -297,9 +301,16 @@ class ReplicationReader:
             log.info("%s", step.done)
 
         cur.execute(
-            "SELECT plugin, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = %s", [self.slot]
+            "SELECT plugin, confirmed_flush_lsn, wal_status FROM pg_replication_slots WHERE slot_name = %s",
+            [self.slot],
         )
         row = cur.fetchone()
+        if row is not None and row[2] == "lost":
+            # Postgres removed WAL the slot still needed (max_slot_wal_keep_size);
+            # it cannot stream from it any more.
+            cur.execute("SELECT pg_drop_replication_slot(%s)", [self.slot])
+            self.slot_was_lost = True
+            row = None
         if row is None:
             cur.execute("SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", [self.slot])
             log.info("created replication slot %s", self.slot)
@@ -321,11 +332,15 @@ class ReplicationReader:
             application_name="erpdoo",
         )
         self.cur = self.conn.cursor()
-        self.cur.start_replication(
-            slot_name=self.slot,
-            decode=False,
-            options={"proto_version": "1", "publication_names": self.publication},
-        )
+        try:
+            self.cur.start_replication(
+                slot_name=self.slot,
+                decode=False,
+                options={"proto_version": "1", "publication_names": self.publication},
+            )
+        except psycopg2.errors.ObjectNotInPrerequisiteState as e:
+            # Invalidated since setup(); the next start creates it again.
+            raise StreamError(f"cannot stream from slot {self.slot} ({reason(e)})") from e
         self.assembler = TransactionAssembler(self.resolve_model)
 
     def poll(self, timeout: float = 1.0, max_changes: int = 10_000) -> Batch:
@@ -369,7 +384,18 @@ class ReplicationReader:
         on its status interval (10 s)."""
         self.cur.send_feedback(flush_lsn=lsn, force=now)
 
+    def health(self) -> SlotHealth | None:
+        """How far the slot trails Postgres' WAL (see erpdoo.health)."""
+        if self._health_conn is None:
+            self._health_conn = psycopg2.connect(self.dsn, application_name="erpdoo-health")
+            self._health_conn.autocommit = True
+        with self._health_conn.cursor() as cur:
+            return health.query(cur, self.slot)
+
     def close(self) -> None:
+        if self._health_conn is not None:
+            self._health_conn.close()
+            self._health_conn = None
         if self.conn is None:
             return
         try:

@@ -82,6 +82,7 @@ class Viewer:
         self.clients: set[asyncio.Queue] = set()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.server: uvicorn.Server | None = None
+        self.slot: dict | None = None  # slot health, set by erpdoo's main loop
         self.app = self._build_app()
 
     def _build_app(self) -> FastAPI:
@@ -95,6 +96,10 @@ class Viewer:
         @app.get("/", response_class=HTMLResponse)
         async def page():
             return PAGE
+
+        @app.get("/slot")
+        async def slot():
+            return self.slot
 
         @app.get("/recent")
         async def recent():
@@ -165,6 +170,7 @@ PAGE = """<!doctype html>
   h1 { font-size: 16px; margin: 0; }
   .status { color: var(--muted); }
   .status.live::before { content: "\\25CF "; color: var(--ins); }
+  .status.warn { color: var(--del); font-weight: 600; }
   label { color: var(--muted); user-select: none; }
   main { padding: 12px 16px; display: grid; gap: 10px; }
   .txn { background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
@@ -198,6 +204,7 @@ PAGE = """<!doctype html>
 <header>
   <h1>erpdoo live</h1>
   <span id="status" class="status">connecting</span>
+  <span id="slot" class="status" title="how far erpdoo's replication slot trails Postgres">slot: checking</span>
   <label><input type="checkbox" id="only-events"> only transactions with events</label>
   <label><input type="checkbox" id="show-internal"> show internal-only updates</label>
   <label><input type="checkbox" id="pause"> pause</label>
@@ -283,6 +290,18 @@ showInternal.onchange = () => document.body.classList.toggle("show-internal", sh
 
 onlyEvents.onchange = () => { for (const el of list.querySelectorAll(".txn")) el.hidden = onlyEvents.checked && el.dataset.events === "0"; };
 pause.onchange = () => { if (!pause.checked) { const q = queued; queued = []; q.forEach(add); } };
+
+// Slot lag, refreshed every 10 seconds (erpdoo measures it every minute).
+const slotEl = document.getElementById("slot");
+function showSlot() {
+  fetch("slot").then(r => r.json()).then(h => {
+    if (!h) return;
+    slotEl.textContent = h.text.replace(/^slot \S+: /, "slot: ") + (h.warnings.length ? " \u2014 " + h.warnings.join("; ") : "");
+    slotEl.className = "status" + (h.warnings.length ? " warn" : "");
+  }).catch(() => {});
+}
+showSlot();
+setInterval(showSlot, 10000);
 
 fetch("recent").then(r => r.json()).then(items => {
   items.forEach(add);

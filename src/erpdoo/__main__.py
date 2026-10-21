@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 import psycopg2
 from confluent_kafka import KafkaException
@@ -95,6 +96,15 @@ def run() -> None:
             replica_identity_full=full,
         )
         if slot_created:
+            if reader.slot_was_lost:
+                reader.slot_was_lost = False
+                since = (datetime.fromtimestamp(store.applied_time / 1e6, timezone.utc).isoformat()
+                         if store.applied_time else "the last transaction erpdoo processed (time unknown)")
+                log.error(
+                    "replication slot %s had been invalidated by Postgres, which removed WAL erpdoo had not"
+                    " read yet (it held more than max_slot_wal_keep_size); created it again. Changes committed"
+                    " between %s and %s were not streamed, so events from that time may be missing."
+                    " The state store is copied again.", slot, since, datetime.now(timezone.utc).isoformat())
             # A new slot starts now: changes since the store was last updated are lost.
             store.reset()
         store.sync(dsn, tracked)
@@ -126,6 +136,7 @@ def run() -> None:
         viewer.start()
 
     confirmed_at = time.monotonic()
+    reported_at = 0.0  # last slot health report
     # For tests only (scripts/replay_test.py): while this file exists, events
     # are delivered but the slot is not confirmed; once it is removed, erpdoo
     # exits at once, as if it had crashed.
@@ -171,6 +182,9 @@ def run() -> None:
                     confirmed_at = time.monotonic()
                     store.prune(batch.ack_lsn)
                     store.commit()
+            if time.monotonic() - reported_at >= config["slot"]["report_seconds"]:
+                reported_at = time.monotonic()
+                report_health(reader, store, config["slot"], viewer)
             models_changed = any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes)
             if models_changed:
                 registry = ModelRegistry.load(dsn)
@@ -204,6 +218,22 @@ def run() -> None:
         if viewer:
             viewer.stop()
     log.info("stopped")
+
+
+def report_health(reader: ReplicationReader, store: StateStore, settings: dict, viewer) -> None:
+    """Log how far the slot trails Postgres' WAL, as a warning past the
+    configured thresholds, and show it in the viewer."""
+    health = reader.health()
+    if health is None:
+        return
+    problems = health.warnings(settings)
+    text = f"{health.describe()}; {store.fetches} rows fetched on demand so far"
+    if problems:
+        log.warning("%s: %s", text, "; ".join(problems))
+    else:
+        log.info("%s", text)
+    if viewer:
+        viewer.slot = health.as_dict(settings)
 
 
 if __name__ == "__main__":
