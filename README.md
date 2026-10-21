@@ -41,11 +41,11 @@ next to the events built from it. This is a real event from the dev stack:
 
 ```json
 {
-  "event_id": "cdf720b0-763d-5c84-b402-ce66b89b9e47",
+  "event_id": "cd443309-b495-5e44-af7e-736cd95bad1b",
   "event_type": "SaleOrderConfirmed",
   "model": "sale.order",
-  "record_id": 35,
-  "occurred_at": "2026-10-19T23:47:45.626831+00:00",
+  "record_id": 3740,
+  "occurred_at": "2026-10-21T00:04:04.388605+00:00",
   "changes": {
     "state": {
       "from": "draft",
@@ -53,15 +53,15 @@ next to the events built from it. This is a real event from the dev stack:
     }
   },
   "record": {
-    "id": 35,
-    "name": "S00035",
+    "id": 3740,
+    "name": "S03740",
     "state": "sale",
-    "date_order": "2026-10-19 23:47:45",
+    "date_order": "2026-10-21 00:04:04",
     "client_order_ref": null,
     "currency_id": 1,
     "amount_untaxed": "1500.00",
-    "amount_tax": "0.00",
-    "amount_total": "1500.00",
+    "amount_tax": "225.00",
+    "amount_total": "1725.00",
     "user_id": 2,
     "team_id": 1,
     "company_id": 1,
@@ -74,25 +74,33 @@ next to the events built from it. This is a real event from the dev stack:
     },
     "order_line": [
       {
-        "id": 59,
+        "id": 3766,
         "name": "[DESK0005] Customizable Desk (Custom, White)\n160x80cm, with large legs.",
         "product_uom_qty": "2.00",
         "price_unit": "750.0",
         "discount": "0.00",
         "price_subtotal": "1500.00",
-        "price_total": "1500.00",
+        "price_total": "1725.00",
         "product_id": {
-          "id": 44,
+          "id": 45,
           "name": "Customizable Desk",
           "default_code": "DESK0005"
-        }
+        },
+        "tax_id": [
+          {
+            "id": 1,
+            "name": "15%",
+            "amount": "15.0000",
+            "amount_type": "percent"
+          }
+        ]
       }
     ]
   },
   "source": {
     "table": "sale_order",
-    "xid": 1813,
-    "commit_lsn": "0/61C27B0"
+    "xid": 10145,
+    "commit_lsn": "0/E5EBAC8"
   }
 }
 ```
@@ -213,6 +221,7 @@ InvoicePosted:
       fields: [name, quantity, price_unit, price_subtotal]
       where: { display_type: product }
     invoice_line_ids.product_id: [name, default_code]
+    invoice_line_ids.tax_ids: [name, amount]   # many2many
 ```
 
 - `when` compares each record at the start of a transaction with the same
@@ -222,9 +231,11 @@ InvoicePosted:
   `DeliveryDone` does with `picking_type_id.code: outgoing`.
 - `on` picks the triggers: `create`, `update`, `delete` (default: create and update).
 - `fields` lists the record's fields to keep (default: every stored column).
-- `include` expands many2one and one2many fields, nested with dots. Related
-  fields such as a product's `name` (stored on the product template) are
-  followed automatically. `where` filters the related rows.
+- `include` expands many2one, one2many and many2many fields, nested with
+  dots. Related fields such as a product's `name` (stored on the product
+  template) are followed automatically. `where` filters the related rows.
+  one2many and many2many rows come in order of their id, not in the order
+  Odoo shows them.
 
 erpdoo checks rules against Odoo's models at startup and lists every
 problem, such as an unknown field. The full reference is at the top of
@@ -247,15 +258,18 @@ For the shipped rules, run this in Odoo's database (named `odoo` here):
 CREATE ROLE erpdoo WITH LOGIN REPLICATION PASSWORD 'change-me';
 GRANT CONNECT ON DATABASE odoo TO erpdoo;
 
--- The rules' tables, the related records they include, and ir_model /
+-- The rules' tables, the related records they include (with the join
+-- tables of many2many fields such as taxes), and ir_model /
 -- ir_model_fields, which tell erpdoo when an Odoo app is installed.
 CREATE PUBLICATION erpdoo FOR TABLE
-  account_move, account_move_line, crm_lead, crm_stage, ir_model, ir_model_fields,
+  account_move, account_move_line, account_move_line_account_tax_rel, account_tax,
+  account_tax_sale_order_line_rel, crm_lead, crm_stage, ir_model, ir_model_fields,
   product_product, product_template, res_partner, sale_order, sale_order_line,
   stock_move, stock_picking, stock_picking_type;
 
 GRANT SELECT ON
-  account_move, account_move_line, crm_lead, crm_stage, ir_model, ir_model_fields,
+  account_move, account_move_line, account_move_line_account_tax_rel, account_tax,
+  account_tax_sale_order_line_rel, crm_lead, crm_stage, ir_model, ir_model_fields,
   product_product, product_template, res_partner, sale_order, sale_order_line,
   stock_move, stock_picking, stock_picking_type
   TO erpdoo;
@@ -389,7 +403,9 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
 - **The state store copies whole tables.** Each table a rule includes
   (partners, products, order and invoice lines, ...) is copied into SQLite
   when tracking starts, which takes a while on a large database, then kept
-  current from the stream. many2many includes are not supported yet.
+  current from the stream. A many2many include also copies its join table
+  (for taxes, `account_move_line_account_tax_rel`, one row per line and
+  tax), which must be published like the other tables.
 - **Delivery is at-least-once.** erpdoo streams changes over Postgres'
   replication protocol and confirms its position in the slot right after
   every sink has delivered the events. If it crashes in between, or one sink
