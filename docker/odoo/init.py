@@ -69,6 +69,19 @@ group.model_access = [(0, 0, {{"name": f"erpdoo read {{model}}", "model_id": env
 env.cr.commit()
 print("read-only user may now also read", ", ".join(m for m in {READ_MODELS!r} if m not in have))
 """
+# Dev stacks created with an earlier fixed key: replace it with the current one.
+DEV_KEYS = [(INTEGRATION_LOGIN, "erpdoo (dev stack)", DEV_API_KEY),
+            (READER_LOGIN, "erpdoo polling (dev stack)", DEV_READER_KEY)]
+REPLACE_KEY = """
+from odoo.addons.base.models.res_users import INDEX_SIZE, KEY_CRYPT_CONTEXT
+user = env["res.users"].search([("login", "=", {login!r})])
+env.cr.execute("DELETE FROM res_users_apikeys WHERE user_id = %s AND name = %s", [user.id, {name!r}])
+env.cr.execute("INSERT INTO res_users_apikeys (name, user_id, scope, expiration_date, key, index)"
+               " VALUES (%s, %s, NULL, NULL, %s, %s)",
+               [{name!r}, user.id, KEY_CRYPT_CONTEXT.hash({key!r}), {key!r}[:INDEX_SIZE]])
+env.cr.commit()
+print("replaced the dev API key of", user.login)
+"""
 
 
 def query(sql: str, params=()):
@@ -100,4 +113,10 @@ elif query("SELECT count(DISTINCT m.model) FROM ir_model_access a JOIN res_group
            " JOIN ir_model m ON m.id = a.model_id WHERE g.name->>'en_US' = %s AND m.model = ANY(%s)",
            [READER_GROUP, READ_MODELS])[0][0] < len(READ_MODELS):
     subprocess.run([*ODOO, "shell", "-d", "odoo", "--no-http"], input=ADD_READER_ACCESS, text=True, check=True)
+for login, name, key in DEV_KEYS:
+    # The index is the key's first 8 characters (Odoo's INDEX_SIZE).
+    if not query("SELECT 1 FROM res_users_apikeys k JOIN res_users u ON u.id = k.user_id"
+                 " WHERE u.login = %s AND k.name = %s AND k.index = %s", [login, name, key[:8]]):
+        subprocess.run([*ODOO, "shell", "-d", "odoo", "--no-http"],
+                       input=REPLACE_KEY.format(login=login, name=name, key=key), text=True, check=True)
 sys.exit(0)
