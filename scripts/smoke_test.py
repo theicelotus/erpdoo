@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
 import time
 import urllib.request
@@ -23,6 +24,12 @@ from decimal import Decimal
 
 import psycopg2
 from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.schema_registry.json_schema import JSONDeserializer
+from confluent_kafka.serialization import MessageField, SerializationContext
+
+REGISTRY = "http://localhost:18081"
 
 
 class Odoo:
@@ -65,10 +72,34 @@ def wait_until(what: str, check, timeout: float = 120):
         time.sleep(1)
 
 
+class Decoder:
+    """Decodes messages the way a consumer would: the schema registry's wire
+    format with confluent-kafka's own deserializers, which fetch the
+    writer's schema by the id in the message (the JSON one also validates
+    the event against it), or plain JSON."""
+
+    def __init__(self, registry: str = REGISTRY) -> None:
+        self.client = SchemaRegistryClient({"url": registry})
+        self.json = JSONDeserializer(None, schema_registry_client=self.client)
+        self.avro = AvroDeserializer(self.client)
+
+    def __call__(self, msg) -> tuple[dict, int | None]:
+        """The event and the id of its schema (None for plain JSON)."""
+        value = msg.value()
+        if value[:1] != b"\0":
+            return json.loads(value), None
+        schema_id = struct.unpack(">I", value[1:5])[0]
+        kind = self.client.get_schema(schema_id).schema_type
+        context = SerializationContext(msg.topic(), MessageField.VALUE)
+        return (self.avro if kind == "AVRO" else self.json)(value, context), schema_id
+
+
 class Events:
     """Collects events from the topic, starting at its current end."""
 
-    def __init__(self, bootstrap: str, topic: str) -> None:
+    def __init__(self, bootstrap: str, topic: str, registry: str = REGISTRY) -> None:
+        self.topic = topic
+        self.decode = Decoder(registry)
         self.consumer = Consumer({"bootstrap.servers": bootstrap, "group.id": f"smoke-{uuid.uuid4()}",
                                   "enable.auto.commit": False})
 
@@ -81,6 +112,17 @@ class Events:
         self.consumer.assign([TopicPartition(topic, pid, self.consumer.get_watermark_offsets(
             TopicPartition(topic, pid), timeout=10)[1]) for pid in partitions])
         self.seen: list[tuple[float, dict]] = []
+        self.schema_ids: dict[str, int | None] = {}  # event_id -> id of the schema it was written with
+
+    def poll(self, timeout: float) -> dict | None:
+        """Read one message, decode it and keep the event."""
+        msg = self.consumer.poll(timeout)
+        if msg is None or msg.error():
+            return None
+        event, schema_id = self.decode(msg)
+        self.seen.append((time.monotonic(), event))
+        self.schema_ids[event["event_id"]] = schema_id
+        return event
 
     def wait(self, model: str, record_id: int, timeout: float, settle: float = 3.0) -> list[tuple[float, dict]]:
         """Events for one record; after the first arrives, wait ``settle``
@@ -93,10 +135,8 @@ class Events:
         if matches():
             deadline = min(deadline, time.monotonic() + settle)
         while time.monotonic() < deadline:
-            msg = self.consumer.poll(0.2)
-            if msg is None or msg.error():
+            if self.poll(0.2) is None:
                 continue
-            self.seen.append((time.monotonic(), json.loads(msg.value())))
             if matches():
                 deadline = min(deadline, time.monotonic() + settle)
         return matches()
@@ -152,6 +192,7 @@ def main() -> int:
     p.add_argument("--db", default="odoo")
     p.add_argument("--kafka", default="127.0.0.1:19092")
     p.add_argument("--topic", default="erpdoo.events")
+    p.add_argument("--registry", default=REGISTRY)
     p.add_argument("--pg", default="host=localhost dbname=odoo user=erpdoo password=erpdoo",
                    help="erpdoo's connection, to check that it cannot write")
     p.add_argument("--timeout", type=float, default=30)
@@ -159,7 +200,7 @@ def main() -> int:
 
     wait_until("Odoo", lambda: urllib.request.urlopen(args.odoo.rstrip("/") + "/web/health", timeout=5).status == 200)
     odoo = Odoo(args.odoo, args.db, "admin", "admin")
-    events = Events(args.kafka, args.topic)
+    events = Events(args.kafka, args.topic, args.registry)
     results: list[tuple[str, bool, str]] = []
 
     problems, notes = write_access(args.pg)

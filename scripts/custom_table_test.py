@@ -5,7 +5,8 @@ tests/odoo_addons (model erpdoo.test.gadget, table erpdoo_custom_gadgets)
 and runs a second erpdoo with the rule in tests/rules_custom_table, its own
 slot and topic. That erpdoo must name the custom table in the SQL it asks
 an admin to run; after running that SQL, activating a gadget must give a
-GadgetActivated event. Uninstalls the module and removes the slot at the end.
+GadgetActivated event. Uninstalls the module and removes the slot and the
+event's schema subjects at the end.
 
     python scripts/custom_table_test.py
 """
@@ -19,11 +20,12 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from smoke_test import Events, Odoo, wait_until  # noqa: E402
+from smoke_test import REGISTRY, Events, Odoo, wait_until  # noqa: E402
 
 MODULE, MODEL, TABLE = "erpdoo_custom_table", "erpdoo.test.gadget", "erpdoo_custom_gadgets"
 SLOT, TOPIC, CONTAINER = "erpdoo_custom_table_test", "erpdoo.custom-table-test", "erpdoo-custom-table-test"
@@ -34,6 +36,7 @@ def main() -> int:
     p.add_argument("--odoo", default="http://localhost:8069")
     p.add_argument("--db", default="odoo")
     p.add_argument("--kafka", default="127.0.0.1:19092")
+    p.add_argument("--registry", default=REGISTRY)
     p.add_argument("--admin-sql", default="docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U odoo -d odoo",
                    help="command that runs SQL from stdin as an admin")
     args = p.parse_args()
@@ -89,7 +92,7 @@ def main() -> int:
         else:
             print(f"ok   with tables: in erpdoo.yml, {MODEL} -> {TABLE} without detection")
 
-        events = Events(args.kafka, TOPIC)
+        events = Events(args.kafka, TOPIC, args.registry)
         partner = odoo("res.partner", "search", [("customer_rank", ">", 0)], limit=1)[0]
         partner_name = odoo("res.partner", "read", [partner], ["name"])[0]["name"]
         name = f"Gadget {uuid.uuid4().hex[:6]}"
@@ -107,7 +110,14 @@ def main() -> int:
         subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
         admin(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '{SLOT}';")
         odoo("ir.module.module", "button_immediate_uninstall", [module["id"]])
-        print(f"     uninstalled {MODULE} and dropped slot {SLOT}")
+        for subject in ("erpdoo.GadgetActivated", "erpdoo.avro.GadgetActivated"):
+            for query in ("", "?permanent=true"):  # a subject is soft-deleted first
+                try:
+                    urllib.request.urlopen(urllib.request.Request(
+                        f"{args.registry}/subjects/{subject}{query}", method="DELETE"), timeout=10)
+                except OSError:
+                    pass
+        print(f"     uninstalled {MODULE}, dropped slot {SLOT} and the GadgetActivated schemas")
     for failure in failures:
         print(f"FAIL {failure}")
     print("OK" if not failures else "FAIL")

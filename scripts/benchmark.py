@@ -58,7 +58,9 @@ class Collector:
             if msg is None or msg.error():
                 continue
             now = time.time()
-            event = json.loads(msg.value())
+            value = msg.value()
+            # Skip the schema registry's header (zero byte, schema id) of JSON Schema messages.
+            event = json.loads(value[5:] if value[:1] == b"\0" else value)
             if event["event_type"] == "SaleOrderConfirmed":
                 commit = datetime.fromisoformat(event["occurred_at"]).timestamp()
                 with self.lock:

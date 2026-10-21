@@ -4,7 +4,7 @@
 #   docker compose up -d --build
 #
 # Odoo:     http://localhost:8069  (admin / admin)
-# Console:  http://localhost:8080  (topic erpdoo.events)
+# Console:  http://localhost:8080  (topics erpdoo.events, erpdoo.events.avro; Schema Registry)
 # Viewer:   http://localhost:8000  (live changes and events)
 # Kafka:    127.0.0.1:19092        Schema registry: http://localhost:18081
 # Postgres: localhost:5432         (odoo / odoo; erpdoo's read-only role: erpdoo / erpdoo)
@@ -133,6 +133,7 @@ services:
       ERPDOO_PG_DSN: host=postgres dbname=odoo user=erpdoo password=erpdoo
       ERPDOO_KAFKA_BOOTSTRAP: redpanda:9092
       ERPDOO_TOPIC: erpdoo.events
+      ERPDOO_SCHEMA_REGISTRY: http://redpanda:8081
       # Test hook for scripts/replay_test.py; does nothing unless the file exists.
       ERPDOO_TEST_HOLD_ACK: /var/lib/erpdoo/test-hold-ack
     ports:

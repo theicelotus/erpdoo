@@ -51,9 +51,7 @@ def main() -> int:
     def wait_for(order: int, count: int, timeout: float) -> list[dict]:
         deadline = time.monotonic() + timeout
         while len(confirmations(order)) < count and time.monotonic() < deadline:
-            msg = events.consumer.poll(0.5)
-            if msg is not None and not msg.error():
-                events.seen.append((time.monotonic(), json.loads(msg.value())))
+            events.poll(0.5)
         return confirmations(order)
 
     name = f"Replay Test {uuid.uuid4().hex[:8]}"

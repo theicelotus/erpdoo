@@ -3,9 +3,27 @@
 # confirmed only after all of them have delivered.
 
 sinks:
+  # Each event type's schema is registered in the schema registry, under the
+  # subject <namespace>.<event type> (see "Schemas" in the README), and
+  # messages carry its id. Without schema_registry, messages are plain JSON.
   - type: kafka
     bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
     topic: ${ERPDOO_TOPIC:-erpdoo.events}
+    format: json                # JSON Schema (the default), or avro
+    schema_registry:
+      url: ${ERPDOO_SCHEMA_REGISTRY:-http://127.0.0.1:18081}
+      # namespace: erpdoo       # of the subjects and record names
+
+  # The same events in Avro, to compare the two in Redpanda Console. A sink
+  # in another format needs its own namespace, since subjects are named
+  # after the event type. Remove it if you do not need Avro.
+  - type: kafka
+    bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
+    topic: ${ERPDOO_TOPIC:-erpdoo.events}.avro
+    format: avro
+    schema_registry:
+      url: ${ERPDOO_SCHEMA_REGISTRY:-http://127.0.0.1:18081}
+      namespace: erpdoo.avro
 
   # One JSON event per line on standard output (docker compose logs erpdoo).
   - type: stdout
