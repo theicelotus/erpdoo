@@ -47,6 +47,10 @@ jobs:
       # Installs a test module whose model sets its own _table.
       - name: Custom table name test
         run: python scripts/custom_table_test.py
+      # Makes Postgres invalidate erpdoo's slot while erpdoo is stopped, and
+      # checks that the missed window is backfilled (about a minute).
+      - name: Backfill test
+        run: python scripts/backfill_test.py
       - name: Show logs
         if: failure()
         run: docker compose logs --no-color --tail=300
