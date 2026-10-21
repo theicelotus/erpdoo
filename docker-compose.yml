@@ -138,6 +138,9 @@ services:
       # odoo-init with this fixed key (dev stack only).
       ERPDOO_ODOO_URL: http://odoo:8069
       ERPDOO_ODOO_API_KEY: dev-only-integration-key-not-secret
+      # Polling mode (source: polling in erpdoo.yml) reads as Odoo's
+      # erpdoo-reader user, created by odoo-init with this fixed key (dev stack only).
+      ERPDOO_POLL_API_KEY: dev-only-reader-key-not-secret
       # Test hook for scripts/replay_test.py; does nothing unless the file exists.
       ERPDOO_TEST_HOLD_ACK: /var/lib/erpdoo/test-hold-ack
     ports:

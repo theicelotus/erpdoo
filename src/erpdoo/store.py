@@ -92,6 +92,7 @@ INBOUND_SCHEMA = """
         message_id TEXT NOT NULL, rule TEXT NOT NULL, uid INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS inbound_attempts_start ON inbound_attempts (start_lsn);
 """
+SOURCES = {"replication": 1, "polling": 2}  # meta 'source': which mode built the store
 SQLITE_TIMEOUT = 30  # seconds to wait for the other connection's write (inbound and outbound share the file)
 
 
@@ -172,6 +173,19 @@ class StateStore:
         self.specs.clear()
         self.applied_lsn = 0
         self.applied_time = None
+
+    def use_source(self, source: str) -> None:
+        """Start over if the store was built by the other source: rows read
+        through Odoo's API (polling) and from Postgres (replication) differ
+        slightly, and so do the positions kept."""
+        code = SOURCES[source]
+        row = self.db.execute("SELECT value FROM meta WHERE key = 'source'").fetchone()
+        if (row[0] if row else SOURCES["replication"]) != code and self.loaded:
+            log.info("state store: built in %s mode, starting over for %s mode",
+                     next(k for k, v in SOURCES.items() if v != code), source)
+            self.reset()
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('source', ?)", [code])
+        self.db.commit()
 
     def forget(self, table: str) -> None:
         """Stop tracking a table. Its rows would go stale, so they are dropped."""

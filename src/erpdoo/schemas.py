@@ -153,9 +153,10 @@ def event_shape(rule: Rule, registry: ModelRegistry) -> Shape:
             "xid": Shape("integer", doc="Postgres transaction id (streamed events)"),
             "commit_lsn": Shape("string", doc="WAL position of the commit (streamed events)"),
             "backfill": Shape("boolean", doc="rebuilt by erpdoo backfill"),
-            "approximate": Shape("boolean", doc="backfilled from current values"),
-            "mail_message_id": Shape("integer", doc="backfill: Odoo's tracking message"),
-            "write_date": Shape("string", doc="backfill: the record's write_date"),
+            "polling": Shape("boolean", doc="read by polling Odoo's API"),
+            "approximate": Shape("boolean", doc="backfilled or polled from values, not from Odoo's field tracking"),
+            "mail_message_id": Shape("integer", doc="backfill, polling: Odoo's tracking message"),
+            "write_date": Shape("string", doc="backfill, polling: the record's write_date"),
             "create_date": Shape("string", doc="backfill: the record's create_date"),
             "inbound": Shape("object", fields={
                 "message_id": Shape("string", nullable=False),

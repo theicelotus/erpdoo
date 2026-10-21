@@ -1,6 +1,6 @@
 """Create the "odoo" database with demo data and the apps the shipped event
-packs use, and the integration user erpdoo's inbound rules act as, unless
-that is done already.
+packs use, the integration user erpdoo's inbound rules act as, and the
+read-only user erpdoo's polling mode reads as, unless that is done already.
 
 Running odoo -i again on installed apps reloads their data and rewrites
 records (every CRM lead, for one), which looks like real changes to erpdoo
@@ -35,6 +35,30 @@ env.cr.commit()
 print("created integration user", user.login, user.id)
 """
 
+# The read-only user polling mode reads as (see "Polling mode" in the README):
+# an internal user, plus a group that may only read the models the shipped
+# rules use, Odoo's model list and its field tracking (which Odoo otherwise
+# shows administrators only), with a fixed API key. Dev stack only.
+READER_LOGIN = "erpdoo-reader"
+DEV_READER_KEY = "dev-only-reader-key-not-secret"
+READ_MODELS = ["ir.model", "ir.model.fields", "mail.tracking.value", "sale.order", "sale.order.line", "account.tax",
+               "account.move", "account.move.line", "stock.picking", "stock.move", "stock.picking.type", "crm.lead",
+               "crm.stage"]
+CREATE_READER = f"""
+from odoo.addons.base.models.res_users import INDEX_SIZE, KEY_CRYPT_CONTEXT
+group = env["res.groups"].create({{"name": "erpdoo: read only", "model_access": [
+    (0, 0, {{"name": f"erpdoo read {{model}}", "model_id": env["ir.model"]._get_id(model), "perm_read": True}})
+    for model in {READ_MODELS!r}]}})
+user = env["res.users"].with_context(no_reset_password=True).create({{
+    "name": "erpdoo reader", "login": "{READER_LOGIN}", "groups_id": [(6, 0, [env.ref("base.group_user").id, group.id])]}})
+env.cr.execute("INSERT INTO res_users_apikeys (name, user_id, scope, expiration_date, key, index)"
+               " VALUES (%s, %s, NULL, NULL, %s, %s)",
+               ["erpdoo polling (dev stack)", user.id, KEY_CRYPT_CONTEXT.hash("{DEV_READER_KEY}"),
+                "{DEV_READER_KEY}"[:INDEX_SIZE]])
+env.cr.commit()
+print("created read-only user", user.login, user.id)
+"""
+
 
 def query(sql: str, params=()):
     try:
@@ -59,4 +83,6 @@ else:
     print(f"apps already installed: {', '.join(APPS)}", flush=True)
 if not query("SELECT 1 FROM res_users WHERE login = %s", [INTEGRATION_LOGIN]):
     subprocess.run([*ODOO, "shell", "-d", "odoo", "--no-http"], input=CREATE_USER, text=True, check=True)
+if not query("SELECT 1 FROM res_users WHERE login = %s", [READER_LOGIN]):
+    subprocess.run([*ODOO, "shell", "-d", "odoo", "--no-http"], input=CREATE_READER, text=True, check=True)
 sys.exit(0)

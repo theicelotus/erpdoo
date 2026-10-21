@@ -1,4 +1,4 @@
-"""Odoo's external JSON-RPC API, as erpdoo's inbound rules use it.
+"""Odoo's external JSON-RPC API, as erpdoo's inbound rules and polling mode use it.
 
 Calls run as one Odoo user, authenticated with an API key (Odoo accepts it
 in place of the password). Each call is one Odoo transaction with Odoo's own
@@ -56,8 +56,10 @@ class OdooClient:
         self.timeout = timeout
         self.uid: int | None = None
         self._ids = itertools.count(1)
+        self.calls = 0  # requests sent to Odoo, for polling mode's load report
 
     def _rpc(self, service: str, method: str, *args):
+        self.calls += 1
         body = json.dumps({"jsonrpc": "2.0", "method": "call", "id": next(self._ids),
                            "params": {"service": service, "method": method, "args": args}}).encode()
         request = urllib.request.Request(f"{self.url}/jsonrpc", body, {"Content-Type": "application/json"})

@@ -29,6 +29,7 @@ from erpdoo.events import EventBuilder
 from erpdoo.inbound import load_inbound_rules, validate_inbound
 from erpdoo.inbound_consumer import Inbound, InboundFailed
 from erpdoo.models import ModelRegistry
+from erpdoo.odoo_rpc import OdooClient, OdooError, OdooSetupError, OdooUnavailable
 from erpdoo.replication import PublicationError, ReplicationReader, StreamError
 from erpdoo.rules import (
     Rule, RuleError, load_rules, missing_model_message, split_by_model, tracked_tables, validate,
@@ -42,6 +43,7 @@ log = logging.getLogger("erpdoo")
 MODEL_TABLES = ("ir_model", "ir_model_fields")
 RECHECK_SECONDS = 30
 CONFIRM_SECONDS = 10  # at most this long between confirmations sent to Postgres
+MAX_POLL_DELAY = 60  # seconds between polls at most while Odoo does not answer
 
 
 def main() -> None:
@@ -60,7 +62,7 @@ def main() -> None:
         sys.exit(2)
     except Stopped:
         log.info("stopped")
-    except (DeliveryError, StreamError, InboundFailed, psycopg2.OperationalError) as e:
+    except (DeliveryError, StreamError, InboundFailed, psycopg2.OperationalError, OdooError) as e:
         # Nothing undelivered was confirmed: after a restart, which waits for
         # Postgres and Kafka to be back, the events are sent again.
         log.error("%s; stopping, unconfirmed events are sent again after a restart", reason(e))
@@ -75,12 +77,12 @@ def run() -> None:
     state_path = os.environ.get("ERPDOO_STATE", "erpdoo-state.db")
     lang = os.environ.get("ERPDOO_LANG", "en_US")
     config = load_config(os.environ.get("ERPDOO_CONFIG"))
-    if config["source"]["type"] != "replication":
-        raise ConfigError("source: polling is not available yet; remove source: from erpdoo.yml")
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
     signal.signal(signal.SIGINT, lambda _signum, _frame: stop.set())
+    if config["source"]["type"] == "polling":
+        return run_polling(config, rules_path, state_path, lang, stop)
 
     rules = load_rules(rules_path)
     # After a reboot erpdoo may start before Postgres and Kafka: wait for them.
@@ -88,6 +90,7 @@ def run() -> None:
     report_tables(registry, None)
     reader = ReplicationReader(dsn, slot, publication, lambda table: registry.model_for_table(table))
     store = StateStore(state_path)
+    store.use_source("replication")
 
     def activate(registry: ModelRegistry) -> tuple[EventBuilder, list[Rule]]:
         """Publish and track what the rules of installed apps need. The
@@ -267,6 +270,63 @@ def run() -> None:
     log.info("stopped")
 
 
+def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop: threading.Event) -> None:
+    """Polling mode (see erpdoo.polling): no Postgres, only Odoo's API."""
+    from erpdoo.polling import Poller
+
+    source = config["source"]
+    odoo = source["odoo"]
+    client = OdooClient(odoo["url"], odoo["db"], odoo["login"], odoo["api_key"])
+    store = StateStore(state_path)
+    store.use_source("polling")
+    poller = Poller(client, source, store, lang, config["tables"])
+    rules = load_rules(rules_path)
+    try:
+        # After a reboot erpdoo may start before Odoo: wait for it.
+        registry = retry("Odoo", poller.load, (OdooUnavailable,), stop)
+        skipped = retry("Odoo", lambda: poller.activate(rules), (OdooUnavailable,), stop)
+    except OdooSetupError as e:
+        raise ConfigError(f"polling: {e}") from None
+    for rule in skipped:
+        log.warning("rule %s skipped: %s; restart erpdoo once its app is installed", rule.name,
+                    missing_model_message(rule, registry))
+    log.info("rules: %d active (%s), %d inactive; transitions from Odoo's field tracking: %s",
+             len(poller.rules), ", ".join(r.name for r in poller.rules) or "none", len(skipped),
+             ", ".join(sorted(n for p in poller.plans.values() for n in p.by_tracking)) or "none")
+    sinks = [retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec),
+                   (Unreachable, KafkaException, TimeoutError), stop)
+             for spec in config["sinks"]]
+    retry("schema registry", lambda: prepare(sinks, poller.rules, poller.registry), (Unreachable,), stop)
+    interval = source["interval"]
+    log.info("polling %s every %g s as %s, to %s", odoo["url"], interval, odoo["login"],
+             ", ".join(spec["type"] for spec in config["sinks"]))
+    delay = interval  # after a failed poll; doubles up to MAX_POLL_DELAY
+    try:
+        while not stop.is_set():
+            started = time.monotonic()
+            try:
+                result = poller.poll()
+            except (OdooUnavailable, OdooSetupError) as e:
+                (log.error if isinstance(e, OdooSetupError) else log.warning)(
+                    "polling: %s; trying again in %g s", e, delay)
+                stop.wait(delay)
+                delay = min(delay * 2, MAX_POLL_DELAY)
+                continue
+            delay = interval
+            # Every sink must deliver before the poll is noted. If one fails,
+            # erpdoo stops; after a restart the same changes are read again.
+            if result.events:
+                for sink in sinks:
+                    sink.send(result.events)
+            poller.commit(result)
+            (log.info if result.changes or result.events else log.debug)("poll %d: %s", result.number,
+                                                                          result.summary())
+            stop.wait(max(0.0, interval - (time.monotonic() - started)))
+    finally:
+        for sink in sinks:
+            sink.close()
+
+
 def start_inbound(config: dict, rules_path: str, registry: ModelRegistry, state_path: str, dsn: str,
                   stop: threading.Event) -> Inbound | None:
     """Start consuming inbound messages, if erpdoo.yml has inbound settings
@@ -307,6 +367,9 @@ def backfill_command(argv: list[str]) -> None:
     args = p.parse_args(argv)
     dsn = os.environ.get("ERPDOO_PG_DSN", "host=localhost dbname=odoo user=erpdoo password=erpdoo")
     config = load_config(os.environ.get("ERPDOO_CONFIG"))
+    if config["source"]["type"] == "polling":
+        raise ConfigError("erpdoo backfill reads Postgres, which polling mode does not use. In polling mode erpdoo"
+                          " catches up by itself: after a stop it reads everything written since its cursor")
     registry = ModelRegistry.load(dsn, config["tables"])
     active, skipped = split_by_model(load_rules(os.environ.get("ERPDOO_RULES", "rules")), registry)
     validate(active, registry)
