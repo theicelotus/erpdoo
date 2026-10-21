@@ -1,6 +1,6 @@
 # erpdoo
 
-Turn Odoo's database changes into clean business events and stream them to Kafka, with nothing installed inside Odoo.
+An Odoo Kafka connector and webhooks: change data capture that turns Odoo's database changes into clean business events, with nothing installed inside Odoo.
 
 [![CI](https://github.com/theicelotus/erpdoo/actions/workflows/ci.yml/badge.svg)](https://github.com/theicelotus/erpdoo/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -10,7 +10,11 @@ Turn Odoo's database changes into clean business events and stream them to Kafka
 
 ## What it does
 
-erpdoo reads Odoo's PostgreSQL logical replication stream directly, with no Debezium and no Kafka Connect, and turns each committed transaction into business events such as `SaleOrderConfirmed` or `InvoicePaid`, with the customer, order lines and products filled in. Nothing is installed inside Odoo, and no code is needed per event: each event is a short YAML rule, and six ship with erpdoo. Events go to Kafka (JSON Schema or Avro, with schemas registered automatically), a webhook or stdout, and messages from other systems can act on Odoo in the other direction. erpdoo is in early development.
+erpdoo reads Odoo's PostgreSQL logical replication stream directly, with no Debezium and no Kafka Connect, and turns each committed transaction into business events such as `SaleOrderConfirmed` or `InvoicePaid`, with the customer, order lines and products filled in.
+
+Nothing is installed inside Odoo, and no code is needed per event: each event is a short YAML rule, and six ship with erpdoo. Events go to Kafka (JSON Schema or Avro, with schemas registered automatically), a webhook or stdout, and messages from other systems can act on Odoo in the other direction.
+
+Version 0.1: tested end to end; configuration may change before 1.0.
 
 ```
 Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ Kafka / Redpanda / webhook / stdout
@@ -35,13 +39,13 @@ Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ 
 - Python 3.11 or later, or Docker.
 - A sink: Kafka or Redpanda (a schema registry is optional), or a webhook endpoint.
 - **Replication access to Odoo's Postgres**: `wal_level=logical`, a role with `REPLICATION`, and a database admin who runs a few SQL statements once ([Postgres setup](docs/postgres-setup.md)). erpdoo's role stays read-only.
-- **Or, for hosted Odoo** (Odoo Online, Odoo.sh), which usually gives no replication access: [polling mode](docs/polling.md) reads Odoo's API instead, with no database access but real limits. States of fields Odoo does not track between two polls are lost, deletes are found late, latency is the poll interval, and each poll costs API calls. On Odoo Online the external API needs the Custom plan.
+- **Or, for hosted Odoo** without replication access: [polling mode](docs/polling.md) reads Odoo's API instead, with real limits.
 
 ## Quick start
 
 The dev stack runs Odoo 18 with demo data, Postgres 16, Redpanda with its schema registry, Redpanda Console and erpdoo. It needs Docker with Compose v2.
 
-1. Start it. The first start downloads about 2 GB of images, then installs Odoo's Sales, Inventory, CRM and shipping apps with demo data (about a minute), and an integration user for [inbound messages](docs/inbound.md). A one-shot `db-setup` container then prepares Postgres as a database admin would, so erpdoo runs with a role that can stream and read but not write.
+1. Start it. The first start downloads about 2 GB of images, then installs Odoo with demo data (about a minute).
    ```sh
    git clone https://github.com/theicelotus/erpdoo && cd erpdoo
    docker compose up -d --build
@@ -58,11 +62,15 @@ A full example event is in [docs/events.md](docs/events.md#an-event).
 For your own self-hosted Odoo:
 
 1. Have a database admin prepare Postgres once, as described in the [Postgres setup guide](docs/postgres-setup.md).
-2. Install erpdoo from a clone, with the live viewer's extra, or build its Docker image:
-   ```sh
-   git clone https://github.com/theicelotus/erpdoo && pip install './erpdoo[viewer]'
-   docker build -t erpdoo ./erpdoo    # or this
-   ```
+2. Install erpdoo in one of two ways:
+   - **With pip**, from a clone, with the live viewer's extra:
+     ```sh
+     git clone https://github.com/theicelotus/erpdoo && pip install './erpdoo[viewer]'
+     ```
+   - **With Docker**, by building its image:
+     ```sh
+     git clone https://github.com/theicelotus/erpdoo && docker build -t erpdoo ./erpdoo
+     ```
 3. Copy the shipped rules from [rules/](rules/) and set `ERPDOO_PG_DSN` (for example `host=db dbname=odoo user=erpdoo password=...`), `ERPDOO_RULES` and `ERPDOO_STATE` (the state store's SQLite file, on persistent storage). All settings are in [Configuration](docs/configuration.md).
 4. Run `erpdoo` under a supervisor (systemd, or Docker's restart policy). When Postgres or a sink goes away it exits without confirming what is undelivered, and continues from there when restarted.
 5. Tell it where events go, in `erpdoo.yml` (or `ERPDOO_CONFIG`):
@@ -90,19 +98,23 @@ SaleOrderConfirmed:
     order_line.product_id: [name, default_code]
 ```
 
-A consumer, with confluent-kafka. JSON Schema messages are plain JSON after a 5-byte schema registry header:
+A consumer on the dev stack, with confluent-kafka (`pip install 'confluent-kafka[json]'`), whose deserializer fetches each message's schema from the registry and checks the event against it:
 
 ```python
-import json
 from confluent_kafka import Consumer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.json_schema import JSONDeserializer
+from confluent_kafka.serialization import MessageField, SerializationContext
 
+registry = SchemaRegistryClient({"url": "http://127.0.0.1:18081"})
+deserialize = JSONDeserializer(None, schema_registry_client=registry)  # each message's own schema
 consumer = Consumer({"bootstrap.servers": "127.0.0.1:19092", "group.id": "billing",
                      "auto.offset.reset": "earliest"})  # read_committed is librdkafka's default
 consumer.subscribe(["erpdoo.events"])
 while True:
     msg = consumer.poll(1.0)
     if msg is not None and not msg.error():
-        event = json.loads(msg.value()[5:])
+        event = deserialize(msg.value(), SerializationContext(msg.topic(), MessageField.VALUE))
         print(event["event_id"], event["event_type"], event["record"]["name"])
 ```
 
@@ -110,7 +122,7 @@ Commands:
 
 ```sh
 erpdoo                                    # stream events, by the rules and erpdoo.yml
-erpdoo backfill --since 2026-10-21T01:28:55Z --until 2026-10-21T01:29:06Z [--dry-run]
+erpdoo backfill --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z [--dry-run]
 python -m erpdoo.models sale.order        # how an Odoo model maps to its table
 docker compose restart erpdoo             # dev stack: after editing rules/ or erpdoo.yml
 ```

@@ -114,8 +114,10 @@ docker compose logs erpdoo | grep inbound
 
 ## The integration user
 
-The dev stack creates `erpdoo-integration` with a fixed API key (in
-[docker-compose.yml](../docker-compose.yml), dev only). For your own Odoo:
+The dev stack creates `erpdoo-integration` on its first start, when it
+installs Odoo ([docker/odoo/init.py](../docker/odoo/init.py)), with a fixed
+API key (in [docker-compose.yml](../docker-compose.yml), dev only). For your
+own Odoo:
 
 1. **Settings → Users & Companies → Users → New**: name it, login
    `erpdoo-integration`, type **Internal User**. Give it only the groups the

@@ -23,7 +23,12 @@ checked against the running stack, not only with unit tests.
 ## Setting up
 
 Start the dev stack (see [Quick start](README.md#quick-start)) and install
-erpdoo with its development extras in a virtual environment:
+erpdoo with its development extras in a virtual environment. On its first
+start the stack installs Odoo's Sales, Inventory, CRM and shipping apps
+with demo data, the [integration user](docs/inbound.md#the-integration-user)
+for inbound messages and the [read-only user](docs/polling.md#the-read-only-user)
+for polling mode, and prepares Postgres in a one-shot `db-setup` container
+(see [Setting up Postgres](docs/postgres-setup.md#the-sql)).
 
 ```sh
 docker compose up -d --build

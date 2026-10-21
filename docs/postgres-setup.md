@@ -71,7 +71,9 @@ erpdoo creates its replication slot itself, which `REPLICATION` allows. The
 publication and slot names are set with `ERPDOO_PUBLICATION` and
 `ERPDOO_SLOT` (both `erpdoo` by default). The dev stack runs the same steps
 from [docker/postgres/setup-erpdoo.sql](../docker/postgres/setup-erpdoo.sql),
-in its one-shot `db-setup` container.
+in a one-shot `db-setup` container that runs as a database admin would,
+before erpdoo starts, so the dev stack's erpdoo also runs with a role that
+can stream and read but not write.
 
 If erpdoo's role is allowed to make these changes, for example because it
 owns Odoo's tables, erpdoo makes them itself and no admin step is needed.

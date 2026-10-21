@@ -15,7 +15,7 @@ limits.
 ## Running a backfill
 
 ```sh
-erpdoo backfill --since 2026-10-21T01:28:55Z --until 2026-10-21T01:29:06Z [--dry-run]
+erpdoo backfill --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z [--dry-run]
 ```
 
 rebuilds the events the active rules would have produced in that window
