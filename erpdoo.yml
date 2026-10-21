@@ -2,6 +2,22 @@
 # ${VAR:-default}. Events go to every sink listed; the replication slot is
 # confirmed only after all of them have delivered.
 
+# Where Odoo's changes come from: Postgres logical replication (the default,
+# set with ERPDOO_PG_DSN), or, for hosted Odoo without database access,
+# polling Odoo's JSON-RPC API as a read-only Odoo user. Polling needs no
+# Postgres access, but has limits: see "Polling mode" in the README.
+# source:
+#   type: polling
+#   interval: 5       # seconds between polls: the latency of events
+#   overlap: 60       # seconds read again before the cursor, for transactions that commit late
+#   deletes: 300      # seconds between the id comparisons that find deletes (false: never)
+#   batch: 500        # records per API call
+#   odoo:
+#     url: https://example.odoo.com
+#     db: example
+#     login: erpdoo-reader
+#     api_key: ${ERPDOO_POLL_API_KEY}
+
 sinks:
   # Each event type's schema is registered in the schema registry, under the
   # subject <namespace>.<event type> (see "Schemas" in the README), and

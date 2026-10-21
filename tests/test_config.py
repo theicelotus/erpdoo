@@ -80,3 +80,35 @@ inbound:
     ]:
         with pytest.raises(ConfigError, match=error):
             load_config(write(tmp_path, "sinks: [{type: stdout}]\n" + text))
+
+
+def test_source_setting(tmp_path):
+    for text in ("", "source: replication\n", "source: {type: replication}\n"):
+        assert load_config(write(tmp_path, "sinks: [{type: stdout}]\n" + text))["source"] == {"type": "replication"}
+    path = write(tmp_path, """
+sinks: [{type: stdout}]
+source:
+  type: polling
+  interval: 2
+  deletes: false
+  odoo: {url: "https://example.odoo.com", db: example, login: erpdoo-reader, api_key: "${KEY}"}
+""")
+    assert load_config(path, env={"KEY": "k"})["source"] == {
+        "type": "polling", "interval": 2.0, "overlap": 60.0, "deletes": None, "batch": 500,
+        "odoo": {"url": "https://example.odoo.com", "db": "example", "login": "erpdoo-reader", "api_key": "k"}}
+    odoo = "odoo: {url: u, db: d, login: l, api_key: k}"
+    assert load_config(write(tmp_path, f"sinks: [{{type: stdout}}]\nsource: {{type: polling, {odoo}}}\n"))[
+        "source"]["deletes"] == 300.0
+    for text, error in [
+        ("source: polling", "polling needs the Odoo to poll"),
+        ("source: postgres", "is replication, or a mapping with type: polling"),
+        ("source: {type: replication, slot: x}", "replication takes no settings"),
+        (f"source: {{type: polling, every: 5, {odoo}}}", "unknown settings"),
+        ("source: {type: polling, odoo: {url: u, db: d, login: l}}", "odoo needs api_key, db, login, url"),
+        ("source: {type: polling, odoo: {url: u, db: d, login: l, api_key: ''}}", "odoo needs"),
+        (f"source: {{type: polling, interval: soon, {odoo}}}", "are numbers"),
+        (f"source: {{type: polling, deletes: true, {odoo}}}", "are numbers"),
+        (f"source: {{type: polling, interval: 0, {odoo}}}", "must be positive"),
+    ]:
+        with pytest.raises(ConfigError, match=error):
+            load_config(write(tmp_path, "sinks: [{type: stdout}]\n" + text))

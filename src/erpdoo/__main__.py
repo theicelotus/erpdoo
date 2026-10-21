@@ -75,6 +75,8 @@ def run() -> None:
     state_path = os.environ.get("ERPDOO_STATE", "erpdoo-state.db")
     lang = os.environ.get("ERPDOO_LANG", "en_US")
     config = load_config(os.environ.get("ERPDOO_CONFIG"))
+    if config["source"]["type"] != "replication":
+        raise ConfigError("source: polling is not available yet; remove source: from erpdoo.yml")
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
