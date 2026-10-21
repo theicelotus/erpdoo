@@ -585,31 +585,38 @@ Measured with [scripts/benchmark.py](scripts/benchmark.py) on the dev stack,
 everything on one laptop: Intel Core i9-11900H (8 cores, 16 threads),
 15.4 GiB RAM, Samsung NVMe SSD, Fedora 42 (kernel 6.19), Docker 29.5.3.
 Odoo, Postgres, Redpanda, Redpanda Console and erpdoo all share that machine.
-erpdoo runs the six shipped rules with the dev config (Kafka and stdout
-sinks, viewer on), and each event includes the partner and order lines from
-the state store. Latency is from the Postgres commit to the moment a Kafka
-consumer receives the event. Results from two consecutive runs:
+erpdoo runs the six shipped rules with the dev config (two Kafka sinks, JSON
+Schema and Avro with the schema registry, and stdout; viewer on), and each
+event includes the partner and order lines from the state store. Latency is
+from the Postgres commit to the moment a Kafka consumer of the JSON Schema
+topic receives the event. Results from two consecutive runs:
 
 | | Run 1 | Run 2 |
 |---|---|---|
-| Latency, one order at a time (200 orders), p50 / p95 / p99 | 13.2 / 16.4 / 28.5 ms | 13.2 / 15.7 / 22.3 ms |
-| Burst while erpdoo runs (3,000 orders, 25 per transaction, 8 concurrent clients) | 166 events/s | 169 events/s |
-| Latency during that burst, p50 / p95 / p99 | 24 / 52 / 65 ms | 32 / 71 / 87 ms |
-| Last event after the last commit | 0.04 s | 0.05 s |
-| Backlog of 3,000 confirmed orders, erpdoo started afterwards | 3,188 events/s (0.94 s) | 3,219 events/s (0.93 s) |
-| erpdoo startup (container start to streaming) | 0.72 s | 0.69 s |
+| Latency, one order at a time (200 orders), p50 / p95 / p99 | 18.4 / 20.2 / 30.1 ms | 18.5 / 21.9 / 50.2 ms |
+| Burst while erpdoo runs (3,000 orders, 25 per transaction, 8 concurrent clients) | 159 events/s | 157 events/s |
+| Latency during that burst, p50 / p95 / p99 | 30 / 89 / 95 ms | 36 / 90 / 101 ms |
+| Last event after the last commit | 0.05 s | 0.05 s |
+| Backlog of 3,000 confirmed orders, erpdoo started afterwards | 2,993 events/s (1.00 s) | 2,520 events/s (1.19 s) |
+| erpdoo startup (container start to streaming) | 0.89 s | 0.93 s |
 
 How to read it:
 
-- In the burst, Odoo is the limit: it committed about 170 confirmations a
-  second, and erpdoo delivered each within about 90 ms, finishing 50 ms
+- In the burst, Odoo is the limit: it committed about 160 confirmations a
+  second, and erpdoo delivered each within about 100 ms, finishing 50 ms
   after the last commit.
 - The backlog run takes Odoo out of the picture: erpdoo works through 3,000
-  waiting confirmations at about 3,200 events a second, including the
-  state store lookups for each event's partner and order lines. The orders
+  waiting confirmations at 2,500 to 3,000 events a second, each written to
+  both topics, including the state store lookups for each event's partner
+  and order lines. The orders
   were created while erpdoo ran, so their lines were already in the store;
   orders from before erpdoo started cost one query each for their lines.
 - No events were missing or duplicated in any phase.
+- Schemas cost no measurable time. An earlier measurement, with one Kafka
+  sink writing plain JSON, gave 13.2 ms at p50; that same configuration
+  gives 18.8 ms on this machine today (and one JSON Schema sink alone
+  18.6 ms), with a dev database grown to about 30,000 orders by the test
+  runs. The difference is the machine and its data, not the formats.
 - This is one machine with no network between the services, and small
   demo tables. Expect higher latency across real networks, and a longer
   first start on a large database while the state store copies the rule
