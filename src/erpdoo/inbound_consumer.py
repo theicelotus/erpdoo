@@ -19,7 +19,9 @@ For each message:
    failure (the API key or an access right), logged as an error.
 
 The attempt positions also tell the outbound side which message caused a
-transaction (see EventBuilder): events get "source": {"inbound": ...}.
+transaction (see EventBuilder): events get "source": {"inbound": ...}. In
+polling mode, without Postgres, the positions are times on erpdoo's clock,
+and the record each message acted on is noted too (see erpdoo.polling).
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ class Temporary(Exception):
 
 
 class Inbound(threading.Thread):
-    def __init__(self, settings: dict, rules: list[InboundRule], state_path: str, dsn: str,
+    def __init__(self, settings: dict, rules: list[InboundRule], state_path: str, dsn: str | None,
                  stop: threading.Event) -> None:
         super().__init__(name="erpdoo-inbound", daemon=True)
         self.settings = {**DEFAULTS, **settings}
@@ -167,7 +169,7 @@ class Inbound(threading.Thread):
         if done:
             log.info("inbound: %s %s is a repeat (%s before, record %s); skipped", rule.name, message_id, *done)
             return
-        attempt = None
+        attempt = outcome = None
         try:
             uid = self.odoo.uid or self.odoo.authenticate()
             attempt = self.log.begin(topic, message_id, rule.name, uid, self._wal_position())
@@ -182,7 +184,8 @@ class Inbound(threading.Thread):
             return
         finally:
             if attempt is not None:
-                self.log.end(attempt, self._wal_position_or_none())
+                self.log.end(attempt, self._wal_position_or_none(),
+                             (rule.model, outcome.record_id) if outcome is not None else None)
         self.log.finish(topic, message_id, rule.name, outcome.status, outcome.record_id)
         if outcome.status == "already_done":
             log.info("inbound: %s %s: already carried out (%s), noted as processed", rule.name, message_id,
@@ -228,7 +231,10 @@ class Inbound(threading.Thread):
 
     def _wal_position(self) -> int:
         """Postgres' current WAL insert position. Any transaction Odoo
-        commits after this call has a commit position past it."""
+        commits after this call has a commit position past it. In polling
+        mode (no Postgres), the time in microseconds instead."""
+        if self.dsn is None:
+            return int(time.time() * 1_000_000)
         for attempt in (1, 2):
             try:
                 if self._pg is None or self._pg.closed:

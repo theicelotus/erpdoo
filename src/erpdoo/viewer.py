@@ -13,6 +13,7 @@ import logging
 import threading
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -53,7 +54,19 @@ def describe_change(change: Change) -> dict:
 
 
 def describe(txn: Transaction, events: list[Event]) -> dict:
-    changes = [describe_change(c) for c in txn.changes[:MAX_CHANGES]]
+    return {"xid": txn.xid, "commit_lsn": format_lsn(txn.commit_lsn), "commit_time": txn.commit_time.isoformat(),
+            **describe_changes(txn.changes, events)}
+
+
+def describe_poll(number: int, at: datetime, changes: list[Change], events: list[Event], calls: int) -> dict:
+    """A poll (polling mode) for display, like a transaction: the records it
+    found changed (only the fields rules use) next to their events."""
+    return {"label": f"poll {number}", "commit_time": at.isoformat(), "detail": f"{calls} API calls",
+            **describe_changes(changes, events)}
+
+
+def describe_changes(all_changes: list[Change], events: list[Event]) -> dict:
+    changes = [describe_change(c) for c in all_changes[:MAX_CHANGES]]
     # Link the field changes that made a rule fire to the event they produced:
     # the event's transition fields, on the event's record.
     for event in events:
@@ -65,11 +78,8 @@ def describe(txn: Transaction, events: list[Event]) -> dict:
                 if name in shown:
                     item.setdefault("fires", {}).setdefault(name, []).append(event.event_id)
     return {
-        "xid": txn.xid,
-        "commit_lsn": format_lsn(txn.commit_lsn),
-        "commit_time": txn.commit_time.isoformat(),
-        "change_count": len(txn.changes),
-        "table_count": len({c.table for c in txn.changes}),
+        "change_count": len(all_changes),
+        "table_count": len({c.table for c in all_changes}),
         "changes": changes,
         "events": [e.payload for e in events],
     }
@@ -82,7 +92,7 @@ class Viewer:
         self.clients: set[asyncio.Queue] = set()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.server: uvicorn.Server | None = None
-        self.slot: dict | None = None  # slot health, set by erpdoo's main loop
+        self.slot: dict | None = None  # slot health (polling: poll status), set by erpdoo's main loop
         self.app = self._build_app()
 
     def _build_app(self) -> FastAPI:
@@ -254,7 +264,7 @@ function render(t) {
   const hidden = t.change_count - t.changes.length;
   const internal = t.changes.filter(c => c.internal).length;
   el.innerHTML = `<div class="meta"><span class="summary">${plural(t.change_count, "change")} in ${plural(t.table_count, "table")} \\u2192 ${plural(t.events.length, "event")}</span>
-    \\u00b7 transaction ${t.xid} \\u00b7 ${new Date(t.commit_time).toLocaleTimeString()} \\u00b7 LSN ${esc(t.commit_lsn)}</div>
+    \\u00b7 ${t.label ? esc(t.label) : "transaction " + t.xid} \\u00b7 ${new Date(t.commit_time).toLocaleTimeString()}${t.commit_lsn ? " \\u00b7 LSN " + esc(t.commit_lsn) : ""}${t.detail ? " \\u00b7 " + esc(t.detail) : ""}</div>
     <div class="cols"><div class="col"><h2>Raw changes</h2>${t.changes.map(changeHtml).join("")}
       ${internal ? `<div class="none internal-note">+${plural(internal, "update")} with only internal fields changed</div>` : ""}
       ${hidden > 0 ? `<div class="none">+${hidden} more not shown</div>` : ""}</div>
@@ -291,13 +301,15 @@ showInternal.onchange = () => document.body.classList.toggle("show-internal", sh
 onlyEvents.onchange = () => { for (const el of list.querySelectorAll(".txn")) el.hidden = onlyEvents.checked && el.dataset.events === "0"; };
 pause.onchange = () => { if (!pause.checked) { const q = queued; queued = []; q.forEach(add); } };
 
-// Slot lag, refreshed every 10 seconds (erpdoo measures it every minute).
+// Slot lag (polling mode: the polls' load), refreshed every 10 seconds
+// (erpdoo measures it every minute).
 const slotEl = document.getElementById("slot");
 function showSlot() {
   fetch("slot").then(r => r.json()).then(h => {
     if (!h) return;
     slotEl.textContent = h.text.replace(/^slot \S+: /, "slot: ") + (h.warnings.length ? " \u2014 " + h.warnings.join("; ") : "");
     slotEl.className = "status" + (h.warnings.length ? " warn" : "");
+    if (h.title) slotEl.title = h.title;
   }).catch(() => {});
 }
 showSlot();

@@ -41,6 +41,24 @@ poll was delivered but not yet noted, has the same id.
 Related records (includes, related fields) are read through the API for each
 poll in batches, one call per model and level of includes, as Odoo has them
 at the poll, not as of the change.
+
+Limits, besides intermediate states of untracked fields:
+
+- Latency is the poll interval (plus the poll itself); occurred_at is to
+  the second, Odoo's write_date or tracking time rather than the commit.
+- Deletes leave no write_date. For models with delete rules, every
+  ``deletes`` seconds erpdoo compares the ids Odoo has with those it
+  stored; a missing one is a delete, dated when it was found, with the
+  values of the last poll. A record created and deleted between two polls
+  is never seen, and one the user can no longer read looks deleted.
+- Every poll costs API calls: one search_read per rule model, two for
+  tracking messages when there are any, and a few per level of includes
+  when events are built. Each poll that found something logs its count,
+  and a summary is logged every minute.
+- An event caused by an inbound message is marked as in replication mode,
+  but matched by time to the second and by the record the message acted
+  on, rather than by WAL position; a later write by someone else before the
+  poll hides it.
 """
 
 from __future__ import annotations
@@ -82,6 +100,7 @@ COLUMN_TYPES = {
     "char": "varchar", "selection": "varchar", "reference": "varchar", "text": "text", "html": "text",
 }
 PROGRESS_SECONDS = 5
+SLACK = 2 * SECOND  # difference allowed between erpdoo's and Odoo's clocks, to tell inbound messages
 POLL_SCHEMA = """
     -- Odoo tracking messages whose transitions were handled, by message id
     -- and its date (microseconds since 1970, UTC), so the overlap read again
@@ -319,6 +338,10 @@ class Plan:
     tracked: dict[str, dict]  # tracked fields the rules use: name -> {"id", "type", "labels"}
     by_tracking: set[str]  # rules whose transitions come from tracking messages
 
+    @property
+    def deletes(self) -> bool:
+        return any("delete" in r.on for r in self.rules)
+
 
 @dataclass
 class Write:
@@ -340,6 +363,7 @@ class Poll:
     events: list[Event] = field(default_factory=list)
     changes: list[Change] = field(default_factory=list)  # for the viewer
     rows: dict[str, dict[int, dict]] = field(default_factory=dict)  # table -> rows to store
+    deleted: dict[str, list[int]] = field(default_factory=dict)  # table -> ids gone from Odoo
     cursors: dict[str, int] = field(default_factory=dict)
     message_cursor: int | None = None
     messages: dict[int, int] = field(default_factory=dict)  # handled tracking messages: id -> date
@@ -373,19 +397,36 @@ class Poller:
         self.columns: dict[str, list[str]] = {}
         self.tracking = True  # the user may read mail.tracking.value
         self.polls = 0
+        self.deletes_at = 0.0  # when deletes were last looked for (monotonic)
+        self.fields_mark: tuple | None = None  # ir.model.fields' count and newest write_date
 
     def load(self) -> ModelRegistry:
         """Log in and read Odoo's models."""
         self.client.authenticate()
+        self.fields_mark = self._fields_mark()
         self.models = read_models(self.client)
         self.registry = build_registry(*self.models, self.overrides, column_types(self.info))
         return self.registry
+
+    def _fields_mark(self) -> tuple:
+        newest = self.client.call("ir.model.fields", "search_read", [], fields=["write_date"],
+                                  order="write_date desc, id desc", limit=1)
+        return self.client.call("ir.model.fields", "search_count", []), newest[0]["write_date"] if newest else None
+
+    def models_changed(self) -> bool:
+        """Whether Odoo's models changed (a module was installed, updated or
+        removed) since load(); two API calls."""
+        return self._fields_mark() != self.fields_mark
 
     def activate(self, rules: list[Rule]) -> list[Rule]:
         """Poll for the rules whose model exists; returns the others. A model
         polled for the first time, or with more fields than before, gets a
         baseline of its records' current values first."""
         active, skipped = split_by_model(rules, self.registry)
+        if self.settings["deletes"] is None:
+            for rule in [r for r in active if "delete" in r.on]:
+                log.warning("rule %s skipped: deletes are not looked for (deletes: false under source:)", rule.name)
+                active.remove(rule)
         validate(active, self.registry)
         specs = tracked_tables(active, self.registry)
         used = {m for t in specs if (m := self.registry.model_for_table(t))} | {r.model for r in active}
@@ -434,6 +475,24 @@ class Poller:
             self._baseline_tracking(new_fields)
         self.store.commit()
         return skipped
+
+    def check_read_only(self) -> list[str]:
+        """What the Odoo user may do besides reading, on the models erpdoo
+        reads (Odoo lets every internal user post chatter messages, so
+        mail.message is left out). One API call per model and operation."""
+        models = sorted({*self.columns, "ir.model", "ir.model.fields", *(["mail.tracking.value"] * self.tracking)})
+        problems = []
+        for model in models:
+            allowed = [op for op in ("write", "create", "unlink") if self.client.call(model, "has_access", [], op)]
+            if allowed:
+                problems.append(f"{model} ({', '.join(allowed)})")
+        if problems:
+            log.warning("polling: Odoo user %s may change models erpdoo only reads: %s. erpdoo never does, but use"
+                        " a read-only user (see \"Polling mode\" in the README)", self.client.login,
+                        ", ".join(problems))
+        else:
+            log.info("polling: Odoo user %s may only read the %d models erpdoo reads", self.client.login, len(models))
+        return problems
 
     def _with_currencies(self, model: str, names: list[str]) -> list[str]:
         """Add the currency fields of monetary fields, for their decimal places."""
@@ -562,6 +621,12 @@ class Poller:
             matches += self._evaluate(plan, current, by_record, result)
             seen = [micros(r["write_date"]) for r in current.values() if r.get("write_date")]
             result.cursors[plan.model] = max([self._meta(f"poll_cursor:{plan.model}"), *seen])
+        if any(p.deletes for p in self.plans.values()) and (
+                time.monotonic() - self.deletes_at >= self.settings["deletes"] or not self.deletes_at):
+            self.deletes_at = time.monotonic()
+            for plan in self.plans.values():
+                if plan.deletes:
+                    matches += self._deletes(plan, result)
         for rule in self.rules:
             mine = [m for m in matches if m[0] is rule]
             if mine:
@@ -714,11 +779,29 @@ class Poller:
                             micros(row["write_date"]), True, {"write_date": row.get("write_date")},
                             row.get("write_uid"))]
 
+    def _deletes(self, plan: Plan, result: Poll) -> list[tuple]:
+        """Records stored but no longer in Odoo: deleted since the last check."""
+        have = {r[0] for r in self.store.db.execute("SELECT id FROM records WHERE tbl = ?", [plan.table])}
+        gone = sorted(have - set(self.reader.search(plan.model, [])))
+        result.deleted[plan.table] = gone
+        now = int(time.time() * SECOND)
+        matches = []
+        for record_id in gone:
+            before = self.stored(plan.table, record_id)
+            result.changes.append(Change("delete", plan.table, plan.model, before, False, None))
+            for rule in plan.rules:
+                if rule.matches(before, None):
+                    matches.append(self._match(rule, before, before, None, "delete", now, True, {}, None))
+        return matches
+
     def _match(self, rule: Rule, row: dict, before: dict, after: dict | None, what: str, at: int,
                approximate: bool, detail: dict, uid: int | None, namespace=POLLING_NAMESPACE, order: int = 0):
         record_id = row["id"]
         name = what if namespace is BACKFILL_NAMESPACE else f"{rule.name}/{rule.model}/{record_id}/{what}"
         source = {"polling": True, "approximate": approximate, **detail}
+        cause = self.store.inbound_cause_at(at, uid, rule.model, record_id, SLACK) if uid else None
+        if cause:
+            source["inbound"] = {"message_id": cause["message_id"], "topic": cause["topic"], "rule": cause["rule"]}
         return (rule, record_id, before, after, str(uuid.uuid5(namespace, name)), at, source, order)
 
     def commit(self, result: Poll) -> None:
@@ -726,6 +809,8 @@ class Poller:
         tracking messages handled."""
         for table, rows in result.rows.items():
             self._put(table, list(rows.values()))
+        for table, ids in result.deleted.items():
+            self.store.db.executemany("DELETE FROM records WHERE tbl = ? AND id = ?", [(table, i) for i in ids])
         for model, cursor in result.cursors.items():
             self._set_meta(f"poll_cursor:{model}", cursor)
         if result.messages:
@@ -736,5 +821,9 @@ class Poller:
             # Messages before the window can no longer be read again.
             self.store.db.execute("DELETE FROM polled_messages WHERE at < ?",
                                   [result.message_cursor - self.overlap - 60 * SECOND])
+        # Inbound attempts before every cursor's window cannot be matched any more.
+        cursors = [c for c in (*result.cursors.values(), result.message_cursor) if c]
+        if cursors:
+            self.store.prune_inbound_attempts(min(cursors) - self.overlap - 600 * SECOND)
         self.store.commit()
 

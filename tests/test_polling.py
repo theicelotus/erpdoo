@@ -6,8 +6,8 @@ from jsonschema import Draft7Validator
 from erpdoo.polling import Poller, build_registry, column_types, decimal_text, micros, odoo_time
 from erpdoo.rules import parse_rule
 from erpdoo.schemas import avro_datum, event_shape, json_schema
-from erpdoo.store import StateStore
-from fake_odoo_api import FakeApi
+from erpdoo.store import InboundLog, StateStore
+from fake_odoo_api import FMT, FakeApi
 
 SETTINGS = {"interval": 5.0, "overlap": 60.0, "deletes": None, "batch": 2}
 CONFIRMED = parse_rule("SaleOrderConfirmed", {
@@ -20,8 +20,8 @@ WON = parse_rule("LeadWon", {"model": "crm.lead", "when": {"probability": {"to":
                              "fields": ["name", "probability"]})
 
 
-def poller(api, store=None, rules=(CONFIRMED, CREATED, WON)) -> Poller:
-    p = Poller(api, SETTINGS, store or StateStore(":memory:"))
+def poller(api, store=None, rules=(CONFIRMED, CREATED, WON), **settings) -> Poller:
+    p = Poller(api, {**SETTINGS, **settings}, store or StateStore(":memory:"))
     p.load()
     p.activate(list(rules))
     return p
@@ -239,3 +239,57 @@ def test_polled_events_fit_their_schemas(api):
         validator = Draft7Validator(json_schema(rule, p.registry))
         assert [e.message for e in validator.iter_errors(event.payload)] == []
         avro_datum(event_shape(rule, p.registry), event.payload)  # raises for a key the schema lacks
+
+
+def test_deletes_are_found_by_comparing_ids(api):
+    deleted = parse_rule("LeadDeleted", {"model": "crm.lead", "on": ["delete"], "fields": ["name", "probability"]})
+    p = poller(api, rules=[WON, deleted], deletes=1e-9)  # look for deletes at every poll
+    run(p)
+    api.delete("crm.lead", api.lead)
+    result = run(p)
+    [event] = result.events
+    assert (event.event_type, event.record_id) == ("LeadDeleted", api.lead)
+    # The values of the last poll; when is not known, only when it was found.
+    assert event.payload["record"] == {"id": api.lead, "name": "Big deal", "probability": 10.0}
+    assert event.payload["source"] == {"table": "crm_lead", "polling": True, "approximate": True}
+    assert [(c.op, c.old["id"]) for c in result.changes] == [("delete", api.lead)]
+    assert run(p).events == []
+    # Without looking for deletes, delete rules are not used.
+    assert [r.name for r in poller(api, rules=[WON, deleted], deletes=None).rules] == ["LeadWon"]
+
+
+def test_events_caused_by_inbound_messages_are_marked(api, tmp_path):
+    path = str(tmp_path / "state.db")
+    p = poller(api, StateStore(path))
+    run(p)
+    inbound, bot = InboundLog(path), 5
+    # The integration user wins a lead while erpdoo carries out a message.
+    now = micros(api.now.strftime(FMT)) + api.now.microsecond
+    attempt = inbound.begin("crm.events", "msg-1", "LeadWinning", bot, now - 100_000)
+    api.write("crm.lead", api.lead, {"probability": 100.0}, uid=bot)
+    inbound.end(attempt, now + 400_000, ("crm.lead", api.lead))
+    [event] = run(p).events
+    assert event.payload["source"]["inbound"] == {"message_id": "msg-1", "topic": "crm.events", "rule": "LeadWinning"}
+    # Not by the integration user, or not during a message: not marked.
+    api.tick(30)
+    other = api.create("crm.lead", {"name": "Other", "probability": 10.0, "active": True})
+    third = api.create("crm.lead", {"name": "Third", "probability": 10.0, "active": True})
+    run(p)
+    api.write("crm.lead", other, {"probability": 100.0}, uid=2)
+    api.write("crm.lead", third, {"probability": 100.0}, uid=bot)
+    events = run(p).events
+    assert [(e.record_id, e.payload["source"].get("inbound")) for e in events] == [(other, None), (third, None)]
+
+
+def test_read_only_check(api):
+    p = poller(api)
+    assert p.check_read_only() == []
+    api.writable = {"sale.order"}
+    assert p.check_read_only() == ["sale.order (write, create, unlink)"]
+
+
+def test_models_changed(api):
+    p = poller(api)
+    assert not p.models_changed()
+    api.fields.append({**api.fields[-1], "id": len(api.fields) + 1, "name": "x_note", "write_date": api.now})
+    assert p.models_changed()

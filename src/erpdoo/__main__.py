@@ -44,6 +44,8 @@ MODEL_TABLES = ("ir_model", "ir_model_fields")
 RECHECK_SECONDS = 30
 CONFIRM_SECONDS = 10  # at most this long between confirmations sent to Postgres
 MAX_POLL_DELAY = 60  # seconds between polls at most while Odoo does not answer
+MODELS_CHECK_SECONDS = 60  # polling: how often to check whether Odoo's models changed (two API calls)
+REPORT_SECONDS = 60  # polling: how often the API calls are summed up in the log
 
 
 def main() -> None:
@@ -281,15 +283,22 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
     store.use_source("polling")
     poller = Poller(client, source, store, lang, config["tables"])
     rules = load_rules(rules_path)
+
+    def activate(previous: set[str]) -> list[Rule]:
+        skipped = retry("Odoo", lambda: poller.activate(rules), (OdooUnavailable,), stop)
+        for rule in skipped:
+            if rule.name not in previous:
+                log.warning("rule %s skipped: %s; it is activated when the model appears", rule.name,
+                            missing_model_message(rule, poller.registry))
+        return skipped
+
     try:
         # After a reboot erpdoo may start before Odoo: wait for it.
-        registry = retry("Odoo", poller.load, (OdooUnavailable,), stop)
-        skipped = retry("Odoo", lambda: poller.activate(rules), (OdooUnavailable,), stop)
+        retry("Odoo", poller.load, (OdooUnavailable,), stop)
+        skipped = activate(set())
+        retry("Odoo", poller.check_read_only, (OdooUnavailable,), stop)
     except OdooSetupError as e:
         raise ConfigError(f"polling: {e}") from None
-    for rule in skipped:
-        log.warning("rule %s skipped: %s; restart erpdoo once its app is installed", rule.name,
-                    missing_model_message(rule, registry))
     log.info("rules: %d active (%s), %d inactive; transitions from Odoo's field tracking: %s",
              len(poller.rules), ", ".join(r.name for r in poller.rules) or "none", len(skipped),
              ", ".join(sorted(n for p in poller.plans.values() for n in p.by_tracking)) or "none")
@@ -297,18 +306,43 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
                    (Unreachable, KafkaException, TimeoutError), stop)
              for spec in config["sinks"]]
     retry("schema registry", lambda: prepare(sinks, poller.rules, poller.registry), (Unreachable,), stop)
+    viewer = None
+    if config.get("viewer") is not None:
+        try:
+            from erpdoo.viewer import Viewer, describe_poll
+        except ImportError:
+            raise ConfigError("the viewer needs FastAPI and uvicorn: pip install 'erpdoo[viewer]'") from None
+        viewer = Viewer(**config["viewer"])
+        viewer.start()
+    # No Postgres: inbound attempts are timed on erpdoo's clock (see erpdoo.polling).
+    inbound = start_inbound(config, rules_path, poller.registry, state_path, None, stop)
     interval = source["interval"]
     log.info("polling %s every %g s as %s, to %s", odoo["url"], interval, odoo["login"],
              ", ".join(spec["type"] for spec in config["sinks"]))
     delay = interval  # after a failed poll; doubles up to MAX_POLL_DELAY
+    load = PollLoad(client.calls)
+    checked_at = time.monotonic()  # when Odoo's models were last checked for changes
     try:
         while not stop.is_set():
+            if inbound is not None and inbound.error is not None:
+                raise InboundFailed(f"inbound: {reason(inbound.error)}")
             started = time.monotonic()
             try:
+                if started - checked_at >= MODELS_CHECK_SECONDS:
+                    checked_at = started
+                    if poller.models_changed():
+                        before = {r.name for r in poller.rules}
+                        poller.load()
+                        skipped = activate({r.name for r in skipped})
+                        prepare(sinks, poller.rules, poller.registry)
+                        for name in sorted({r.name for r in poller.rules} - before):
+                            log.info("rule %s activated", name)
+                        log.info("Odoo models changed, reloaded %d models", len(poller.registry.models))
                 result = poller.poll()
-            except (OdooUnavailable, OdooSetupError) as e:
+            except (OdooUnavailable, OdooSetupError, Unreachable) as e:
                 (log.error if isinstance(e, OdooSetupError) else log.warning)(
                     "polling: %s; trying again in %g s", e, delay)
+                load.failed(str(e))
                 stop.wait(delay)
                 delay = min(delay * 2, MAX_POLL_DELAY)
                 continue
@@ -319,15 +353,70 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
                 for sink in sinks:
                     sink.send(result.events)
             poller.commit(result)
+            load.add(result)
             (log.info if result.changes or result.events else log.debug)("poll %d: %s", result.number,
                                                                           result.summary())
+            if viewer and (result.changes or result.events):
+                viewer.publish(describe_poll(result.number, datetime.now(timezone.utc), result.changes,
+                                             result.events, result.calls))
+            if load.due():
+                log.info("%s", load.report(client.calls, interval))
+            if viewer:
+                viewer.slot = load.status(interval)
             stop.wait(max(0.0, interval - (time.monotonic() - started)))
     finally:
+        if inbound is not None:
+            stop.set()
+            inbound.join(timeout=30)
         for sink in sinks:
             sink.close()
+        if viewer:
+            viewer.stop()
 
 
-def start_inbound(config: dict, rules_path: str, registry: ModelRegistry, state_path: str, dsn: str,
+class PollLoad:
+    """What polling costs Odoo, for the log (every REPORT_SECONDS) and the viewer."""
+
+    def __init__(self, calls: int) -> None:
+        self.since, self.calls = time.monotonic(), calls
+        self.polls = self.read = self.events = 0
+        self.last: float | None = None
+        self.last_calls = 0
+        self.error: str | None = None
+        self.per_minute = 0.0
+
+    def add(self, result) -> None:
+        self.polls += 1
+        self.read += result.read
+        self.events += len(result.events)
+        self.last, self.last_calls, self.error = time.monotonic(), result.calls, None
+
+    def failed(self, error: str) -> None:
+        self.error = error
+
+    def due(self) -> bool:
+        return time.monotonic() - self.since >= REPORT_SECONDS
+
+    def report(self, calls: int, interval: float) -> str:
+        seconds = time.monotonic() - self.since
+        used = calls - self.calls
+        self.per_minute = used * 60 / seconds
+        text = (f"polling every {interval:g} s: {self.polls} polls in the last {seconds:.0f} s, {used} API calls"
+                f" ({used / max(self.polls, 1):.1f} per poll, {self.per_minute:.0f} per minute),"
+                f" {self.read} records read, {self.events} events")
+        self.since, self.calls = time.monotonic(), calls
+        self.polls = self.read = self.events = 0
+        return text
+
+    def status(self, interval: float) -> dict:
+        ago = f"{time.monotonic() - self.last:.0f} s ago" if self.last is not None else "not yet"
+        rate = f", {self.per_minute:.0f} API calls per minute" if self.per_minute else ""
+        return {"text": f"polling every {interval:g} s: last poll {ago}, {self.last_calls} API calls{rate}",
+                "warnings": [self.error] if self.error else [],
+                "title": "erpdoo polls Odoo's API; each poll costs the API calls shown"}
+
+
+def start_inbound(config: dict, rules_path: str, registry: ModelRegistry, state_path: str, dsn: str | None,
                   stop: threading.Event) -> Inbound | None:
     """Start consuming inbound messages, if erpdoo.yml has inbound settings
     and there are inbound rules (ERPDOO_INBOUND_RULES, by default the

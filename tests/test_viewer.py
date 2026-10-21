@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from erpdoo.events import Event  # noqa: E402
 from erpdoo.replication import Change, Transaction  # noqa: E402
-from erpdoo.viewer import Viewer, describe, describe_change  # noqa: E402
+from erpdoo.viewer import Viewer, describe, describe_change, describe_poll  # noqa: E402
 
 
 def test_update_shows_changed_fields_from_old_row():
@@ -63,3 +63,16 @@ def test_field_changes_that_fired_a_rule_link_to_the_event():
     assert internal["internal"] and "fires" not in internal
     assert "fires" not in line  # same field name, different record
     assert (item["change_count"], item["table_count"]) == (3, 2)
+
+
+def test_a_poll_shows_like_a_transaction():
+    changes = [Change("update", "sale_order", "sale.order", {"id": 5, "state": "draft"}, False,
+                      {"id": 5, "state": "sale"}),
+               Change("delete", "crm_lead", "crm.lead", {"id": 3, "name": "Deal"}, False, None)]
+    event = Event("ev-2", "SaleOrderConfirmed", "sale.order", 5,
+                  {"event_id": "ev-2", "changes": {"state": {"from": "draft", "to": "sale"}}})
+    item = describe_poll(12, datetime(2026, 1, 1, tzinfo=timezone.utc), changes, [event], 7)
+    assert (item["label"], item["detail"], item["change_count"], item["table_count"]) == ("poll 12", "7 API calls", 2, 2)
+    assert "xid" not in item and "commit_lsn" not in item
+    assert item["changes"][0]["fires"] == {"state": ["ev-2"]}
+    assert item["changes"][1] == {"op": "delete", "table": "crm_lead", "model": "crm.lead", "id": 3}

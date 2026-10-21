@@ -86,12 +86,22 @@ INBOUND_SCHEMA = """
     -- Each attempt at a message: the WAL position before it and after it
     -- (NULL while it runs), and the Odoo user it acts as. Messages are
     -- carried out one at a time, so what that user committed in between was
-    -- caused by the message.
+    -- caused by the message. In polling mode the positions are erpdoo's
+    -- clock (microseconds since 1970), and record_model and record_id say
+    -- which record the message acted on.
     CREATE TABLE IF NOT EXISTS inbound_attempts (
         id INTEGER PRIMARY KEY, start_lsn INTEGER NOT NULL, end_lsn INTEGER, topic TEXT NOT NULL,
         message_id TEXT NOT NULL, rule TEXT NOT NULL, uid INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS inbound_attempts_start ON inbound_attempts (start_lsn);
 """
+
+
+def inbound_schema(db: sqlite3.Connection) -> None:
+    db.executescript(INBOUND_SCHEMA)
+    columns = [r[1] for r in db.execute("PRAGMA table_info(inbound_attempts)")]
+    if "record_model" not in columns:  # stores from before polling mode
+        db.execute("ALTER TABLE inbound_attempts ADD COLUMN record_model TEXT")
+        db.execute("ALTER TABLE inbound_attempts ADD COLUMN record_id INTEGER")
 SOURCES = {"replication": 1, "polling": 2}  # meta 'source': which mode built the store
 SQLITE_TIMEOUT = 30  # seconds to wait for the other connection's write (inbound and outbound share the file)
 
@@ -100,7 +110,7 @@ class StateStore:
     def __init__(self, path: str, dsn: str | None = None) -> None:
         self.db = sqlite3.connect(path, timeout=SQLITE_TIMEOUT)
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript(INBOUND_SCHEMA)
+        inbound_schema(self.db)
         self.db.executescript(
             """
             CREATE TABLE IF NOT EXISTS records (
@@ -344,6 +354,24 @@ class StateStore:
             [commit_lsn, commit_lsn]).fetchone()
         return dict(zip(("topic", "message_id", "rule", "uid"), row)) if row else None
 
+    def inbound_cause_at(self, at: int, uid: int, model: str, record_id: int, slack: int) -> dict | None:
+        """Polling mode: the inbound attempt of Odoo user ``uid`` that a change
+        at ``at`` falls in. Odoo gives times to the second (``at`` is the
+        second's start) and attempts are timed on erpdoo's clock, so the
+        attempt's window is widened by ``slack`` microseconds for the two
+        clocks' difference. Of several, the one that acted on this record,
+        else the latest."""
+        row = self.db.execute(
+            "SELECT topic, message_id, rule, uid FROM inbound_attempts WHERE uid = ? AND start_lsn < ?"
+            " AND (end_lsn IS NULL OR end_lsn >= ?)"
+            " ORDER BY coalesce(record_model = ? AND record_id = ?, 0) DESC, start_lsn DESC, id DESC LIMIT 1",
+            [uid, at + 1_000_000 + slack, at - slack, model, record_id]).fetchone()
+        return dict(zip(("topic", "message_id", "rule", "uid"), row)) if row else None
+
+    def prune_inbound_attempts(self, before: int) -> None:
+        """Polling mode: forget attempts that ended before ``before`` (microseconds)."""
+        self.db.execute("DELETE FROM inbound_attempts WHERE end_lsn < ?", [before])
+
     def commit(self) -> None:
         self.db.commit()
 
@@ -544,7 +572,7 @@ class InboundLog:
     def __init__(self, path: str) -> None:
         self.db = sqlite3.connect(path, timeout=SQLITE_TIMEOUT, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript(INBOUND_SCHEMA)
+        inbound_schema(self.db)
         self.db.commit()
 
     def processed(self, topic: str, message_id: str) -> tuple[str, int | None] | None:
@@ -562,11 +590,15 @@ class InboundLog:
         self.db.commit()
         return attempt
 
-    def end(self, attempt: int, lsn: int | None) -> None:
-        """Note where an attempt ended (None: not known, left open until the next one)."""
+    def end(self, attempt: int, lsn: int | None, record: tuple[str, int] | None = None) -> None:
+        """Note where an attempt ended (None: not known, left open until the
+        next one), and the record it acted on, if it succeeded."""
+        if record is not None:
+            self.db.execute("UPDATE inbound_attempts SET record_model = ?, record_id = ? WHERE id = ?",
+                            [*record, attempt])
         if lsn is not None:
             self.db.execute("UPDATE inbound_attempts SET end_lsn = ? WHERE id = ?", [lsn, attempt])
-            self.db.commit()
+        self.db.commit()
 
     def finish(self, topic: str, message_id: str, rule: str, status: str, record_id: int | None) -> None:
         self.db.execute("INSERT OR REPLACE INTO inbound_messages VALUES (?, ?, ?, ?, ?, ?)",

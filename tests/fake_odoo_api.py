@@ -47,6 +47,7 @@ class FakeApi:
         self.login = "erpdoo-reader"
         self.calls = 0
         self.log: list[tuple[str, str]] = []
+        self.writable: set[str] = set()  # models the user may change besides reading
         self.fields: list[dict] = []
         for model, fields in SCHEMA.items():
             for name, ttype, *rest in [*MAGIC, *fields]:
@@ -58,7 +59,7 @@ class FakeApi:
                     "relation_table": options.get("relation_table", False), "column1": options.get("column1", False),
                     "column2": options.get("column2", False), "store": options.get("store", True),
                     "related": options.get("related", False), "translate": options.get("translate", False),
-                    "tracking": options.get("tracking", 0), "_options": options})
+                    "tracking": options.get("tracking", 0), "write_date": datetime(2026, 1, 1), "_options": options})
         self.records: dict[str, dict[int, dict]] = {model: {} for model in SCHEMA}
         self.tracking: list[dict] = []
         self.messages: dict[int, dict] = {}
@@ -133,7 +134,7 @@ class FakeApi:
                     out[f["name"]] = desc
             return out
         if method == "has_access":
-            return True
+            return args[1] == "read" or model in self.writable
         if model == "res.lang":
             return [{"id": 1, "code": "en_US"}]
         if model == "res.currency" and method == "search_read":
@@ -150,6 +151,8 @@ class FakeApi:
         found = found[:kwargs["limit"]] if kwargs.get("limit") else found
         if method == "search":
             return [r["id"] for r in found]
+        if method == "search_count":
+            return len(found)
         return [self._out(model, r, kwargs["fields"]) for r in found]
 
     def _table(self, model: str) -> dict[int, dict]:
