@@ -245,13 +245,76 @@ starts, copies its state store again and logs the time window it could
 not stream, from the last transaction it processed to the new slot:
 
 ```
-ERROR erpdoo: replication slot erpdoo had been invalidated by Postgres, which removed WAL erpdoo had not read yet (it held more than max_slot_wal_keep_size); created it again. Changes committed between 2026-10-21T00:44:03.747894+00:00 and 2026-10-21T00:44:29.982924+00:00 were not streamed, so events from that time may be missing. The state store is copied again.
+ERROR erpdoo: replication slot erpdoo had been invalidated by Postgres, which removed WAL erpdoo had not read yet (it held more than max_slot_wal_keep_size); created it again. Changes committed between 2026-10-21T01:28:55.063437+00:00 and 2026-10-21T01:29:05.901836+00:00 were not streamed, so events from that time may be missing. They are backfilled from Odoo's records next. The state store is copied again.
+INFO erpdoo: backfilled 2026-10-21T01:28:55.063437+00:00 to 2026-10-21T01:29:05.901836+00:00: 3 events (2 from Odoo's field tracking, 1 approximate)
 ```
 
-Events for records changed in that window are not sent, and erpdoo cannot
-rebuild them yet. This was tested on the
-dev stack with `max_slot_wal_keep_size = '64MB'`, erpdoo stopped, an order
-confirmed and 150 MB of unrelated WAL written.
+It then rebuilds the events of that window from Odoo's own records (see
+[Backfill](#backfill)) before it streams again; `backfill: {after_lost_slot:
+false}` in erpdoo.yml turns that off. `scripts/backfill_test.py`, also run
+in CI, checks this on the dev stack: with `max_slot_wal_keep_size = '64MB'`
+and erpdoo stopped, it confirms an order, cancels another and wins a lead,
+writes WAL elsewhere until Postgres invalidates the slot, and expects each
+change exactly once as a backfilled event.
+
+## Backfill
+
+```sh
+erpdoo backfill --since 2026-10-21T01:28:55Z --until 2026-10-21T01:29:06Z [--dry-run]
+```
+
+rebuilds the events the active rules would have produced in that window
+and sends them to the configured sinks (`--dry-run` prints them instead).
+In the dev stack: `docker compose exec erpdoo erpdoo backfill ...`. erpdoo
+runs it by itself for the window of an invalidated slot. It reads what
+Odoo recorded, not the WAL, so it also covers time erpdoo was not
+running at all.
+
+- **Rules on fields Odoo tracks** (those whose changes appear in a
+  record's chatter: a sale order's or invoice's `state`, an invoice's
+  `payment_state`, a delivery's `state`): each tracked change in the
+  window is checked, with its real old and new values from
+  `mail_tracking_value` and its time from `mail_message`. The event's
+  `occurred_at` is that time and `changes` has the real `from` and `to`.
+- **Other rules** (a field Odoo does not track, such as `crm.lead`'s
+  `probability`, which `LeadWon` uses; create rules): erpdoo takes the
+  records written (created) in the window whose current values match the
+  rule. The previous values are unknown, so `from` conditions are not
+  checked and `changes` has `"from": null`. These events are marked
+  `"approximate": true`.
+
+Each backfilled event says so in its source, and has an id built from the
+rule, the record and the tracking message (or the record's
+`write_date`), so running the same backfill again sends the same ids:
+
+```json
+"source": {"table": "sale_order", "backfill": true, "approximate": false, "mail_message_id": 65293}
+```
+
+Limits:
+
+- **Other fields are as they are now.** The tracked change's own fields
+  have the values of that moment, but the rest of the record and its
+  related records (customer, lines) are read as they are when the
+  backfill runs.
+- **Ids differ from streamed events.** A change that was streamed and is
+  also in a backfill window is sent twice, with two ids. erpdoo widens the
+  window to whole seconds (Odoo stores times without fractions), so a
+  change in the first second of an automatic backfill can be one.
+- **Approximate events can be wrong.** A record written in the window for
+  another reason, one that already matched the rule before, gives an
+  event too: a lead won last month and edited today counts as won today,
+  and an Odoo module update that rewrites records makes them all count.
+  A record that matched in the window but no longer does gives none, and
+  since its id comes from the `write_date`, writing the record again
+  changes the id.
+- **Only one event per tracked change, and only what Odoo tracked.** A
+  change made without tracking (SQL, some imports, a record created
+  directly in its final state) is not found. Delete rules cannot be
+  backfilled, and deleted records are skipped.
+- **It needs read access to Odoo's tracking:** `mail_tracking_value`,
+  `ir_model_fields_selection`, and four columns of `mail_message` (the
+  record and the time, not the message text); see the SQL below.
 
 ## Writing rules
 
@@ -323,6 +386,11 @@ GRANT SELECT ON
   product_product, product_template, res_partner, sale_order, sale_order_line,
   stock_move, stock_picking, stock_picking_type
   TO erpdoo;
+
+-- For backfill: Odoo's field tracking. Of mail_message only which record
+-- changed when, not the messages themselves.
+GRANT SELECT (id, model, res_id, date) ON mail_message TO erpdoo;
+GRANT SELECT ON mail_tracking_value, ir_model_fields_selection TO erpdoo;
 ```
 
 Tables keep their default replica identity (the primary key): erpdoo takes
@@ -534,7 +602,8 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   limit unless `max_slot_wal_keep_size` is set (see
   [Slot health](#slot-health)). With the limit, a slot that needs more is
   invalidated: erpdoo then starts over with a new slot, logs the window it
-  missed, and events from that window are not sent. Drop the slot
+  missed and backfills it from Odoo's records, which is exact only for
+  fields Odoo tracks (see [Backfill](#backfill)). Drop the slot
   (`SELECT pg_drop_replication_slot('erpdoo')`) if you remove erpdoo.
 
 ## License
