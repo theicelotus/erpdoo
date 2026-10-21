@@ -165,3 +165,23 @@ def test_unreachable_kafka_names_the_cause():
 
     with pytest.raises(Unreachable, match="127.0.0.1:1.*Connection refused"):
         check_reachable("127.0.0.1:1", timeout=1)
+
+
+def test_skip_inbound_leaves_out_events_inbound_messages_caused():
+    from erpdoo.sinks import InboundFilter
+
+    def caused(n, topic):
+        e = event(n)
+        return Event(e.event_id, e.event_type, e.model, e.record_id,
+                     {**e.payload, "source": {"inbound": {"message_id": "m", "topic": topic, "rule": "R"}}})
+
+    events = [event(1), caused(2, "warehouse.events"), caused(3, "payments.events")]
+    for topics, kept in [(None, [1]), (["warehouse.events"], [1, 3])]:
+        inner = FakeSink()
+        InboundFilter(inner, topics).send(events)
+        assert inner.delivered == kept
+    stream = io.StringIO()
+    make_sink({"type": "stdout", "stream": stream, "skip_inbound": True}).send(events)
+    assert [json.loads(line)["record_id"] for line in stream.getvalue().splitlines()] == [1]
+    with pytest.raises(ConfigError, match="skip_inbound is true or a list"):
+        make_sink({"type": "stdout", "skip_inbound": "warehouse.events"})

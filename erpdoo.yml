@@ -26,7 +26,11 @@ sinks:
       namespace: erpdoo.avro
 
   # One JSON event per line on standard output (docker compose logs erpdoo).
+  # Here it stands in for the warehouse system's feed: events caused by its
+  # own messages (source.inbound) are left out, so it does not get its own
+  # changes back. skip_inbound: true leaves out those of every inbound topic.
   - type: stdout
+    skip_inbound: [warehouse.events]
 
   # POST each event as JSON. Retries network errors, 5xx, 408 and 429 with
   # exponential backoff. An event that is rejected (other 4xx) or still fails

@@ -109,11 +109,51 @@ def prepare(sinks: list, rules, registry) -> None:
         plan.apply()
 
 
+class InboundFilter:
+    """Wraps a sink: events caused by inbound messages (``source.inbound``)
+    are not sent to it, from every inbound topic or the ones listed, so a
+    system does not get its own changes back."""
+
+    def __init__(self, sink: Sink, topics: list[str] | None) -> None:
+        self.sink = sink
+        self.topics = None if topics is None else set(topics)
+
+    def keeps(self, event: Event) -> bool:
+        inbound = event.payload.get("source", {}).get("inbound")
+        return inbound is None or (self.topics is not None and inbound["topic"] not in self.topics)
+
+    def send(self, events: list[Event]) -> None:
+        kept = [e for e in events if self.keeps(e)]
+        if kept:
+            self.sink.send(kept)
+
+    def schema_plan(self, rules, registry):
+        plan = getattr(self.sink, "schema_plan", None)
+        return plan(rules, registry) if plan else None
+
+    def close(self) -> None:
+        self.sink.close()
+
+
 def make_sink(spec: dict) -> Sink:
     """Build a sink from one entry of the config's ``sinks`` list."""
     options = dict(spec)
     kind = options.pop("type", None)
     dead_letter = options.pop("dead_letter", None)
+    skip_inbound = options.pop("skip_inbound", False)
+    if skip_inbound is True:
+        topics = None
+    elif skip_inbound is False:
+        topics = []
+    elif isinstance(skip_inbound, list) and all(isinstance(t, str) for t in skip_inbound):
+        topics = skip_inbound
+    else:
+        raise ConfigError(f"sink {kind}: skip_inbound is true or a list of inbound topics")
+    sink = _make_sink(kind, options, dead_letter)
+    return sink if topics == [] else InboundFilter(sink, topics)
+
+
+def _make_sink(kind, options: dict, dead_letter) -> Sink:
     try:
         if kind == "kafka":
             from erpdoo.sinks.kafka import KafkaSink

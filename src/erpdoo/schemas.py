@@ -157,6 +157,12 @@ def event_shape(rule: Rule, registry: ModelRegistry) -> Shape:
             "mail_message_id": Shape("integer", doc="backfill: Odoo's tracking message"),
             "write_date": Shape("string", doc="backfill: the record's write_date"),
             "create_date": Shape("string", doc="backfill: the record's create_date"),
+            "inbound": Shape("object", fields={
+                "message_id": Shape("string", nullable=False),
+                "topic": Shape("string", nullable=False),
+                "rule": Shape("string", nullable=False),
+            }, required=("message_id", "topic", "rule"),
+                doc="the inbound message whose Odoo call made the change, if one did"),
         }),
     }, doc=f"erpdoo event {rule.name} ({rule.model})")
 

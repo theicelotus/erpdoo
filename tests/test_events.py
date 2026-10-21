@@ -172,3 +172,22 @@ def test_many2many_include_through_the_join_table():
                         [update(None, order(state="sale", name="S00005-B"))])
     b.store.apply_transaction(later)
     assert b.render("sale.order", order(), ("name",), tagged.includes)["tag_ids"] == [{"id": 1, "name": "VIP"}]
+
+
+def test_events_caused_by_an_inbound_message_say_which():
+    from erpdoo.store import InboundLog
+
+    b = builder()
+    inbound = InboundLog.__new__(InboundLog)
+    inbound.db = b.store.db  # the same in-memory store
+    attempt = inbound.begin("shop.events", "m-7", "OrderAccepted", 8, 0x1F00)
+    by_bot = txn(update(order(), order(state="sale", write_uid=8)))  # commits at 0x2000
+    [event] = b.build(by_bot)
+    assert event.payload["source"]["inbound"] == {"message_id": "m-7", "topic": "shop.events", "rule": "OrderAccepted"}
+    # Someone else's change in the same window is not the message's.
+    [other] = b.build(txn(update(order(), order(state="sale", write_uid=2)), xid=901))
+    assert "inbound" not in other.payload["source"]
+    # Nor is the bot's change after the attempt ended.
+    inbound.end(attempt, 0x1FF0)
+    [later] = b.build(by_bot)
+    assert "inbound" not in later.payload["source"]

@@ -97,6 +97,10 @@ class EventBuilder:
     def _build(self, txn: Transaction, replay: bool) -> list[Event]:
         events = []
         changes_by_model: dict[str, dict] = {}
+        source = {"xid": txn.xid, "commit_lsn": format_lsn(txn.commit_lsn)}
+        inbound = self.inbound_cause(txn)
+        if inbound:
+            source["inbound"] = inbound
         for rule in self.rules:
             if rule.model not in changes_by_model:
                 changes_by_model[rule.model] = net_changes(txn, rule.model)
@@ -108,8 +112,17 @@ class EventBuilder:
                     continue
                 events.append(self.event(
                     rule, record_id, before, after, event_id(txn, rule.name, rule.model, record_id),
-                    txn.commit_time, {"xid": txn.xid, "commit_lsn": format_lsn(txn.commit_lsn)}))
+                    txn.commit_time, source))
         return events
+
+    def inbound_cause(self, txn: Transaction) -> dict | None:
+        """The inbound message whose Odoo call made this transaction, if
+        any: it committed while erpdoo was carrying the message out, and the
+        integration user wrote a row in it (erpdoo.inbound_consumer)."""
+        cause = self.store.inbound_cause(txn.commit_lsn)
+        if cause is None or not any((c.new or {}).get("write_uid") == cause["uid"] for c in txn.changes):
+            return None
+        return {"message_id": cause["message_id"], "topic": cause["topic"], "rule": cause["rule"]}
 
     def event(self, rule: Rule, record_id: int, before: dict, after: dict | None, eid: str,
               occurred_at: datetime, source: dict) -> Event:

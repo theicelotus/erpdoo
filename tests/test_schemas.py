@@ -164,3 +164,10 @@ def test_avro_needs_valid_names():
     json_schema(dotted, fake_odoo.registry())  # fine in JSON
     with pytest.raises(SchemaError, match="not a valid Avro record name"):
         avro_schema(parse_rule("sale-confirmed", {"model": "sale.order"}), fake_odoo.registry())
+
+
+def test_the_inbound_marker_fits_both_schemas():
+    payload = confirmed_event()
+    payload["source"]["inbound"] = {"message_id": "m-7", "topic": "shop.events", "rule": "OrderAccepted"}
+    assert errors(json_schema(CONFIRMED, fake_odoo.registry()), payload) == []
+    assert avro_round_trip(CONFIRMED, fake_odoo.registry(), payload)["source"]["inbound"]["message_id"] == "m-7"
