@@ -30,7 +30,8 @@ from erpdoo.replication import PublicationError, ReplicationReader, StreamError
 from erpdoo.rules import (
     Rule, RuleError, load_rules, missing_model_message, split_by_model, tracked_tables, validate,
 )
-from erpdoo.sinks import DeliveryError, make_sink
+from erpdoo.schemas import SchemaError
+from erpdoo.sinks import DeliveryError, make_sink, prepare
 from erpdoo.store import StateStore
 
 log = logging.getLogger("erpdoo")
@@ -50,7 +51,7 @@ def main() -> None:
             backfill_command(sys.argv[2:])
         else:
             run()
-    except (ConfigError, RuleError, PublicationError, BackfillError) as e:
+    except (ConfigError, RuleError, PublicationError, BackfillError, SchemaError) as e:
         # Mistakes in the setup: say what is wrong, without a traceback.
         log.error("%s", e)
         sys.exit(2)
@@ -141,6 +142,9 @@ def run() -> None:
     sinks = [retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec),
                    (Unreachable, KafkaException, TimeoutError), stop)
              for spec in config["sinks"]]
+    # Each event type's schema, for sinks with a schema registry. A rule
+    # change that would break compatibility stops erpdoo here.
+    retry("schema registry", lambda: prepare(sinks, builder.rules, registry), (Unreachable,), stop)
     pending = store.pending_backfill()
     if pending:
         since, until = (datetime.fromtimestamp(t / 1e6, timezone.utc) for t in pending)
@@ -220,19 +224,22 @@ def run() -> None:
                 continue
             before = {r.name for r in builder.rules}
             try:
-                builder, new_skipped = activate(registry)
-            except (RuleError, PublicationError) as e:
+                new_builder, new_skipped = activate(registry)
+                prepare(sinks, new_builder.rules, registry)
+            except (RuleError, PublicationError, SchemaError, Unreachable) as e:
                 # Keep streaming with the rules that worked; a module
                 # install should not stop erpdoo. If Postgres needs an
-                # admin's SQL first, check again until it has been run.
+                # admin's SQL first, or the schema registry does not
+                # answer, check again until it does.
                 builder.registry = registry
-                recheck_at = time.monotonic() + RECHECK_SECONDS if isinstance(e, PublicationError) else None
+                recheck_at = (time.monotonic() + RECHECK_SECONDS if isinstance(e, (PublicationError, Unreachable))
+                              else None)
                 if str(e) != last_error:
                     log.error("Odoo models changed and the rules no longer fit, keeping the active ones%s: %s",
                               f" (checking again every {RECHECK_SECONDS} s)" if recheck_at else "", e)
                 last_error = str(e)
                 continue
-            recheck_at = last_error = None
+            builder, recheck_at, last_error = new_builder, None, None
             report(new_skipped, {r.name for r in skipped}, registry)
             skipped = new_skipped
             for name in sorted({r.name for r in builder.rules} - before):
@@ -278,6 +285,7 @@ def backfill_command(argv: list[str]) -> None:
     else:
         sinks = [make_sink(spec) for spec in config["sinks"]]
         try:
+            prepare(sinks, active, registry)
             send_backfill(result, sinks)
         finally:
             for sink in sinks:

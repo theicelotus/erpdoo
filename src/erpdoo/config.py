@@ -5,6 +5,9 @@ to read environment variables, e.g. for webhook tokens:
       - type: kafka
         bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
         topic: erpdoo.events
+        format: json              # JSON Schema (default) or avro
+        schema_registry:          # optional for json; registers each event type's schema
+          url: http://127.0.0.1:18081
       - type: webhook
         url: https://example.com/hooks/erpdoo
         headers: { Authorization: "Bearer ${WEBHOOK_TOKEN}" }
@@ -53,17 +56,20 @@ def _expand(value, env):
 def load_config(path: str | Path | None, env=os.environ) -> dict:
     """Read the settings file: ``path``, or erpdoo.yml in the working directory
     if it exists. Without one, events go to Kafka as configured by
-    ERPDOO_KAFKA_BOOTSTRAP and ERPDOO_TOPIC."""
+    ERPDOO_KAFKA_BOOTSTRAP, ERPDOO_TOPIC and ERPDOO_SCHEMA_REGISTRY (optional)."""
     if path is None and Path("erpdoo.yml").exists():
         path = "erpdoo.yml"
     if path is not None and not Path(path).exists():
         raise ConfigError(f"config file {path} not found")
     if path is None:
-        return {"sinks": [{
+        kafka = {
             "type": "kafka",
             "bootstrap_servers": env.get("ERPDOO_KAFKA_BOOTSTRAP", "127.0.0.1:19092"),
             "topic": env.get("ERPDOO_TOPIC", "erpdoo.events"),
-        }], "slot": slot_settings(None), "tables": {}, "backfill": {"after_lost_slot": True}}
+        }
+        if env.get("ERPDOO_SCHEMA_REGISTRY"):
+            kafka["schema_registry"] = {"url": env["ERPDOO_SCHEMA_REGISTRY"]}
+        return {"sinks": [kafka], "slot": slot_settings(None), "tables": {}, "backfill": {"after_lost_slot": True}}
     doc = yaml.load(Path(path).read_text(), Loader=YamlLoader) or {}
     if not isinstance(doc, dict):
         raise ConfigError(f"{path}: expected a mapping")

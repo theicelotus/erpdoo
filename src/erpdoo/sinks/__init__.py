@@ -86,9 +86,27 @@ class DeadLetterSink:
             log.warning("%s: sent event %s (%s) to dead-letter topic %s: %s",
                         self.name, event.event_id, event.event_type, self.topic, error)
 
+    def schema_plan(self, rules, registry):
+        plan = getattr(self.sink, "schema_plan", None)
+        return plan(rules, registry) if plan else None
+
     def close(self) -> None:
         self.sink.close()
         self.queue.close()
+
+
+def prepare(sinks: list, rules, registry) -> None:
+    """Register the event schemas of ``rules`` for every sink that has a
+    schema registry. Every sink's schemas are checked first; if any would
+    break compatibility, none is registered and SchemaError says why."""
+    from erpdoo.schema_registry import refused
+    from erpdoo.schemas import SchemaError
+
+    plans = [plan for sink in sinks if (plan := getattr(sink, "schema_plan", lambda *_: None)(rules, registry))]
+    if any(plan.problems for plan in plans):
+        raise SchemaError(refused(plans))
+    for plan in plans:
+        plan.apply()
 
 
 def make_sink(spec: dict) -> Sink:
