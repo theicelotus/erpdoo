@@ -231,3 +231,15 @@ def test_fewer_columns_are_trimmed_in_place():
     assert s.loaded["sale_order_line"] == 0x100
     assert s.get("sale_order_line", 1) == {"id": 1, "order_id": 7, "name": "Desk XL"}
     assert s.get("sale_order_line", 1, as_of=0x110) == {"id": 1, "order_id": 7, "name": "Desk"}
+
+
+def test_a_store_in_an_older_format_starts_over(tmp_path):
+    path = str(tmp_path / "state.db")
+    s = StateStore(path)
+    s.load("res_partner", [{"id": 1, "active": False}], lsn=0x100)
+    s.db.execute("DELETE FROM meta WHERE key = 'format'")  # as erpdoo wrote it before formats
+    s.db.commit()
+    upgraded = StateStore(path)
+    assert upgraded.tables == set()
+    upgraded.load("res_partner", [{"id": 1, "active": True}], lsn=0x200)
+    assert StateStore(path).tables == {"res_partner"}  # only once

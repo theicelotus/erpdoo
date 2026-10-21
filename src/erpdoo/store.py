@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 
 _COLUMN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _UNKNOWN = object()  # no stored version: the slot was confirmed past it, or the table was not tracked
+FORMAT = 2  # of the stored rows; an older store starts over
 PROGRESS_SECONDS = 5  # how often a long snapshot logs its progress
 SNAPSHOT_BATCH = 5000  # rows fetched from Postgres, and written to SQLite, at a time
 
@@ -111,6 +112,16 @@ class StateStore:
             shape = json.loads(spec) if spec else {"columns": None, "full": True}
             columns = frozenset(shape["columns"]) if shape["columns"] is not None else None
             self.specs[table] = TableSpec(columns, shape["full"])
+        row = self.db.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+        if self.loaded and (row is None or row[0] < FORMAT):
+            # Format 1 read booleans from snapshots and fetches as false.
+            log.info("state store: written by an older erpdoo, copying it again")
+            for name in ("records", "loaded_tables", "versions", "lookups"):
+                self.db.execute(f"DELETE FROM {name}")
+            self.loaded.clear()
+            self.specs.clear()
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('format', ?)", [FORMAT])
+        self.db.commit()
         row = self.db.execute("SELECT value FROM meta WHERE key = 'applied_lsn'").fetchone()
         # End of the last transaction applied; anything up to here is in the store.
         self.applied_lsn = row[0] if row else 0
@@ -135,6 +146,7 @@ class StateStore:
         changes since the last run are lost."""
         for table in ("records", "loaded_tables", "versions", "meta", "lookups"):
             self.db.execute(f"DELETE FROM {table}")
+        self.db.execute("INSERT INTO meta VALUES ('format', ?)", [FORMAT])
         self.db.commit()
         self.loaded.clear()
         self.specs.clear()
