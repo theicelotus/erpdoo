@@ -37,6 +37,7 @@ from pathlib import Path
 import yaml
 
 from erpdoo.models import Field, ModelRegistry
+from erpdoo.store import TableSpec
 
 TRIGGERS = frozenset({"create", "update", "delete"})
 RULE_KEYS = {"model", "when", "on", "fields", "include"}
@@ -302,36 +303,65 @@ def _include_target(registry: ModelRegistry, model: str, name: str) -> str:
     return f.relation
 
 
-def tracked_tables(rules: list[Rule], registry: ModelRegistry) -> dict[str, set[str]]:
-    """Tables the state store must copy for these rules, each with the columns
-    to index for one2many and many2many lookups: the rules' own tables, which give each
-    change its previous row, and the tables of the records they include or
-    read. The store keeps rows by id, so a rule table without an id column
-    is left out."""
-    tables: dict[str, set[str]] = {}
+def tracked_tables(rules: list[Rule], registry: ModelRegistry) -> dict[str, TableSpec]:
+    """What the state store keeps for these rules, per table: the columns
+    the rules read (conditions, rendered fields, the keys includes follow),
+    and which tables are copied whole. The rules' own tables are, because
+    they give each change its previous row; the store keeps rows by id, so a
+    rule table without an id column is left out. Tables of related records
+    (includes, related fields) are fetched row by row when first needed."""
+    columns: dict[str, set[str] | None] = {}
+    full: set[str] = set()
+    lookups: dict[str, set[tuple[str, str]]] = {}
+
+    def need(table: str, names=(), every: bool = False) -> None:
+        kept = columns.setdefault(table, {"id"})
+        if every:
+            columns[table] = None
+        elif kept is not None:
+            kept.update(n for n in names if n)
+
+    def need_field(model: str, name: str) -> None:
+        for hop_model, f in related_hops(registry, model, name):
+            need(registry.models[hop_model].table, [f.column])
 
     def need_fields(model: str, names) -> None:
+        if names is None:
+            need(registry.models[model].table, every=True)
         for name in names or ():
-            for _model, hop in related_hops(registry, model, name)[:-1]:
-                tables.setdefault(registry.models[hop.relation].table, set())
+            need_field(model, name)
 
     def walk(model: str, includes: dict[str, Include]) -> None:
         for inc in includes.values():
             f = registry.models[model].fields[inc.field]
             target = registry.models[f.relation]
-            columns = tables.setdefault(target.table, set())
-            if f.type == "one2many":
-                columns.add(registry.models[f.relation].fields[f.inverse].column)
-            elif f.type == "many2many":
-                tables.setdefault(f.relation_table, set()).add(f.column1)
+            need(target.table)
+            if f.type == "many2one":
+                need(registry.models[model].table, [f.column])
+            elif f.type == "one2many":
+                inverse = target.fields[f.inverse].column
+                need(target.table, [inverse])
+                lookups.setdefault(target.table, set()).add((inverse, registry.models[model].table))
+            else:
+                need(f.relation_table, every=True)  # its two columns
+                lookups.setdefault(f.relation_table, set()).add((f.column1, registry.models[model].table))
             need_fields(target.name, inc.fields)
+            need(target.table, [target.fields[c.field].column for c in inc.where])
             walk(target.name, inc.children)
 
     for rule in rules:
         model = registry.models[rule.model]
         if "id" in model.fields and model.fields["id"].column:
-            tables.setdefault(model.table, set())
+            need(model.table)
+            full.add(model.table)
         need_fields(rule.model, rule.fields)
-        need_fields(rule.model, [c.field for c in rule.conditions])
+        for c in rule.conditions:
+            need_field(rule.model, c.field)
         walk(rule.model, rule.includes)
-    return tables
+    return {
+        table: TableSpec(frozenset(kept) if kept is not None else None, table in full,
+                         frozenset(lookups.get(table, ())))
+        for table, kept in columns.items()
+        # A rule table without an id column cannot be kept.
+        if table in full or table not in {registry.models[r.model].table for r in rules}
+    }

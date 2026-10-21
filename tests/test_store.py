@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from erpdoo.replication import Change, Transaction
-from erpdoo.store import StateStore
+from erpdoo.store import StateStore, TableSpec
 
 
 def store() -> StateStore:
@@ -148,3 +148,86 @@ def test_find_as_of_an_earlier_position():
     # Before that transaction: Lamp did not exist, Chair was not deleted, Desk was on order 7.
     assert [r["name"] for r in s.find("sale_order_line", "order_id", 7, as_of=0x110)] == ["Desk", "Chair"]
     assert s.find("sale_order_line", "order_id", 8, as_of=0x110) == []
+
+
+def on_demand_store(postgres):
+    """A store whose sale_order_line rows are fetched from ``postgres`` (a
+    list of rows standing in for the table) when first needed."""
+    s = StateStore(":memory:")
+    reads = []
+
+    def read(table, column, value):
+        reads.append((table, column, value))
+        return [{k: v for k, v in row.items() if k in COLUMNS} for row in postgres if row[column] == value]
+
+    s._read_postgres = read
+    s.track("sale_order", TableSpec(frozenset({"id", "state"}), False))
+    s.track("sale_order_line", TableSpec(COLUMNS, False, frozenset({("order_id", "sale_order")})))
+    return s, reads
+
+
+COLUMNS = frozenset({"id", "order_id", "name"})
+POSTGRES = [{"id": 1, "order_id": 7, "name": "Desk", "note": "x"}, {"id": 2, "order_id": 7, "name": "Chair", "note": "y"}]
+
+
+def test_rows_are_fetched_once_with_the_kept_columns():
+    s, reads = on_demand_store(POSTGRES)
+    assert s.get("sale_order_line", 1) == {"id": 1, "order_id": 7, "name": "Desk"}  # no "note"
+    assert s.get("sale_order_line", 1)["name"] == "Desk"
+    assert reads == [("sale_order_line", "id", 1)]
+    # From then on the stream keeps the row current.
+    s.apply_transaction(txn(0x200, change("update", new={"id": 1, "order_id": 7, "name": "Desk XL", "note": "z"})))
+    assert s.get("sale_order_line", 1) == {"id": 1, "order_id": 7, "name": "Desk XL"}
+    assert len(reads) == 1
+
+
+def test_lookups_are_fetched_once_then_follow_the_stream():
+    s, reads = on_demand_store(POSTGRES)
+    assert [r["name"] for r in s.find("sale_order_line", "order_id", 7)] == ["Desk", "Chair"]
+    s.apply_transaction(txn(0x200, change("insert", new={"id": 3, "order_id": 7, "name": "Lamp", "note": None})))
+    assert [r["name"] for r in s.find("sale_order_line", "order_id", 7)] == ["Desk", "Chair", "Lamp"]
+    assert reads == [("sale_order_line", "order_id", 7)]
+
+
+def test_records_created_while_tracking_need_no_lookup():
+    s, reads = on_demand_store([])
+    s.apply_transaction(txn(0x200, Change("insert", "sale_order", "sale.order", None, False, {"id": 8, "state": "draft"}),
+                            change("insert", new={"id": 3, "order_id": 8, "name": "Lamp", "note": None})))
+    assert [r["name"] for r in s.find("sale_order_line", "order_id", 8)] == ["Lamp"]
+    assert reads == []
+
+
+def test_updates_of_rows_never_fetched():
+    s, reads = on_demand_store(POSTGRES)
+    # Every kept column is in the new row: kept. Without them all: left to a fetch.
+    s.apply_transaction(txn(0x200, change("update", new={"id": 4, "order_id": 9, "name": "Shelf"})))
+    s.apply_transaction(txn(0x300, change("update", new={"id": 5, "order_id": 9})))
+    assert s._current("sale_order_line", 4) == {"id": 4, "order_id": 9, "name": "Shelf"}
+    assert s._current("sale_order_line", 5) is None
+
+
+def test_changed_columns_start_a_table_over():
+    s, _ = on_demand_store(POSTGRES)
+    s.get("sale_order_line", 1)
+    s.sync("dsn", {"sale_order_line": TableSpec(COLUMNS | {"note"}, False)})
+    assert s._current("sale_order_line", 1) is None
+    assert s.specs["sale_order_line"].columns == COLUMNS | {"note"}
+
+
+def test_snapshot_keeps_only_the_kept_columns():
+    s = StateStore(":memory:")
+    s.load("sale_order", [{"id": 1, "state": "draft", "note": "long"}], lsn=0x100,
+           spec=TableSpec(frozenset({"id", "state"}), True))
+    assert s.get("sale_order", 1) == {"id": 1, "state": "draft"}
+    reopened_spec = s.specs["sale_order"]
+    assert reopened_spec.full and reopened_spec.columns == {"id", "state"}
+
+
+def test_fewer_columns_are_trimmed_in_place():
+    # A store that kept whole rows (or more columns) keeps its copy and versions.
+    s = store()
+    s.apply_transaction(txn(0x200, change("update", new={"id": 1, "order_id": 7, "name": "Desk XL"})))
+    s.sync("dsn", {"sale_order_line": TableSpec(frozenset({"id", "order_id", "name"}), True)})
+    assert s.loaded["sale_order_line"] == 0x100
+    assert s.get("sale_order_line", 1) == {"id": 1, "order_id": 7, "name": "Desk XL"}
+    assert s.get("sale_order_line", 1, as_of=0x110) == {"id": 1, "order_id": 7, "name": "Desk"}

@@ -2,6 +2,7 @@ import pytest
 import yaml
 
 import fake_odoo
+from erpdoo.store import TableSpec
 from erpdoo.rules import (
     Condition, RuleError, YamlLoader, missing_model_message, parse_rule, split_by_model, tracked_tables, validate,
 )
@@ -70,10 +71,23 @@ def test_tracked_tables_follow_includes_and_related_fields():
     rule = parse_rule("R", {"model": "sale.order", "include": {
         "partner_id": ["name"], "order_line": ["name"], "order_line.product_id": ["name"]}})
     assert tracked_tables([rule], fake_odoo.registry()) == {
-        "sale_order": set(),  # the rule's own table, for each change's previous row
-        "res_partner": set(), "sale_order_line": {"order_id"},
-        "product_product": set(), "product_template": set(),  # product name is product_tmpl_id.name
+        # The rule's own table, copied whole for each change's previous row
+        # (every column: the rule renders them all).
+        "sale_order": TableSpec(None, True),
+        # Related tables, fetched when first needed, with the columns used.
+        "res_partner": TableSpec(frozenset({"id", "name"}), False),
+        "sale_order_line": TableSpec(frozenset({"id", "order_id", "name", "product_id"}), False,
+                                     frozenset({("order_id", "sale_order")})),
+        "product_product": TableSpec(frozenset({"id", "product_tmpl_id"}), False),  # name is product_tmpl_id.name
+        "product_template": TableSpec(frozenset({"id", "name"}), False),
     }
+
+
+def test_rule_tables_keep_only_the_columns_rules_use():
+    rule = parse_rule("R", {"model": "sale.order", "when": {"state": {"to": "sale"}}, "fields": ["name"],
+                            "include": {"partner_id": ["name"]}})
+    assert tracked_tables([rule], fake_odoo.registry())["sale_order"] == TableSpec(
+        frozenset({"id", "state", "name", "partner_id"}), True)
 
 
 def test_conditions_on_related_paths():
@@ -82,7 +96,9 @@ def test_conditions_on_related_paths():
     validate([rule], registry)
     # product_id.name follows product_id, then the related product_tmpl_id.name.
     assert tracked_tables([rule], registry) == {
-        "sale_order_line": set(), "product_product": set(), "product_template": set()}
+        "sale_order_line": TableSpec(None, True),
+        "product_product": TableSpec(frozenset({"id", "product_tmpl_id"}), False),
+        "product_template": TableSpec(frozenset({"id", "name"}), False)}
     with pytest.raises(RuleError, match="supports only a plain value"):
         validate([parse_rule("R", {"model": "sale.order.line", "when": {"product_id.name": {"to": "x"}}})], registry)
     with pytest.raises(RuleError, match="not a stored many2one"):
@@ -93,7 +109,9 @@ def test_many2many_include_tracks_the_join_table():
     rule = parse_rule("R", {"model": "sale.order", "include": {"tag_ids": ["name"]}})
     validate([rule], fake_odoo.registry())
     assert tracked_tables([rule], fake_odoo.registry()) == {
-        "sale_order": set(), "sale_order_tag_rel": {"order_id"}, "crm_tag": set()}
+        "sale_order": TableSpec(None, True),
+        "sale_order_tag_rel": TableSpec(None, False, frozenset({("order_id", "sale_order")})),
+        "crm_tag": TableSpec(frozenset({"id", "name"}), False)}
 
 
 def test_rule_table_without_id_is_not_tracked():

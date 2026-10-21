@@ -1,11 +1,20 @@
-"""SQLite state store: a local copy of the Odoo tables that events include
-(partners, products, order lines, ...), kept current from the replication
-stream so events carry related records without querying Odoo.
+"""SQLite state store: a local copy of the Odoo data that rules and events
+use (orders, partners, products, order lines, ...), kept current from the
+replication stream so events carry related records without querying Odoo
+for each one.
 
-Each tracked table is loaded once from a snapshot, then updated by streamed
-changes. Changes from before the snapshot can be streamed again after it
-(the slot may be behind); applying them in order still ends at the current
-rows, so the copy converges.
+The store keeps only the columns the rules use. The rules' own tables are
+copied whole when tracking starts (a snapshot), because they supply each
+change's previous row. Related tables are not copied: a row is fetched from
+Postgres the first time an event needs it, and for one2many and many2many
+lookups the rows linked to a record are fetched together, the first time.
+From then on the stream keeps them current. A fetched row is as Postgres
+has it at that moment, which can be newer than the transaction the event
+is about when erpdoo is behind.
+
+Changes from before a snapshot or fetch can be streamed again after it (the
+slot may be behind); applying them in order still ends at the current rows,
+so the copy converges.
 
 The store also gives each change the row it replaces when Postgres does not
 send it (updates and deletes without REPLICA IDENTITY FULL). For that it
@@ -21,8 +30,10 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import closing
+from dataclasses import dataclass
 
 import psycopg2
 from psycopg2 import sql
@@ -34,6 +45,8 @@ log = logging.getLogger(__name__)
 
 _COLUMN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _UNKNOWN = object()  # no stored version: the slot was confirmed past it, or the table was not tracked
+PROGRESS_SECONDS = 5  # how often a long snapshot logs its progress
+SNAPSHOT_BATCH = 5000  # rows fetched from Postgres, and written to SQLite, at a time
 
 
 def row_key(row: dict) -> int:
@@ -46,8 +59,24 @@ def row_key(row: dict) -> int:
     return (row[first] << 32) | row[second]
 
 
+@dataclass(frozen=True)
+class TableSpec:
+    """What the store keeps of one table."""
+
+    columns: frozenset[str] | None = None  # None: every column
+    full: bool = True  # copied whole up front; otherwise rows are fetched when first needed
+    # Columns find() looks rows up by (one2many inverse, many2many join
+    # column), each with the table of the records they point to.
+    lookups: frozenset[tuple[str, str]] = frozenset()
+
+    @property
+    def shape(self) -> dict:
+        """What decides the rows stored; when it changes, the table starts over."""
+        return {"columns": sorted(self.columns) if self.columns is not None else None, "full": self.full}
+
+
 class StateStore:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, dsn: str | None = None) -> None:
         self.db = sqlite3.connect(path)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(
@@ -62,56 +91,84 @@ class StateStore:
                 PRIMARY KEY (tbl, id, lsn));
             CREATE INDEX IF NOT EXISTS versions_lsn ON versions (lsn);
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+            -- find() lookups whose rows are all in the store (fetched, or the
+            -- record they point to was created after tracking started).
+            CREATE TABLE IF NOT EXISTS lookups (
+                tbl TEXT NOT NULL, col TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (tbl, col, value));
             """
         )
         columns = [r[1] for r in self.db.execute("PRAGMA table_info(loaded_tables)")]
         if "lsn" not in columns:  # stores from before versions were kept
             self.db.execute("ALTER TABLE loaded_tables ADD COLUMN lsn INTEGER NOT NULL DEFAULT 0")
-        # Table -> the WAL position its snapshot was taken at.
-        self.loaded = dict(self.db.execute("SELECT tbl, lsn FROM loaded_tables"))
+        if "spec" not in columns:  # stores that kept whole tables; NULL reads as that
+            self.db.execute("ALTER TABLE loaded_tables ADD COLUMN spec TEXT")
+        # Table -> the WAL position its snapshot was taken at (0 for tables
+        # fetched on demand), and what is kept of it.
+        self.loaded: dict[str, int] = {}
+        self.specs: dict[str, TableSpec] = {}
+        for table, lsn, spec in self.db.execute("SELECT tbl, lsn, spec FROM loaded_tables"):
+            self.loaded[table] = lsn
+            shape = json.loads(spec) if spec else {"columns": None, "full": True}
+            columns = frozenset(shape["columns"]) if shape["columns"] is not None else None
+            self.specs[table] = TableSpec(columns, shape["full"])
         row = self.db.execute("SELECT value FROM meta WHERE key = 'applied_lsn'").fetchone()
         # End of the last transaction applied; anything up to here is in the store.
         self.applied_lsn = row[0] if row else 0
+        self.dsn = dsn
+        self.fetches = 0  # queries to Postgres for rows not in the store
+        self._pg = None
+        self._types: dict[str, list[tuple[str, int]]] = {}
+        # Table -> the lookups that point to its records: a record created
+        # while tracking has no linked rows yet, so its lookups start complete.
+        self._children: dict[str, list[tuple[str, str]]] = {}
         self._wal_fallback_logged: set[str] = set()
 
     @property
     def tables(self) -> set[str]:
-        return set(self.loaded)
+        return set(self.specs)
 
     def reset(self) -> None:
         """Forget everything, e.g. when the replication slot was recreated and
         changes since the last run are lost."""
-        for table in ("records", "loaded_tables", "versions", "meta"):
+        for table in ("records", "loaded_tables", "versions", "meta", "lookups"):
             self.db.execute(f"DELETE FROM {table}")
         self.db.commit()
         self.loaded.clear()
+        self.specs.clear()
         self.applied_lsn = 0
 
     def forget(self, table: str) -> None:
         """Stop tracking a table. Its rows would go stale, so they are dropped."""
-        for name in ("records", "loaded_tables", "versions"):
+        for name in ("records", "loaded_tables", "versions", "lookups"):
             self.db.execute(f"DELETE FROM {name} WHERE tbl = ?", [table])
         self.db.commit()
         self.loaded.pop(table, None)
+        self.specs.pop(table, None)
 
-    def load(self, table: str, rows: Iterable[dict], lsn: int = 0) -> int:
+    def track(self, table: str, spec: TableSpec, lsn: int = 0) -> None:
+        """Start tracking a table, empty."""
+        self.db.execute("INSERT OR REPLACE INTO loaded_tables (tbl, lsn, spec) VALUES (?, ?, ?)",
+                        [table, lsn, json.dumps(spec.shape)])
+        self.loaded[table] = lsn
+        self.specs[table] = spec
+        for column, parent in spec.lookups:
+            self.index(column)
+            if (table, column) not in self._children.setdefault(parent, []):
+                self._children[parent].append((table, column))
+
+    def load(self, table: str, rows: Iterable[dict], lsn: int = 0, spec: TableSpec | None = None) -> int:
         """Replace a table's rows with a snapshot taken at WAL position
         ``lsn`` and start tracking it."""
+        spec = spec or TableSpec()
         self.db.execute("DELETE FROM records WHERE tbl = ?", [table])
         self.db.execute("DELETE FROM versions WHERE tbl = ?", [table])
         count = 0
-        batch = []
-        for row in rows:
-            batch.append((table, row_key(row), json.dumps(row)))
-            if len(batch) >= 1000:
-                self.db.executemany("INSERT INTO records VALUES (?, ?, ?)", batch)
-                count += len(batch)
-                batch.clear()
-        self.db.executemany("INSERT INTO records VALUES (?, ?, ?)", batch)
-        count += len(batch)
-        self.db.execute("INSERT OR REPLACE INTO loaded_tables (tbl, lsn) VALUES (?, ?)", [table, lsn])
+        for batch in _batches((table, row_key(row), json.dumps(_keep(spec, row))) for row in rows):
+            self.db.executemany("INSERT INTO records VALUES (?, ?, ?)", batch)
+            count += len(batch)
+            self.db.commit()  # lets SQLite checkpoint its WAL during a long copy
+        self.track(table, spec, lsn)
         self.db.commit()
-        self.loaded[table] = lsn
         return count
 
     def index(self, column: str) -> None:
@@ -137,7 +194,8 @@ class StateStore:
         rows: dict[tuple[str, int], object] = {}
         for change in txn.changes:
             table = change.table
-            if table not in self.loaded:
+            spec = self.specs.get(table)
+            if spec is None:
                 continue
             if change.op == "truncate":
                 if not replay:
@@ -152,34 +210,48 @@ class StateStore:
                 if previous is not _UNKNOWN:
                     rows[key] = None if change.op == "delete" else {**(previous or {}), **change.new}
             else:
-                previous = self.get(table, record_id)
-                self.db.execute("INSERT OR IGNORE INTO versions VALUES (?, ?, ?, ?)",
-                                [table, record_id, txn.commit_lsn, json.dumps(previous)])
+                previous = self._current(table, record_id)
+                if previous is None and change.op != "insert" and not spec.full:
+                    previous = _UNKNOWN  # never fetched: not known, rather than absent
+                else:
+                    self.db.execute("INSERT OR IGNORE INTO versions VALUES (?, ?, ?, ?)",
+                                    [table, record_id, txn.commit_lsn, json.dumps(previous)])
             if change.op != "insert" and txn.commit_lsn >= self.loaded[table]:
                 known = previous is not None and previous is not _UNKNOWN
                 if known and (change.old is None or change.old_is_key_only):
                     change.old, change.old_is_key_only = previous, False
-                elif not known and change.old is not None and not change.old_is_key_only:
+                elif not known and change.old is not None and not change.old_is_key_only and spec.full:
                     if table not in self._wal_fallback_logged:
                         self._wal_fallback_logged.add(table)
                         log.info("%s: previous row of %s not in the state store, using the one Postgres sent"
                                  " (REPLICA IDENTITY FULL)", table, record_id)
             if not replay:
-                self._apply(change, previous)
+                self._apply(change, None if previous is _UNKNOWN else previous, spec)
         if not replay:
             self.applied_lsn = txn.end_lsn
             self.db.execute("INSERT OR REPLACE INTO meta VALUES ('applied_lsn', ?)", [txn.end_lsn])
         return replay
 
-    def _apply(self, change: Change, previous: dict | None) -> None:
+    def _apply(self, change: Change, previous: dict | None, spec: TableSpec) -> None:
+        table = change.table
         if change.op == "delete":
-            self.db.execute("DELETE FROM records WHERE tbl = ? AND id = ?", [change.table, row_key(change.old)])
+            self.db.execute("DELETE FROM records WHERE tbl = ? AND id = ?", [table, row_key(change.old)])
             return
-        # Unchanged TOASTed columns are not in the new row of an update; keep the stored value.
-        row = {**(previous or {}), **change.new} if change.op == "update" else change.new
+        new = _keep(spec, change.new)
+        if change.op == "insert":
+            row = new
+            for child, column in self._children.get(table, ()):
+                self.db.execute("INSERT OR IGNORE INTO lookups VALUES (?, ?, ?)", [child, column, row_key(row)])
+        elif previous is not None or spec.full:
+            # Unchanged TOASTed columns are not in the new row of an update; keep the stored value.
+            row = {**(previous or {}), **new}
+        elif spec.columns is not None and spec.columns <= change.new.keys():
+            row = new  # not fetched yet, but the update has every column kept
+        else:
+            return  # fetched in full when an event needs it
         self.db.execute(
             "INSERT INTO records VALUES (?, ?, ?) ON CONFLICT (tbl, id) DO UPDATE SET data = excluded.data",
-            [change.table, row_key(row), json.dumps(row)],
+            [table, row_key(row), json.dumps(row)],
         )
 
     def _version(self, table: str, record_id: int, lsn: int):
@@ -197,23 +269,38 @@ class StateStore:
     def commit(self) -> None:
         self.db.commit()
 
+    def _current(self, table: str, record_id: int) -> dict | None:
+        row = self.db.execute("SELECT data FROM records WHERE tbl = ? AND id = ?", [table, record_id]).fetchone()
+        return json.loads(row[0]) if row else None
+
     def get(self, table: str, record_id: int, as_of: int | None = None) -> dict | None:
         """A row, as of WAL position ``as_of`` (the end of a transaction) if
         given: during a replay the store is ahead of the stream, and the row
-        then comes from the versions kept since the slot's confirmed position."""
+        then comes from the versions kept since the slot's confirmed position.
+        A row of a table fetched on demand is read from Postgres the first time."""
         if as_of is not None and as_of < self.applied_lsn:
             row = self.db.execute("SELECT data FROM versions WHERE tbl = ? AND id = ? AND lsn >= ?"
                                   " ORDER BY lsn LIMIT 1", [table, record_id, as_of]).fetchone()
             if row:
                 return json.loads(row[0])
-        row = self.db.execute("SELECT data FROM records WHERE tbl = ? AND id = ?", [table, record_id]).fetchone()
-        return json.loads(row[0]) if row else None
+        current = self._current(table, record_id)
+        spec = self.specs.get(table)
+        if current is None and spec is not None and not spec.full:
+            fetched = self._fetch(table, "id", record_id)
+            current = fetched[0] if fetched else None
+        return current
 
     def find(self, table: str, column: str, value: object, as_of: int | None = None) -> list[dict]:
         """Rows of ``table`` whose ``column`` equals ``value``, by id, as of
-        WAL position ``as_of`` if given (see get)."""
+        WAL position ``as_of`` if given (see get). For a table fetched on
+        demand, the rows are read from Postgres the first time."""
         if not _COLUMN.match(column):
             raise ValueError(f"invalid column name {column!r}")
+        spec = self.specs.get(table)
+        if spec is not None and not spec.full and not self.db.execute(
+                "SELECT 1 FROM lookups WHERE tbl = ? AND col = ? AND value = ?", [table, column, value]).fetchone():
+            self._fetch(table, column, value)
+            self.db.execute("INSERT OR IGNORE INTO lookups VALUES (?, ?, ?)", [table, column, value])
         # No ORDER BY: with it, SQLite prefers the primary key (tbl, id) and
         # scans the whole table instead of using the column's index.
         rows = dict(self.db.execute(
@@ -235,53 +322,139 @@ class StateStore:
                     rows.pop(record_id, None)
         return [json.loads(data) for _, data in sorted(rows.items())]
 
-    def sync(self, dsn: str, tables: dict[str, set[str]]) -> None:
-        """Track exactly ``tables`` (table -> columns to index): drop tables no
-        longer needed and load a snapshot of new ones."""
-        for table in sorted(self.tables - tables.keys()):
+    def _trim(self, table: str, spec: TableSpec) -> None:
+        for name in ("records", "versions"):
+            key = "id" if name == "records" else "id, lsn"
+            for batch in _batches(self.db.execute(f"SELECT {key}, data FROM {name} WHERE tbl = ?", [table]).fetchall()):
+                self.db.executemany(
+                    f"UPDATE {name} SET data = ? WHERE tbl = ? AND " + " AND ".join(f"{k} = ?" for k in key.split(", ")),
+                    [(json.dumps(_keep(spec, json.loads(data)) if data != "null" else None), table, *keys)
+                     for *keys, data in batch])
+        self.track(table, spec, self.loaded[table])
+        self.db.commit()
+
+    def _fetch(self, table: str, column: str, value: object) -> list[dict]:
+        """Read the rows of ``table`` whose ``column`` is ``value`` from
+        Postgres, as it has them now, and keep them."""
+        rows = self._read_postgres(table, column, value)
+        self.fetches += 1
+        self.db.executemany(
+            "INSERT INTO records VALUES (?, ?, ?) ON CONFLICT (tbl, id) DO UPDATE SET data = excluded.data",
+            [(table, row_key(row), json.dumps(row)) for row in rows])
+        return rows
+
+    def _read_postgres(self, table: str, column: str, value: object) -> list[dict]:
+        if self._pg is None:
+            self._pg = psycopg2.connect(self.dsn, application_name="erpdoo-fetch")
+            self._pg.autocommit = True
+        if table not in self._types:
+            self._types[table] = _column_types(self._pg, table, self.specs[table].columns)
+        columns = self._types[table]
+        query = sql.SQL("SELECT {} FROM {} WHERE {} = %s").format(
+            sql.SQL(", ").join(sql.SQL("{}::text").format(sql.Identifier(name)) for name, _ in columns),
+            sql.Identifier("public", table), sql.Identifier(column))
+        with self._pg.cursor() as cur:
+            cur.execute(query, [value])
+            return [{name: pgoutput.convert(oid, v) for (name, oid), v in zip(columns, values)} for values in cur]
+
+    def sync(self, dsn: str, specs: dict[str, TableSpec]) -> None:
+        """Track exactly the tables in ``specs``: drop tables no longer
+        needed, start over with tables whose kept columns changed, and copy
+        the tables to be copied whole."""
+        self.dsn = dsn
+        self._types.clear()
+        for table in sorted(self.tables - specs.keys()):
             self.forget(table)
             log.info("state store: stopped tracking %s", table)
-        for columns in tables.values():
-            for column in columns:
-                self.index(column)
-        missing = sorted(tables.keys() - self.tables)
+        for table, spec in sorted(specs.items()):
+            have = self.specs.get(table)
+            if have is None or have.shape == spec.shape:
+                continue
+            if _covers(have, spec):
+                # Fewer columns (or fetched on demand from now on): trim the
+                # rows in place, keeping the copy's position and the versions.
+                self._trim(table, spec)
+                log.info("state store: %s now keeps %s", table,
+                         "every column" if spec.columns is None else f"{len(spec.columns)} columns")
+            else:
+                self.forget(table)
+                log.info("state store: %s needs columns it did not keep, starting it over", table)
+        self._children.clear()
+        for table, spec in sorted(specs.items()):
+            if table in self.specs or not spec.full:
+                self.track(table, spec, self.loaded.get(table, 0))
+        self.db.commit()
+        missing = sorted(t for t, spec in specs.items() if t not in self.specs)
         if missing:
             with closing(psycopg2.connect(dsn, application_name="erpdoo-snapshot")) as conn:
                 conn.set_session(isolation_level="REPEATABLE READ")
                 for table in missing:
-                    lsn, rows = snapshot(conn, table)
-                    count = self.load(table, rows, lsn)
-                    log.info("state store: loaded %d rows of %s", count, table)
+                    started = time.monotonic()
+                    lsn, rows = snapshot(conn, table, specs[table].columns)
+                    count = self.load(table, rows, lsn, specs[table])
+                    log.info("state store: copied %d rows of %s in %.1f s", count, table, time.monotonic() - started)
 
 
-def snapshot(conn, table: str) -> tuple[int, Iterator[dict]]:
-    """The WAL position of a snapshot of a table, and its rows, converted
-    exactly like streamed rows: every column is read as text and converted by
-    its type, as pgoutput values are. ``conn`` must use REPEATABLE READ, so
-    the rows are as of that position."""
-    with conn.cursor() as cur:
-        # The first statement takes the snapshot; every transaction it sees
-        # committed before this position.
-        cur.execute("SELECT pg_current_wal_insert_lsn() - '0/0'")
-        lsn = int(cur.fetchone()[0])
-    return lsn, _rows(conn, table)
+def _covers(have: TableSpec, want: TableSpec) -> bool:
+    """Whether a table kept as ``have`` already holds what ``want`` keeps."""
+    columns = have.columns is None or (want.columns is not None and want.columns <= have.columns)
+    return columns and (have.full or not want.full)
 
 
-def _rows(conn, table: str) -> Iterator[dict]:
+def _keep(spec: TableSpec, row: dict) -> dict:
+    return row if spec.columns is None else {k: v for k, v in row.items() if k in spec.columns}
+
+
+def _batches(items: Iterable, size: int = SNAPSHOT_BATCH) -> Iterator[list]:
+    batch = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _column_types(conn, table: str, columns: frozenset[str] | None) -> list[tuple[str, int]]:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT attname, atttypid FROM pg_attribute"
             " WHERE attrelid = %s::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
             [f"public.{table}"],
         )
-        columns = cur.fetchall()
+        return [(name, oid) for name, oid in cur.fetchall() if columns is None or name in columns]
+
+
+def snapshot(conn, table: str, columns: frozenset[str] | None = None) -> tuple[int, Iterator[dict]]:
+    """The WAL position of a snapshot of a table, and its rows (only
+    ``columns``, if given), converted exactly like streamed rows: every
+    column is read as text and converted by its type, as pgoutput values are.
+    ``conn`` must use REPEATABLE READ, so the rows are as of that position."""
+    with conn.cursor() as cur:
+        # The first statement takes the snapshot; every transaction it sees
+        # committed before this position.
+        cur.execute("SELECT pg_current_wal_insert_lsn() - '0/0', reltuples FROM pg_class"
+                    " WHERE oid = %s::regclass", [f"public.{table}"])
+        lsn, estimate = cur.fetchone()
+    return int(lsn), _rows(conn, table, columns, max(int(estimate), 0))
+
+
+def _rows(conn, table: str, columns: frozenset[str] | None, estimate: int) -> Iterator[dict]:
+    types = _column_types(conn, table, columns)
     query = sql.SQL("SELECT {} FROM {}").format(
-        sql.SQL(", ").join(sql.SQL("{}::text").format(sql.Identifier(name)) for name, _ in columns),
+        sql.SQL(", ").join(sql.SQL("{}::text").format(sql.Identifier(name)) for name, _ in types),
         sql.Identifier("public", table),
     )
     with conn.cursor(name=f"snapshot_{table}") as cur:
-        cur.itersize = 5000
+        cur.itersize = SNAPSHOT_BATCH
         cur.execute(query)
+        count, logged = 0, time.monotonic()
         for values in cur:
-            yield {name: pgoutput.convert(oid, v) for (name, oid), v in zip(columns, values)}
+            yield {name: pgoutput.convert(oid, v) for (name, oid), v in zip(types, values)}
+            count += 1
+            if time.monotonic() - logged >= PROGRESS_SECONDS:
+                logged = time.monotonic()
+                total = f" of about {estimate:,}" if estimate else ""
+                log.info("state store: copying %s, %s%s rows so far", table, f"{count:,}", total)
     conn.commit()

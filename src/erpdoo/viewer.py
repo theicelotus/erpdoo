@@ -39,7 +39,8 @@ def describe_change(change: Change) -> dict:
     if change.op == "update":
         before = change.old if change.old is not None and not change.old_is_key_only else None
         item["changed"] = None if before is None else {
-            k: [before.get(k), v] for k, v in change.new.items() if k not in NOISE and before.get(k) != v
+            # The store keeps only the columns rules use; others are not compared.
+            k: [before[k], v] for k, v in change.new.items() if k not in NOISE and k in before and before[k] != v
         }
         # Odoo rewrites rows for bookkeeping (write_date, computed fields that
         # kept their value); the page hides these unless asked.
