@@ -163,7 +163,7 @@ def source_settings(spec, path=None) -> dict:
     odoo = spec.get("odoo")
     if not isinstance(odoo, dict) or odoo.keys() != ODOO or not all(odoo.values()):
         raise ConfigError(f"{where}: odoo needs {', '.join(sorted(ODOO))} (an API key of a read-only Odoo user,"
-                          " see \"Polling mode\" in the README)")
+                          " see docs/polling.md)")
     settings = {**POLLING, **{k: v for k, v in spec.items() if k in POLLING}}
     if settings["deletes"] is False:
         settings["deletes"] = None
@@ -188,7 +188,7 @@ def inbound_settings(spec, path=None) -> dict:
     odoo = spec["odoo"]
     if not isinstance(odoo, dict) or odoo.keys() != ODOO or not all(odoo.values()):
         raise ConfigError(f"{where}: odoo needs {', '.join(sorted(ODOO))} (an API key of the"
-                          " integration user, see \"Inbound\" in the README)")
+                          " integration user, see docs/inbound.md)")
     try:
         numbers = {k: float(spec[k]) for k in ("backoff", "max_backoff", "keep_days") if k in spec}
     except (TypeError, ValueError):

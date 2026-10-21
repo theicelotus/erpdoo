@@ -1,5 +1,5 @@
 # Inbound: a warehouse system reports a shipment. See src/erpdoo/inbound.py
-# for the rule format, and "Inbound" in the README.
+# for the rule format, and docs/inbound.md.
 #
 #   {"id": "wh-81723", "type": "DeliveryShipped", "reference": "WH/OUT/00042",
 #    "tracking_number": "1Z999AA10123456784"}

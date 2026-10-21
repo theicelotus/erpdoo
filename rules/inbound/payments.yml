@@ -1,5 +1,5 @@
 # Inbound: a payment provider reports a payment for a customer invoice. See
-# src/erpdoo/inbound.py for the rule format, and "Inbound" in the README.
+# src/erpdoo/inbound.py for the rule format, and docs/inbound.md.
 #
 #   {"id": "evt_3Q7x", "type": "PaymentReceived", "invoice": "INV/2026/00042",
 #    "amount": 1725.0, "date": "2026-10-21", "payment_id": "pi_3Q7xY2"}

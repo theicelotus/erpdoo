@@ -447,7 +447,7 @@ class Poller:
         if not self.tracking:
             log.warning("polling: Odoo user %s may not read Odoo's field tracking (mail.tracking.value), so every"
                         " rule compares values between polls and its events are approximate; give it read access"
-                        " (see \"Polling mode\" in the README)", self.client.login)
+                        " (see docs/polling.md)", self.client.login)
         self.columns = {}
         for table, spec in specs.items():
             model = self.registry.model_for_table(table)
@@ -506,7 +506,7 @@ class Poller:
                 problems.append(f"{model} ({', '.join(allowed)})")
         if problems:
             log.warning("polling: Odoo user %s may change models erpdoo only reads: %s. erpdoo never does, but use"
-                        " a read-only user (see \"Polling mode\" in the README)", self.client.login,
+                        " a read-only user (see docs/polling.md)", self.client.login,
                         ", ".join(problems))
         else:
             log.info("polling: Odoo user %s may only read the %d models erpdoo reads", self.client.login, len(models))
@@ -584,8 +584,8 @@ class Poller:
                 self.created_logged = True
                 log.warning("polling: Odoo user %s may not read ir.model.data, so erpdoo cannot tell when an app"
                             " installed later was installed: its records' values when erpdoo finds it are the"
-                            " baseline, and changes before give no event; give it read access (see \"Polling"
-                            " mode\" in the README)", self.client.login)
+                            " baseline, and changes before give no event; give it read access (see"
+                            " docs/polling.md)", self.client.login)
             return {}
         ids = {r["id"]: r["model"] for r in self.client.call("ir.model", "search_read", [("model", "in", models)],
                                                               fields=["model"])}

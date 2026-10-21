@@ -17,7 +17,7 @@ import psycopg2
 APPS = ["sale_management", "sale_stock", "crm", "stock_delivery"]
 ODOO = ["/entrypoint.sh", "odoo"]
 
-# The integration user (see "Inbound" in the README): an internal user with
+# The integration user (see docs/inbound.md): an internal user with
 # only the rights the shipped inbound rules need, and a fixed API key that
 # docker-compose.yml gives erpdoo. Dev stack only, like admin/admin.
 INTEGRATION_LOGIN = "erpdoo-integration"
@@ -35,7 +35,7 @@ env.cr.commit()
 print("created integration user", user.login, user.id)
 """
 
-# The read-only user polling mode reads as (see "Polling mode" in the README):
+# The read-only user polling mode reads as (see docs/polling.md):
 # an internal user, plus a group that may only read the models the shipped
 # rules use, Odoo's model list, its external ids (when a model was created)
 # and its field tracking (which Odoo otherwise shows administrators only),

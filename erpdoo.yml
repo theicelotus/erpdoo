@@ -3,12 +3,12 @@
 # confirmed only after all of them have delivered. When every sink is Kafka,
 # delivery is exactly once, in Kafka transactions (consumers must read with
 # isolation.level=read_committed); with any other sink, such as the stdout
-# one below, at-least-once. See "Delivery" in the README.
+# one below, at-least-once. See docs/sinks.md.
 
 # Where Odoo's changes come from: Postgres logical replication (the default,
 # set with ERPDOO_PG_DSN), or, for hosted Odoo without database access,
 # polling Odoo's JSON-RPC API as a read-only Odoo user. Polling needs no
-# Postgres access, but has limits: see "Polling mode" in the README.
+# Postgres access, but has limits: see docs/polling.md.
 # source:
 #   type: polling
 #   interval: 5       # seconds between polls: the latency of events
@@ -23,7 +23,7 @@
 
 sinks:
   # Each event type's schema is registered in the schema registry, under the
-  # subject <namespace>.<event type> (see "Schemas" in the README), and
+  # subject <namespace>.<event type> (see docs/schemas.md), and
   # messages carry its id. Without schema_registry, messages are plain JSON.
   - type: kafka
     bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
@@ -72,7 +72,7 @@ sinks:
 #   checkpoint_topic: erpdoo.checkpoints
 
 # Inbound: messages from other systems that act on Odoo, by the rules in
-# rules/inbound/ (see "Inbound" in the README). They act through Odoo's API as
+# rules/inbound/ (see docs/inbound.md). They act through Odoo's API as
 # a dedicated integration user, so Odoo's own access rights and checks apply.
 inbound:
   bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
@@ -88,20 +88,20 @@ inbound:
     api_key: ${ERPDOO_ODOO_API_KEY}
 
 # Tables of models that set their own _table in Odoo, when erpdoo should not
-# find them by their columns (see "Tables of custom models" in the README).
+# find them by their columns (see docs/postgres-setup.md).
 # tables:
 #   x_custom.gadget: x_custom_gadgets
 
 # Log a warning when the replication slot is this far behind (it is logged
-# every report_seconds either way). See "Slot health" in the README.
+# every report_seconds either way). See docs/slot-health.md.
 # slot:
 #   lag_warning: 1GB
 #   lag_warning_seconds: 300
 #   report_seconds: 60
 
 # When Postgres has invalidated the replication slot, erpdoo creates it again
-# and backfills the window it missed from Odoo's records (see "Backfill" in
-# the README). Set to false to only log the window.
+# and backfills the window it missed from Odoo's records (see
+# docs/slot-health.md). Set to false to only log the window.
 # backfill:
 #   after_lost_slot: true
 
