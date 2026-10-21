@@ -43,3 +43,8 @@ SELECT format('ALTER PUBLICATION erpdoo ADD TABLE %I', t)
 \endif
 
 GRANT SELECT ON :tables TO erpdoo;
+
+-- For erpdoo backfill: Odoo's field tracking. Of mail_message only the
+-- columns that say which record changed when, not the messages themselves.
+GRANT SELECT (id, model, res_id, date) ON mail_message TO erpdoo;
+GRANT SELECT ON mail_tracking_value, ir_model_fields_selection TO erpdoo;

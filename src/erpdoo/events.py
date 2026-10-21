@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from erpdoo.models import ModelRegistry
 from erpdoo.pgoutput import format_lsn
@@ -105,27 +106,30 @@ class EventBuilder:
                     continue
                 if not rule.matches(before, self._with_related(rule, after)):
                     continue
-                row = after if after is not None else before
-                eid = event_id(txn, rule.name, rule.model, record_id)
-                payload = {
-                    "event_id": eid,
-                    "event_type": rule.name,
-                    "model": rule.model,
-                    "record_id": record_id,
-                    "occurred_at": txn.commit_time.isoformat(),
-                    "changes": {
-                        c.field: {"from": before.get(c.field), "to": (after or {}).get(c.field)}
-                        for c in rule.conditions if c.is_transition
-                    },
-                    "record": self.render(rule.model, row, rule.fields, rule.includes),
-                    "source": {
-                        "table": self.registry.models[rule.model].table,
-                        "xid": txn.xid,
-                        "commit_lsn": format_lsn(txn.commit_lsn),
-                    },
-                }
-                events.append(Event(eid, rule.name, rule.model, record_id, payload))
+                events.append(self.event(
+                    rule, record_id, before, after, event_id(txn, rule.name, rule.model, record_id),
+                    txn.commit_time, {"xid": txn.xid, "commit_lsn": format_lsn(txn.commit_lsn)}))
         return events
+
+    def event(self, rule: Rule, record_id: int, before: dict, after: dict | None, eid: str,
+              occurred_at: datetime, source: dict) -> Event:
+        """The event of a rule that matched a record going from ``before`` to
+        ``after`` (None: deleted)."""
+        row = after if after is not None else before
+        payload = {
+            "event_id": eid,
+            "event_type": rule.name,
+            "model": rule.model,
+            "record_id": record_id,
+            "occurred_at": occurred_at.isoformat(),
+            "changes": {
+                c.field: {"from": before.get(c.field), "to": (after or {}).get(c.field)}
+                for c in rule.conditions if c.is_transition
+            },
+            "record": self.render(rule.model, row, rule.fields, rule.includes),
+            "source": {"table": self.registry.models[rule.model].table, **source},
+        }
+        return Event(eid, rule.name, rule.model, record_id, payload)
 
     def _previous_unknown(self, model: str, record_id: int, txn: Transaction, replay: bool) -> None:
         """Say why a record's rules were not checked."""

@@ -7,6 +7,8 @@ replication settings come from environment variables.
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
 import signal
@@ -18,6 +20,8 @@ from datetime import datetime, timezone
 import psycopg2
 from confluent_kafka import KafkaException
 
+from erpdoo import backfill
+from erpdoo.backfill import BackfillError
 from erpdoo.backoff import Stopped, Unreachable, reason, retry
 from erpdoo.config import ConfigError, load_config
 from erpdoo.events import EventBuilder
@@ -42,8 +46,11 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        run()
-    except (ConfigError, RuleError, PublicationError) as e:
+        if sys.argv[1:2] == ["backfill"]:
+            backfill_command(sys.argv[2:])
+        else:
+            run()
+    except (ConfigError, RuleError, PublicationError, BackfillError) as e:
         # Mistakes in the setup: say what is wrong, without a traceback.
         log.error("%s", e)
         sys.exit(2)
@@ -220,6 +227,44 @@ def run() -> None:
         if viewer:
             viewer.stop()
     log.info("stopped")
+
+
+def send_backfill(result: backfill.Backfill, sinks: list) -> None:
+    for reason_ in result.skipped:
+        log.warning("backfill: %s", reason_)
+    for start in range(0, len(result.events), 500):
+        for sink in sinks:
+            sink.send(result.events[start:start + 500])
+
+
+def backfill_command(argv: list[str]) -> None:
+    """erpdoo backfill --since T --until T: send the events the rules would
+    have produced in that window (see erpdoo.backfill)."""
+    p = argparse.ArgumentParser(prog="erpdoo backfill", description=backfill.__doc__.split("\n\n")[0])
+    p.add_argument("--since", required=True, type=backfill.parse_time, help="start, ISO 8601 (UTC if no zone)")
+    p.add_argument("--until", required=True, type=backfill.parse_time, help="end, ISO 8601 (UTC if no zone)")
+    p.add_argument("--dry-run", action="store_true", help="print the events instead of sending them")
+    args = p.parse_args(argv)
+    dsn = os.environ.get("ERPDOO_PG_DSN", "host=localhost dbname=odoo user=erpdoo password=erpdoo")
+    config = load_config(os.environ.get("ERPDOO_CONFIG"))
+    registry = ModelRegistry.load(dsn, config["tables"])
+    active, skipped = split_by_model(load_rules(os.environ.get("ERPDOO_RULES", "rules")), registry)
+    validate(active, registry)
+    for rule in skipped:
+        log.warning("rule %s skipped: %s", rule.name, missing_model_message(rule, registry))
+    result = backfill.run(active, registry, dsn, args.since, args.until, os.environ.get("ERPDOO_LANG", "en_US"))
+    if args.dry_run:
+        for event in result.events:
+            print(json.dumps(event.payload))
+    else:
+        sinks = [make_sink(spec) for spec in config["sinks"]]
+        try:
+            send_backfill(result, sinks)
+        finally:
+            for sink in sinks:
+                sink.close()
+    log.info("backfill %s to %s: %s%s", args.since.isoformat(), args.until.isoformat(), result.summary(),
+             "" if args.dry_run else f", sent to {', '.join(spec['type'] for spec in config['sinks'])}")
 
 
 def report_tables(registry: ModelRegistry, previous: ModelRegistry | None) -> None:
