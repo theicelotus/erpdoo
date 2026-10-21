@@ -7,7 +7,8 @@ Against the running compose stack:
 - starts erpdoo, which recreates the slot and backfills the window; each
   of the three must arrive exactly once, marked as backfilled, with the
   from and to values of the change (the lead's probability is not tracked
-  by Odoo, so that event is approximate and has no "from");
+  by Odoo, so that event is approximate and has no "from"), and valid
+  against the schema registered for its event type;
 - runs erpdoo backfill for the same window twice more; both runs must give
   the same event ids.
 Resets max_slot_wal_keep_size at the end.
@@ -28,7 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from smoke_test import Events, Odoo, wait_until  # noqa: E402
+from event_checks import SchemaCheck  # noqa: E402
+from smoke_test import REGISTRY, Events, Odoo, wait_until  # noqa: E402
 
 
 def main() -> int:
@@ -37,6 +39,7 @@ def main() -> int:
     p.add_argument("--db", default="odoo")
     p.add_argument("--kafka", default="127.0.0.1:19092")
     p.add_argument("--topic", default="erpdoo.events")
+    p.add_argument("--registry", default=REGISTRY)
     p.add_argument("--compose", default="docker compose", help="how to run docker compose")
     args = p.parse_args()
     compose = shlex.split(args.compose)
@@ -50,7 +53,8 @@ def main() -> int:
 
     wait_until("Odoo", lambda: Odoo(args.odoo, args.db, "admin", "admin"))
     odoo = Odoo(args.odoo, args.db, "admin", "admin")
-    events = Events(args.kafka, args.topic)
+    events = Events(args.kafka, args.topic, args.registry)
+    schemas = SchemaCheck(events.decode.client, args.registry)
     tag = uuid.uuid4().hex[:6]
     partner = odoo("res.partner", "create", {"name": f"Backfill Test {tag}", "customer_rank": 1})
     product = odoo("product.product", "search", [("sale_ok", "=", True), ("type", "=", "service")], limit=1)[0]
@@ -117,6 +121,8 @@ def main() -> int:
                                 f" {[e['event_type'] for e in got]}")
             elif change != {"from": old, "to": new} or got[0]["source"]["approximate"] is not approximate:
                 failures.append(f"{model} {record_id}: {event_type} with {change}, source {got[0]['source']}")
+            elif problems := schemas.problems(got[0], events.schema_ids[got[0]["event_id"]], "erpdoo"):
+                failures.append(f"{model} {record_id}: backfilled {event_type} does not fit its schema: {problems}")
             else:
                 first_ids[(model, record_id)] = got[0]["event_id"]
                 print(f"ok   {event_type} for {model} {record_id} backfilled once: {name} {old} -> {new}"
