@@ -7,9 +7,16 @@ Turn Odoo's raw database changes into clean business events (`SaleOrderConfirmed
 installed inside Odoo.
 
 erpdoo reads PostgreSQL logical replication (pgoutput) directly. No Debezium,
-no Kafka Connect: Postgres, one erpdoo process and a sink. For hosted Odoo
-without database access, erpdoo can poll Odoo's API instead, with limits
-(see [Polling mode](#polling-mode)).
+no Kafka Connect: Postgres, one erpdoo process and a sink.
+
+**What it needs:** replication access to Odoo's Postgres (`wal_level=logical`
+and a role with `REPLICATION`), and a database admin to run a few SQL
+statements once (see [Setting up Postgres](#setting-up-postgres)). Hosted
+Odoo (Odoo Online, Odoo.sh) usually gives neither. There erpdoo can poll
+Odoo's API instead, with no database access but real limits: states of
+fields Odoo does not track between two polls are lost, deletes are found
+late, latency is the poll interval and each poll costs API calls (see
+[Polling mode](#polling-mode)).
 
 ```
 Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ Kafka / Redpanda / webhook / stdout
@@ -212,8 +219,11 @@ sinks:
   up to 60 s; `Retry-After` is honoured); any other 4xx counts as a rejection.
 - **stdout**: one JSON event per line, for debugging (`docker compose logs erpdoo`).
 
-By default an event a sink cannot deliver stops erpdoo, so nothing is lost
-(see the trade-offs). To keep going instead, give the sink a dead-letter topic:
+By default an event a sink cannot deliver (a webhook rejects it, or stays
+unreachable past its retries) stops erpdoo without confirming it, and it is
+tried again after a restart: nothing is lost, but nothing newer gets
+through until the receiver accepts it. To keep going instead, give the sink
+a dead-letter topic:
 
 ```yaml
   - type: webhook
@@ -232,6 +242,23 @@ are plain JSON, without a schema.
 
 Without a config file, events go to Kafka as set by `ERPDOO_KAFKA_BOOTSTRAP`
 and `ERPDOO_TOPIC`.
+
+**Delivery is at-least-once.** If erpdoo stops after a sink delivered but
+before the slot is confirmed, or one sink fails after another succeeded,
+the events are sent again after a restart with the same `event_id`, so
+consumers should dedupe on it. A resent event equals the first, related
+records included: the state store keeps the previous versions of changed
+rows until the slot is confirmed (a related row first read from Postgres
+during the resend is current). After a Postgres crash the slot can restart
+from before what erpdoo confirmed; erpdoo recognises those transactions as
+delivered and does not send them again.
+
+**Something must restart erpdoo.** When Postgres or a sink goes away while
+it runs, erpdoo logs why and exits without confirming the undelivered
+events, for a supervisor (Docker's restart policy, systemd) to start it
+again. At startup it waits for Postgres and Kafka (after 1 s, then twice as
+long each time, up to 30 s), so the order services come up in after a
+reboot does not matter.
 
 ## Schemas
 
@@ -416,12 +443,15 @@ INFO erpdoo: backfilled 2026-10-21T01:28:55.063437+00:00 to 2026-10-21T01:29:05.
 ```
 
 It then rebuilds the events of that window from Odoo's own records (see
-[Backfill](#backfill)) before it streams again; `backfill: {after_lost_slot:
-false}` in erpdoo.yml turns that off. `scripts/backfill_test.py`, also run
+[Backfill](#backfill), exact only for fields Odoo tracks) before it streams
+again; `backfill: {after_lost_slot: false}` in erpdoo.yml turns that off. `scripts/backfill_test.py`, also run
 in CI, checks this on the dev stack: with `max_slot_wal_keep_size = '64MB'`
 and erpdoo stopped, it confirms an order, cancels another and wins a lead,
 writes WAL elsewhere until Postgres invalidates the slot, and expects each
 change exactly once as a backfilled event that fits its registered schema.
+
+If you remove erpdoo, drop its slot (`SELECT pg_drop_replication_slot('erpdoo')`),
+or Postgres keeps WAL for it.
 
 ## Backfill
 
@@ -701,7 +731,8 @@ Messages are carried out one at a time, in order per partition:
 Each step is its own Odoo call and transaction: a message whose second
 step fails has had its first step done. A retry runs every step again, so
 steps must be safe to repeat (writes are; `button_validate` skips done
-deliveries).
+deliveries). Only one erpdoo should consume the inbound topics, since the
+processed ids live in its state store.
 
 ### Loop safety
 
@@ -967,13 +998,39 @@ GRANT SELECT (id, model, res_id, date) ON mail_message TO erpdoo;
 GRANT SELECT ON mail_tracking_value, ir_model_fields_selection, ir_model_data TO erpdoo;
 ```
 
-Tables keep their default replica identity (the primary key): erpdoo takes
-the previous row of each update and delete from its state store, so
-`REPLICA IDENTITY FULL` is not needed. erpdoo creates its replication slot
-itself, which `REPLICATION` allows. The
+erpdoo creates its replication slot itself, which `REPLICATION` allows. The
 publication and slot names are set with `ERPDOO_PUBLICATION` and
 `ERPDOO_SLOT` (both `erpdoo` by default). The dev stack runs the same steps
 from [docker/postgres/setup-erpdoo.sql](docker/postgres/setup-erpdoo.sql).
+
+**Replica identity.** Tables keep their default replica identity (the
+primary key): erpdoo takes the previous row of each update and delete from
+its state store, so `REPLICA IDENTITY FULL` is not needed. Before
+publishing a table, or asking an admin to, erpdoo checks that it has a
+primary key or another replica identity: without one, Postgres would reject
+Odoo's updates and deletes on it, so erpdoo refuses to start and names the
+table. erpdoo does not undo `REPLICA IDENTITY FULL` set for earlier
+versions; `ALTER TABLE <table> REPLICA IDENTITY DEFAULT` gives the smaller
+WAL (the dev stack's setup script does this).
+
+**What erpdoo copies.** In exchange, erpdoo keeps the rules' own tables
+(`sale_order`, `account_move`, `stock_picking` and `crm_lead` for the
+shipped rules) in its state store, copied when it starts tracking them,
+with only the columns the rules use. That costs disk space and a longer
+first copy on a large database (`account_move` holds every journal entry),
+for little WAL saved (see [Performance](#wal-per-order-confirmation)).
+Changes committed before a table was copied are not checked against rules,
+except those of an app installed later, which are backfilled. A rule table
+without an `id` column would still need `REPLICA IDENTITY FULL`, which
+erpdoo then asks for; Odoo's models always have one.
+
+Tables a rule includes (partners, products, order and invoice lines) are
+not copied: erpdoo reads a row from Postgres the first time an event needs
+it (an order's lines together) and keeps it current from the stream after
+that. Such a row is as Postgres has it then, which can be newer than the
+event's transaction while erpdoo works through a backlog. The join table of
+a many2many include (`account_move_line_account_tax_rel` for taxes) must be
+published like the other tables.
 
 With your own rules the list of tables differs, and you don't have to work
 it out: erpdoo checks the publication at startup and, if anything is
@@ -1003,6 +1060,23 @@ owns Odoo's tables, erpdoo makes them itself and no admin step is needed.
 Inbound messages need nothing more: they act through Odoo's API as the
 integration user, and erpdoo only reads Postgres' current WAL position for
 them (`pg_current_wal_insert_lsn()`, open to every role).
+
+**Tables of custom models.** Odoo does not store a model's table name, so
+erpdoo uses Odoo's naming rule (`sale.order` → `sale_order`) plus the core
+models known to differ (`ir.actions.*`). For a model that sets its own
+`_table`, erpdoo looks for the table no other model uses, with an `id`,
+whose columns include every stored field of the model, logs which one it
+found, and does not guess when two fit equally well. To be sure, or for a
+model it cannot find, set the table in [erpdoo.yml](erpdoo.yml):
+
+```yaml
+tables:
+  x_custom.gadget: x_custom_gadgets
+```
+
+`python -m erpdoo.models <model>` shows how a model is mapped, and
+`scripts/custom_table_test.py` checks both with a small test module
+([tests/odoo_addons](tests/odoo_addons)) that sets its own `_table`.
 
 One thing the grants above do not cover: when Odoo creates a database it
 runs `GRANT CREATE ON SCHEMA public TO PUBLIC`, so every role, erpdoo's
@@ -1099,116 +1173,6 @@ WAL a confirmation writes: most of it goes to Odoo's chatter
 (`mail_message`, `mail_followers`) and to indexes. The totals vary from run
 to run by more than the saving, mostly through full-page images, which
 depend on when checkpoints happen; the rule-table figure is the steady one.
-
-## Trade-offs, honestly
-
-- **Needs replication access to Odoo's Postgres** (`wal_level=logical` and a
-  role with `REPLICATION`), and an admin to run a few statements once (see
-  [Setting up Postgres](#setting-up-postgres)). Hosted Odoo platforms
-  (Odoo Online, Odoo.sh) usually don't give you this. Polling mode works
-  without it, through Odoo's API, with real limits: states of untracked
-  fields between two polls are lost, deletes are found late, latency is
-  the poll interval, and it costs API calls (see [Polling mode](#polling-mode)).
-- **The rules' own tables are copied too.** A rule sees the value a field
-  is leaving by comparing with the row before the change, and Postgres only
-  sends that row with `REPLICA IDENTITY FULL`. erpdoo instead keeps the
-  rule tables (`sale_order`, `account_move`, `stock_picking` and `crm_lead`
-  with the shipped rules) in its state store, copied when tracking starts
-  but only with the columns the rules use, with the previous version of
-  each changed row until the slot is confirmed past it. That costs disk
-  space and a longer first copy on a large database (`account_move` holds
-  every invoice and journal entry), to save little WAL (see
-  [Performance](#wal-per-order-confirmation)). Changes committed before a
-  table was copied are not checked against rules, except those of an app
-  installed later, which are backfilled. A rule table without an
-  `id` column would still need `REPLICA IDENTITY FULL`; erpdoo says so in
-  its log and asks for it in its SQL, but Odoo's models always have one.
-- **A new app's rules wait for an admin.** With a read-only role, a rule for
-  an app installed later starts only after an admin runs the SQL erpdoo
-  logs (erpdoo checks every 30 seconds). Changes to the app's records before
-  that are backfilled from Odoo's records then, with backfill's limits.
-- **Published tables need a replica identity.** Before publishing a table,
-  or asking an admin to, erpdoo checks that it has a primary key or another
-  replica identity. Without one, Postgres would reject Odoo's updates and
-  deletes on that table, so erpdoo refuses to start and names the table.
-- **Related records are fetched on first use.** Tables a rule includes
-  (partners, products, order and invoice lines, ...) are not copied up
-  front. The first time an event needs a row, erpdoo reads it from
-  Postgres, with the columns the rules use, and from then on keeps it
-  current from the stream; the lines of an order are read together the
-  first time. A row read this way is as Postgres has it at that moment,
-  which can be newer than the transaction the event is about when erpdoo
-  is behind, for example while it works through a backlog. Records created
-  while erpdoo runs need no query: their lines arrive in the stream. A
-  many2many include works the same way through its join table (for taxes,
-  `account_move_line_account_tax_rel`), which must be published like the
-  other tables.
-- **Delivery is at-least-once.** erpdoo streams changes over Postgres'
-  replication protocol and confirms its position in the slot right after
-  every sink has delivered the events. If it crashes in between, or one sink
-  fails after another succeeded, the events are sent again after a restart,
-  with the same `event_id`. Consumers should dedupe on it. A resent event
-  is the same as the first, related records included: the state store keeps
-  the previous versions of changed rows until the slot is confirmed, and
-  reads related records as of the original commit (a related row it reads
-  from Postgres for the first time during the resend is current). If Postgres itself
-  crashes, the slot can restart from further back than erpdoo confirmed
-  (Postgres saves its position at checkpoints); erpdoo no longer has
-  versions for those transactions, recognises them as delivered and does
-  not send them again.
-- **A sink that keeps failing stops the stream,** unless it has a
-  dead-letter topic. By default erpdoo never skips an event: when a webhook
-  rejects one (a 4xx) or stays unreachable past its retries, erpdoo exits
-  without confirming it and tries again after a restart. Nothing is lost,
-  but nothing newer gets through until the receiver accepts it. With a
-  dead-letter topic, failed events wait there for you instead.
-- **Needs something to restart it.** When Postgres or a sink goes away while
-  erpdoo runs, it logs the cause and exits without confirming the
-  undelivered events, and relies on a supervisor (Docker's restart policy,
-  systemd) to start it again. At startup it waits for Postgres and Kafka,
-  retrying after 1 s and then twice as long each time, up to 30 s, so after
-  a reboot it starts cleanly in whatever order the services come up.
-- **erpdoo does not undo `REPLICA IDENTITY FULL`** set for earlier versions,
-  or remove tables from a publication it did not create. Reset a table with
-  `ALTER TABLE <table> REPLICA IDENTITY DEFAULT` for the smaller WAL (the
-  dev stack's setup script does this).
-- **Table names are inferred.** Odoo does not store a model's table name in
-  the database, so erpdoo uses Odoo's naming rule (`sale.order` →
-  `sale_order`) plus the core models known to differ (`ir.actions.*`). For
-  a model that sets its own `_table`, erpdoo looks for the table by its
-  columns: a table no other model uses, with an `id`, whose columns include
-  every stored field of the model. It logs which table it found, and does
-  not guess when two tables fit equally well. To be sure, or for a model it
-  cannot find, set the table in [erpdoo.yml](erpdoo.yml):
-  ```yaml
-  tables:
-    x_custom.gadget: x_custom_gadgets
-  ```
-  `python -m erpdoo.models <model>` shows how a model is mapped, and
-  `scripts/custom_table_test.py` checks both with a small test module
-  ([tests/odoo_addons](tests/odoo_addons)) that sets its own `_table`.
-- **Schemas hold rules to their word.** With a schema registry, removing a
-  field from a rule (JSON Schema) or changing a field's type stops erpdoo
-  until you choose how to publish the change (see [Schemas](#schemas)),
-  because consumers may depend on it. Schemas say what erpdoo sends, not
-  every value Odoo allows: selections are plain strings, and every value
-  may be null.
-- **Inbound is exactly once only with `already_done`.** erpdoo notes a
-  message as processed right after Odoo commits its action; if erpdoo stops
-  in that moment, the message is carried out again unless its rule can tell
-  it was done. A rule's steps are separate Odoo transactions, so a failure
-  can leave the first steps done (they run again on retry). Messages are
-  handled one at a time, so one waiting for Odoo holds back the rest, and
-  only one erpdoo should consume the inbound topics: the processed ids live
-  in its state store.
-- **An unused replication slot keeps WAL.** If erpdoo is stopped for a long
-  time, Postgres keeps the WAL it hasn't read yet and disk use grows, without
-  limit unless `max_slot_wal_keep_size` is set (see
-  [Slot health](#slot-health)). With the limit, a slot that needs more is
-  invalidated: erpdoo then starts over with a new slot, logs the window it
-  missed and backfills it from Odoo's records, which is exact only for
-  fields Odoo tracks (see [Backfill](#backfill)). Drop the slot
-  (`SELECT pg_drop_replication_slot('erpdoo')`) if you remove erpdoo.
 
 ## License
 

@@ -79,7 +79,7 @@ inbound:
     api_key: ${ERPDOO_ODOO_API_KEY}
 
 # Tables of models that set their own _table in Odoo, when erpdoo should not
-# find them by their columns (see "Table names are inferred" in the README).
+# find them by their columns (see "Tables of custom models" in the README).
 # tables:
 #   x_custom.gadget: x_custom_gadgets
 
