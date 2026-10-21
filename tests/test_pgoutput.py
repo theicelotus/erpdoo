@@ -40,3 +40,11 @@ def test_insert_and_truncate():
     assert pgoutput.parse(insert(16384, "8", None, None)).new == ("8", None, None)
     trunc = pgoutput.parse(b"T" + struct.pack("!ib", 2, 1) + struct.pack("!II", 1, 2))
     assert trunc == pgoutput.Truncate((1, 2), cascade=True, restart_identity=False)
+
+
+def test_booleans_from_the_stream_and_from_snapshots():
+    from erpdoo.pgoutput import _BOOL_OID, convert
+
+    assert convert(_BOOL_OID, "t") is True and convert(_BOOL_OID, "f") is False
+    # Snapshots and fetches read columns as text: bool::text is true/false.
+    assert convert(_BOOL_OID, "true") is True and convert(_BOOL_OID, "false") is False

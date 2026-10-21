@@ -224,7 +224,8 @@ def convert(type_oid: int, text: Value) -> object:
     if type_oid in _INT_OIDS:
         return int(text)
     if type_oid == _BOOL_OID:
-        return text == "t"
+        # pgoutput sends t/f; bool::text, as snapshots read it, gives true/false.
+        return text in ("t", "true")
     if type_oid in _FLOAT_OIDS:
         return float(text)
     if type_oid in _JSON_OIDS:
