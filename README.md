@@ -16,8 +16,9 @@ Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ 
 > **Status: early development.** Events are defined by YAML rules, and six
 > ship with erpdoo (below). Related records (partner, order lines, product
 > names) come from a local SQLite copy kept current from the stream. Events
-> go to Kafka, a webhook or stdout, and a live page shows them next to the
-> database changes they came from.
+> go to Kafka (as JSON Schema or Avro, with each event type's schema in the
+> schema registry), a webhook or stdout, and a live page shows them next to
+> the database changes they came from.
 
 ## Try it
 
@@ -34,7 +35,9 @@ docker compose logs -f erpdoo
 
 Open Odoo at http://localhost:8069 (login `admin`, password `admin`), go to
 **Sales**, open a quotation and click **Confirm**. The event appears in the
-erpdoo log and in Redpanda Console at http://localhost:8080 (topic `erpdoo.events`).
+erpdoo log and in Redpanda Console at http://localhost:8080: topic
+`erpdoo.events` has it as JSON Schema, `erpdoo.events.avro` the same in
+Avro, and **Schema Registry** lists each event type's schema (see [Schemas](#schemas)).
 Posting a customer invoice gives an `InvoicePosted` event the same way.
 The live viewer at http://localhost:8000 shows each transaction's raw changes
 next to the events built from it. This is a real event from the dev stack:
@@ -70,7 +73,8 @@ next to the events built from it. This is a real event from the dev stack:
       "name": "Acme Corporation",
       "email": "info@agrolait.com",
       "phone": "(603)-996-3829",
-      "vat": "US12345673"
+      "vat": "US12345673",
+      "is_company": true
     },
     "order_line": [
       {
@@ -108,12 +112,26 @@ next to the events built from it. This is a real event from the dev stack:
 Events are keyed `sale.order:<id>`, so all events for one record stay in order
 on one partition. `event_id` is derived from the Postgres transaction, the rule
 and the record, so redelivered events carry the same id and consumers can dedupe.
-Numeric values are strings (`"1500.00"`) so no precision is lost.
+Numeric values are strings (`"1500.00"`) so no precision is lost. Each event
+type has a schema generated from its rule (see [Schemas](#schemas)).
 
-To check the whole path from a script (drives every shipped event through
-Odoo's API and checks each against Odoo's data, plus actions that must not
-produce an event, and checks that erpdoo's role cannot write to Odoo's
-tables; CI runs it on every push):
+To check the whole path from a script (CI runs it on every push):
+
+- it drives every shipped event through Odoo's API, and checks actions that
+  must not produce an event;
+- it reads every event from both topics with confluent-kafka's own
+  deserializers; each must be valid against the schema registered for its
+  event type, and the Avro event must say the same as the JSON one;
+- it compares every field of every event, related records and many2many
+  lines included, with the value Odoo returns for it through JSON-RPC, by
+  Odoo's own field types (see [scripts/event_checks.py](scripts/event_checks.py)).
+  The comparison must cover booleans, dates, datetimes, numbers,
+  selections and translated fields (the product gets a French name, and
+  the event must show the English one). With the bug that once read
+  booleans from snapshots as false put back, it fails with
+  `record.partner_id.is_company: False, Odoo says True (boolean)`; the
+  schema check alone passes, since `false` is a valid boolean;
+- it checks that erpdoo's role cannot write to Odoo's tables.
 
 ```sh
 python -m venv .venv && .venv/bin/pip install -e '.[dev]'
@@ -164,7 +182,10 @@ sinks:
   - type: stdout
 ```
 
-- **kafka**: one topic, keyed `model:id`, written with an idempotent producer (`acks=all`).
+- **kafka**: one topic, keyed `model:id`, written with an idempotent producer
+  (`acks=all`). With `schema_registry`, messages are JSON Schema (`format: json`,
+  the default) or Avro (`format: avro`), see [Schemas](#schemas); without it,
+  plain JSON.
 - **webhook**: one `POST` per event, in order, with the event as the JSON
   body and `X-Erpdoo-Event-Id` / `X-Erpdoo-Event-Type` headers. With
   `secret`, `X-Erpdoo-Signature: sha256=<hex>` is the HMAC-SHA256 of the raw
@@ -188,10 +209,137 @@ An event the sink rejects, or that still fails after the retries, is then
 written to that topic as `{"event": ..., "error": ..., "sink": ...,
 "failed_at": ...}` and the stream continues. A sink failure that is not
 about one event, such as an unreachable Kafka broker, still stops erpdoo,
-and so does a failure to write the dead-letter topic.
+and so does a failure to write the dead-letter topic. Dead-letter messages
+are plain JSON, without a schema.
 
 Without a config file, events go to Kafka as set by `ERPDOO_KAFKA_BOOTSTRAP`
 and `ERPDOO_TOPIC`.
+
+## Schemas
+
+With `schema_registry` on a Kafka sink, as in the dev stack, erpdoo
+generates a schema for each rule from the rule and Odoo's field types,
+registers it when it starts, and writes each message in the registry's
+wire format: a zero byte, the schema's id (4 bytes), then the event.
+
+```yaml
+sinks:
+  - type: kafka
+    bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
+    topic: erpdoo.events
+    format: json                # JSON Schema (the default), or avro
+    schema_registry:
+      url: http://127.0.0.1:18081
+      namespace: erpdoo         # the default
+      # username: ...           # HTTP basic auth, with password
+```
+
+- **One subject per event type.** Several event types share a topic, so
+  subjects follow the record name strategy: `<namespace>.<event type>`,
+  e.g. `erpdoo.SaleOrderConfirmed`, which is also the schema's record name
+  (Avro) or `title` (JSON Schema). Two sinks in different formats need
+  different namespaces (the dev stack uses `erpdoo` and `erpdoo.avro`), and
+  so do two erpdoo installations with different rules sharing a registry.
+- **`format: json`**: JSON Schema (draft-07). After the 5-byte header, the
+  message is the same JSON as without a registry, so a consumer that does
+  not use the registry can skip those 5 bytes.
+- **`format: avro`**: values are the same as in JSON. Amounts, dates and
+  datetimes stay strings: Odoo's numeric columns have no fixed scale, which
+  Avro's decimal type needs. A `json` or `properties` field is its JSON text.
+  A key the JSON event leaves out is null in Avro (the fields of a related
+  record that is not in the state store yet, which then has only its id).
+- **Switching a topic to the registry.** Messages written before have no
+  header, and a registry deserializer reading from the start of the topic
+  fails on them ("Invalid magic byte"). Use a new topic, or start consumers
+  after the switch.
+
+How Odoo fields appear, in both formats:
+
+| Odoo field | Postgres column | In the event (JSON Schema / Avro) |
+|---|---|---|
+| boolean | `bool` | boolean |
+| integer, many2one (the id) | `int4` | integer / long |
+| float without digits (`probability`) | `float8` | number / double |
+| float with digits, monetary | `numeric` | string, `"1500.00"` |
+| date | `date` | string, `YYYY-MM-DD` |
+| datetime | `timestamp` | string, `YYYY-MM-DD HH:MM:SS[.ffffff]`, UTC |
+| char, text, html, selection | `varchar`, `text` | string |
+| translated char, text | `jsonb` | string, in `ERPDOO_LANG` (default `en_US`) |
+| json, properties | `jsonb` | any JSON / its JSON text |
+
+Every value may be null. The type comes from the Postgres column when the
+field type does not decide it: a float is a number or a decimal string
+depending on its `digits`. JSON Schema checks decimals, dates and datetimes
+with a pattern; datetimes have no `T` or timezone, so they are not
+`format: date-time`. A selection is a plain string rather than an enum,
+because modules add values to selections, and each install would then be a
+schema change. In `changes`, a translated field holds every language, as
+Odoo stores it.
+
+**Compatibility.** erpdoo sets each subject it creates to `BACKWARD`
+(consumers using the newest schema can read every earlier event). When it
+starts, it checks every rule's schema against the latest version of its
+subject, and registers them only if all pass; otherwise it registers none
+and stops with the registry's reasons:
+
+```
+ERROR erpdoo: the rules changed in a way that breaks the registered event schemas, so erpdoo registered none of the new ones (schema registry http://redpanda:8081, compatibility BACKWARD: ...):
+  SaleOrderCancelled (subject erpdoo.SaleOrderCancelled): The new has a closed content model and is missing a property or item present at path record.amount_total in the old schema
+Adding fields and includes is compatible; removing a field (JSON Schema) or changing its type is not. Undo the change, or publish it as a new event type (rename the rule) or under a new namespace (schema_registry: namespace: in erpdoo.yml). To replace the schema anyway, ...
+  curl -X PUT -H 'Content-Type: application/json' -d '{"compatibility": "NONE"}' http://redpanda:8081/config/erpdoo.SaleOrderCancelled
+```
+
+| Rule change | JSON Schema | Avro |
+|---|---|---|
+| Add a field, an include, a transition condition | compatible | compatible |
+| Remove a field or an include | breaking: objects are closed, so a consumer can count on every field listed | compatible: fields default to null |
+| Change a field's type (in Odoo, or its column) | breaking | breaking |
+| Rename the rule | a new subject | a new subject |
+
+Only the envelope (`event_id`, `event_type`, `model`, `record_id`,
+`occurred_at`, `changes`, `record`, `source`) and each record's `id` are
+required, which is what keeps added fields compatible.
+
+- Going back to an earlier version of a rule works: erpdoo finds that
+  schema registered and writes with its id. The next change is still
+  checked against the latest version, so a field the rollback removed
+  counts as removed.
+- To make a breaking change on purpose, rename the event or change the
+  namespace, or allow it once for the subject as the message shows, restart
+  erpdoo, and set the subject back to `BACKWARD`. erpdoo keeps a level set
+  by hand, and warns at each start while it is not `BACKWARD`.
+- A rule that activates while erpdoo runs (its app was just installed) has
+  its schema registered then. If the registry refuses it, the rule stays
+  inactive and erpdoo logs why. At startup erpdoo waits for an unreachable
+  registry, as it does for Postgres and Kafka.
+
+**In Redpanda Console** (http://localhost:8080), **Schema Registry** lists
+the dev stack's subjects with their versions and compatibility, and the
+topics show messages decoded in both formats. The same `SaleOrderConfirmed`
+is about 970 bytes as JSON and 300 as Avro.
+
+**Reading the events** with confluent-kafka (`pip install 'confluent-kafka[avro,json]'`):
+
+```python
+from confluent_kafka import Consumer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.serialization import MessageField, SerializationContext
+
+registry = SchemaRegistryClient({"url": "http://localhost:18081"})
+# Fetches each message's schema by its id. For erpdoo.events (JSON Schema):
+# JSONDeserializer(None, schema_registry_client=registry), which also validates.
+decode = AvroDeserializer(registry)
+consumer = Consumer({"bootstrap.servers": "127.0.0.1:19092", "group.id": "erpdoo-demo",
+                     "auto.offset.reset": "earliest"})
+consumer.subscribe(["erpdoo.events.avro"])
+while True:
+    msg = consumer.poll(1.0)
+    if msg is None or msg.error():
+        continue
+    event = decode(msg.value(), SerializationContext(msg.topic(), MessageField.VALUE))
+    print(event["event_type"], event["record_id"], event["record"]["partner_id"])
+```
 
 ## Live viewer
 
@@ -255,7 +403,7 @@ false}` in erpdoo.yml turns that off. `scripts/backfill_test.py`, also run
 in CI, checks this on the dev stack: with `max_slot_wal_keep_size = '64MB'`
 and erpdoo stopped, it confirms an order, cancels another and wins a lead,
 writes WAL elsewhere until Postgres invalidates the slot, and expects each
-change exactly once as a backfilled event.
+change exactly once as a backfilled event that fits its registered schema.
 
 ## Backfill
 
@@ -597,6 +745,12 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   `python -m erpdoo.models <model>` shows how a model is mapped, and
   `scripts/custom_table_test.py` checks both with a small test module
   ([tests/odoo_addons](tests/odoo_addons)) that sets its own `_table`.
+- **Schemas hold rules to their word.** With a schema registry, removing a
+  field from a rule (JSON Schema) or changing a field's type stops erpdoo
+  until you choose how to publish the change (see [Schemas](#schemas)),
+  because consumers may depend on it. Schemas say what erpdoo sends, not
+  every value Odoo allows: selections are plain strings, and every value
+  may be null.
 - **An unused replication slot keeps WAL.** If erpdoo is stopped for a long
   time, Postgres keeps the WAL it hasn't read yet and disk use grows, without
   limit unless `max_slot_wal_keep_size` is set (see
