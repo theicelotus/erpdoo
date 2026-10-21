@@ -7,7 +7,9 @@ Turn Odoo's raw database changes into clean business events (`SaleOrderConfirmed
 installed inside Odoo.
 
 erpdoo reads PostgreSQL logical replication (pgoutput) directly. No Debezium,
-no Kafka Connect: Postgres, one erpdoo process and a sink.
+no Kafka Connect: Postgres, one erpdoo process and a sink. For hosted Odoo
+without database access, erpdoo can poll Odoo's API instead, with limits
+(see [Polling mode](#polling-mode)).
 
 ```
 Odoo ──▶ PostgreSQL ──(logical replication)──▶ erpdoo ──▶ Kafka / Redpanda / webhook / stdout
@@ -689,6 +691,188 @@ payment in a new message, a message for a missing invoice (dead-lettered),
 and a payment sent while Odoo is stopped (carried out once, after it is
 back).
 
+## Polling mode
+
+When erpdoo cannot reach Odoo's Postgres (hosted Odoo), it can read the
+changes through Odoo's external JSON-RPC API instead, as a read-only Odoo
+user. It then needs no Postgres access at all. The same rules, sinks,
+schemas, inbound rules and live viewer work, with the differences below.
+
+```yaml
+source:
+  type: polling
+  interval: 5       # seconds between polls
+  overlap: 60       # seconds read again before the cursor
+  deletes: 300      # seconds between the id comparisons that find deletes (false: never)
+  odoo:
+    url: https://example.odoo.com
+    db: example
+    login: erpdoo-reader
+    api_key: ${ERPDOO_POLL_API_KEY}
+```
+
+### The two modes
+
+| | Replication (default) | Polling |
+|---|---|---|
+| Reads | Postgres' WAL, over a replication slot | Odoo's JSON-RPC API, as a read-only Odoo user |
+| Needs | `wal_level=logical`, a role with `REPLICATION` and `SELECT`, an admin's SQL once | Odoo's external API and an API key; no database access |
+| Latency | well under a second after the commit | the poll interval (5 s by default), plus the poll |
+| Transitions | every transaction, exact | exact for fields Odoo tracks (from its chatter tracking); other fields compared between polls, so states between two polls are lost, and events are marked `approximate` |
+| Records in events | as of the commit | as of the poll; tracked fields as of the change |
+| Deletes | exact, when committed | found by comparing ids every `deletes` seconds, with the values of the last poll |
+| `occurred_at` | commit time | Odoo's time of the change, to the second |
+| After a stop | the slot holds every change until erpdoo is back | reads everything written since its cursor: tracked transitions all, others collapsed into one |
+| Load | on Postgres (WAL decoding); none on Odoo | API calls on Odoo every poll, logged |
+| `erpdoo backfill` | yes | not needed; not available (it reads Postgres) |
+
+Events from the two modes have the same types, schemas and record shape,
+so consumers need no change. Their `source` differs:
+
+```json
+"source": {"table": "account_move", "polling": true, "approximate": false, "mail_message_id": 105186}
+```
+
+`approximate: false` means the transition comes from Odoo's tracking
+(`mail_message_id`); `true` means it was found by comparing values between
+polls (`write_date` says which write), or it is a delete.
+
+### API access
+
+- **Replication mode** reads Postgres only. It uses Odoo's API only for
+  inbound rules, as the integration user (see [Inbound](#inbound)).
+- **Polling mode** needs Odoo's external API (JSON-RPC with an API key).
+  Self-hosted Odoo has it. On **Odoo Online it is only included in the
+  Custom plan**; the Standard plan has no external API access, so neither
+  polling mode nor inbound rules work there. erpdoo is developed and
+  tested against Odoo 18 Community; Odoo Online and Odoo.sh run
+  Enterprise, which erpdoo uses only through the same standard API but
+  does not test.
+
+The user erpdoo polls as needs to read the rule models and their related
+models, Odoo's model list (`ir.model`, `ir.model.fields`, which Odoo shows
+only to administrators by default) and Odoo's field tracking
+(`mail.tracking.value`, administrators only by default). In developer mode:
+
+1. **Settings → Users & Companies → Groups → New**, e.g. `erpdoo: read only`,
+   and under **Access Rights** add one line per model with only **Read**
+   checked. For the shipped rules: `sale.order`, `sale.order.line`,
+   `account.tax`, `account.move`, `account.move.line`, `stock.picking`,
+   `stock.move`, `stock.picking.type`, `crm.lead`, `crm.stage`, `ir.model`,
+   `ir.model.fields` and `mail.tracking.value` (partners, products,
+   currencies and languages every internal user may read).
+2. **Settings → Users & Companies → Users → New**: login `erpdoo-reader`,
+   type **Internal User**, no application rights, plus that group. It must
+   see every company whose records the rules cover.
+3. Give it an API key as for the integration user (see
+   [The integration user](#the-integration-user)).
+
+[docker/odoo/init.py](docker/odoo/init.py) does the same for the dev stack.
+At startup erpdoo checks the user cannot write, create or delete any model
+it reads, and logs a warning naming those it can. Every internal user can
+post chatter messages, which erpdoo never does. Without read access to
+`mail.tracking.value`, erpdoo still runs, but every rule compares values
+between polls (all events approximate), and it says so in its log.
+
+### How it works
+
+Every interval, for each rule's model, erpdoo reads the records whose
+`write_date` is at or after its cursor (the newest `write_date` seen) minus
+`overlap`. Odoo sets `write_date` when a transaction *starts*, so a long
+transaction can commit after the cursor has passed it; reading the overlap
+again finds it, as long as it took less than `overlap` seconds (Odoo stops
+requests after `limit_time_real`, 120 s by default, in worker mode).
+
+- **Fields Odoo tracks** (a sale order's, invoice's or delivery's `state`,
+  an invoice's `payment_state`): each tracking message is one write, with
+  its exact old and new values, so every transition is seen, even several
+  between two polls (confirmed and cancelled at once gives both events).
+  The messages handled are noted, so reading the overlap again sends
+  nothing twice.
+- **Other fields** (`crm.lead`'s `probability`, which `LeadWon` uses):
+  erpdoo compares each record with the values it stored at the previous
+  poll. A lead won and lost again between two polls gives no event.
+- **The first poll** of a model stores its records' current values as a
+  baseline, as replication mode copies the rule tables; earlier changes
+  give no event. A restart resumes from the cursor.
+- **Event ids** come from the rule, the record and the tracking message
+  (the id `erpdoo backfill` gives the same change) or the `write_date`, so
+  a poll delivered but not noted (erpdoo stopped in between) sends the same
+  ids again, as in replication mode.
+- **Related records** (customer, lines, products, taxes) are read for each
+  poll in batches: one call per model and level of includes, whatever the
+  number of events.
+
+### Load on Odoo
+
+Each poll costs one `search_read` per rule model and one for tracking
+messages: 5 calls for the shipped rules when nothing changed, 60 a minute
+at the default interval, plus 2 a minute that notice module installs. A poll that finds changes reads the related
+records too (6 to 17 calls in the polling test). The first poll reads every
+record of the rule models, a page of 500 per call (48,000 sale orders took
+99 calls and 7 s on the dev stack). Every poll that found something logs
+its calls, and a summary is logged every minute:
+
+```
+poll 7: 9 records read, 3 changed, 3 events, 14 API calls in 0.3 s
+polling every 5 s: 13 polls in the last 60 s, 75 API calls (5.8 per poll, 75 per minute), 130 records read, 2 events
+```
+
+The live viewer shows each poll that found something like a transaction,
+with its calls, and the load in its status line. Odoo has no index on
+`write_date`, so on large tables each poll also costs Postgres a scan; on
+hosted Odoo you cannot add one. A longer `interval` lowers the load and
+raises the latency.
+
+### Limits
+
+- **States between two polls are lost** for fields Odoo does not track,
+  and such events are `approximate`: their `from` is the value at the
+  previous poll. Make the fields your rules depend on tracked if you can.
+- **Untracked fields in an event are as of the poll**, not the change: an
+  invoice posted and paid between two polls gives an `InvoicePosted` whose
+  `amount_residual` is already 0 (its `payment_state`, tracked, is right).
+- **Deletes are found late and approximately**: by the id comparison,
+  every `deletes` seconds, dated when found, with the last polled values.
+  A record created and deleted between two polls is never seen, and a
+  record the user can no longer read (another company) looks deleted. The
+  comparison reads every id of the model, so it only runs for models with
+  delete rules.
+- **Changes made without the ORM** (SQL, some imports) are seen only if
+  they set `write_date`, and give no tracking.
+- **Times are to the second**, Odoo's time of the change (`write_date` is
+  the start of its transaction), not the commit.
+- **Inbound loop marker**: an event caused by an inbound message is marked
+  as in replication mode, but matched by the integration user, the record
+  the message acted on and the time to the second (keep erpdoo's and
+  Odoo's clocks in sync, within 2 s). If someone else writes the record
+  before the poll, the marker is lost.
+- **Odoo's API returns `0` and `false` for empty numbers and booleans**,
+  where replication mode has `null`.
+
+`scripts/polling_test.py`, also in CI, runs a second erpdoo in polling mode
+next to the dev stack's (with its own topics, schema namespaces and state,
+and no way to reach Postgres), drives the smoke test's scenarios through
+Odoo one poll at a time, and compares its events with replication mode's:
+the same types, records and transitions, each event valid against its
+schema in both formats and equal to Odoo's values. It also restarts the
+polling erpdoo in the middle (no gap, nothing sent twice), runs a 15 s
+transaction that commits after the cursor passed it, pauses erpdoo while an
+invoice is posted and paid and a lead is won and lost, has it carry out an
+inbound message, deletes a lead, and checks its schemas equal replication
+mode's. It prints the expected differences:
+
+```
+expected difference: mark opportunity won: approximate (Odoo does not track probability), "from" is the previous poll's
+expected difference: post and pay between two polls: record.amount_residual: '345.00' in replication, '0.00' polled (not tracked by Odoo: as of the poll, after the payment)
+expected difference: win and lose a lead between two polls: replication gave ['LeadWon'], polling nothing (the win is a state of an untracked field between two polls)
+expected difference: inbound message: only the erpdoo that carried it out marks its event
+```
+
+To try it on the dev stack (which has an `erpdoo-reader` user), set
+`source:` in [erpdoo.yml](erpdoo.yml) as above with
+`url: http://odoo:8069`, `db: odoo`, and `docker compose restart erpdoo`.
+
 ## Setting up Postgres
 
 erpdoo only needs a role with `REPLICATION`, `CONNECT` on Odoo's database
@@ -864,8 +1048,10 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
 - **Needs replication access to Odoo's Postgres** (`wal_level=logical` and a
   role with `REPLICATION`), and an admin to run a few statements once (see
   [Setting up Postgres](#setting-up-postgres)). Hosted Odoo platforms
-  (Odoo Online, Odoo.sh) usually don't give you this. A polling mode over
-  Odoo's API is planned for that case, with its own limits.
+  (Odoo Online, Odoo.sh) usually don't give you this. Polling mode works
+  without it, through Odoo's API, with real limits: states of untracked
+  fields between two polls are lost, deletes are found late, latency is
+  the poll interval, and it costs API calls (see [Polling mode](#polling-mode)).
 - **The rules' own tables are copied too.** A rule sees the value a field
   is leaving by comparing with the row before the change, and Postgres only
   sends that row with `REPLICA IDENTITY FULL`. erpdoo instead keeps the
