@@ -1,0 +1,4 @@
+# erpdoo.yml for scripts/custom_table_test.py: the table set explicitly.
+sinks: [{type: stdout}]
+tables:
+  erpdoo.test.gadget: erpdoo_custom_gadgets

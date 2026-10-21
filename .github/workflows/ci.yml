@@ -44,6 +44,9 @@ jobs:
       # rename in between, and checks the replayed event is unchanged.
       - name: Replay test
         run: python scripts/replay_test.py
+      # Installs a test module whose model sets its own _table.
+      - name: Custom table name test
+        run: python scripts/custom_table_test.py
       - name: Show logs
         if: failure()
         run: docker compose logs --no-color --tail=300

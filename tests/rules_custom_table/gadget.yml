@@ -1,0 +1,8 @@
+# Rule for the test module in tests/odoo_addons, used by scripts/custom_table_test.py.
+GadgetActivated:
+  model: erpdoo.test.gadget
+  when:
+    state: { to: active }
+  fields: [name, state]
+  include:
+    partner_id: [name]

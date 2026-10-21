@@ -46,8 +46,10 @@ services:
       HOST: postgres
       USER: odoo
       PASSWORD: odoo
-    volumes:
+    volumes: &odoo-volumes
       - odoo-data:/var/lib/odoo
+      # A test module (not installed by default) for scripts/custom_table_test.py.
+      - ./tests/odoo_addons:/mnt/extra-addons:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,8 +75,7 @@ services:
     image: odoo:18.0
     command: ["odoo", "-d", "odoo", "--db-filter=^odoo$$"]
     environment: *odoo-db
-    volumes:
-      - odoo-data:/var/lib/odoo
+    volumes: *odoo-volumes
     ports:
       - "127.0.0.1:8069:8069"
     depends_on:
