@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator
@@ -131,9 +132,10 @@ class StateStore:
             -- record they point to was created after tracking started).
             CREATE TABLE IF NOT EXISTS lookups (
                 tbl TEXT NOT NULL, col TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (tbl, col, value));
-            -- Backfilled events not delivered yet, oldest first. They are
-            -- written with the table copy they were found next to, so a crash
-            -- before they are delivered does not lose them.
+            -- Events not delivered yet, oldest first: backfilled ones, written
+            -- with the table copy they were found next to, and in polling mode
+            -- a poll's, written with the poll. So a crash before they are
+            -- delivered does not lose them.
             CREATE TABLE IF NOT EXISTS pending_events (seq INTEGER PRIMARY KEY, data TEXT NOT NULL);
             """
         )
@@ -192,8 +194,9 @@ class StateStore:
         """Forget everything, e.g. when the replication slot was recreated and
         changes since the last run are lost. Backfilled events not delivered
         yet are kept."""
-        for table in ("records", "loaded_tables", "versions", "meta", "lookups"):
+        for table in ("records", "loaded_tables", "versions", "lookups"):
             self.db.execute(f"DELETE FROM {table}")
+        self.db.execute("DELETE FROM meta WHERE key <> 'instance'")
         self.db.execute("INSERT INTO meta VALUES ('format', ?)", [FORMAT])
         self.db.commit()
         self.loaded.clear()
@@ -201,6 +204,17 @@ class StateStore:
         self.specs.clear()
         self.applied_lsn = 0
         self.applied_time = None
+
+    @property
+    def instance(self) -> str:
+        """A random id for this erpdoo, made once per state store and kept
+        when it is reset: the default transactional.id of its Kafka producer."""
+        row = self.db.execute("SELECT value FROM meta WHERE key = 'instance'").fetchone()
+        if row is None:
+            row = (secrets.randbits(63),)
+            self.db.execute("INSERT INTO meta VALUES ('instance', ?)", row)
+            self.db.commit()
+        return f"{row[0]:016x}"
 
     @property
     def streaming_since(self) -> datetime | None:
@@ -391,7 +405,8 @@ class StateStore:
         self.db.commit()
 
     def add_pending_events(self, events: Iterable) -> None:
-        """Keep backfilled events until they are delivered (not committed)."""
+        """Keep events until they are delivered (not committed): backfilled
+        events, and in polling mode those of a poll, noted with it."""
         self.db.executemany("INSERT INTO pending_events (data) VALUES (?)", [
             (json.dumps({"event_id": e.event_id, "event_type": e.event_type, "model": e.model,
                          "record_id": e.record_id, "payload": e.payload}),) for e in events])
@@ -404,6 +419,14 @@ class StateStore:
     def clear_pending_events(self, seqs: Iterable[int]) -> None:
         self.db.executemany("DELETE FROM pending_events WHERE seq = ?", [(s,) for s in seqs])
         self.db.commit()
+
+    def clear_delivered_events(self, event_ids: Iterable[str]) -> int:
+        """Forget the pending events with these ids, which a Kafka transaction
+        delivered (see erpdoo.sinks.transactions). Returns how many."""
+        ids = set(event_ids)
+        seqs = [seq for seq, fields in self.pending_events() if fields["event_id"] in ids]
+        self.clear_pending_events(seqs)
+        return len(seqs)
 
     def prune(self, lsn: int) -> None:
         """Drop versions of transactions before ``lsn``: the slot is confirmed

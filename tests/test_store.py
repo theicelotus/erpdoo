@@ -103,6 +103,24 @@ def test_backfilled_events_wait_until_delivered(tmp_path):
     assert [e["event_id"] for _, e in StateStore(path).pending_events()] == ["e2"]
 
 
+def test_events_a_kafka_transaction_delivered_are_forgotten(tmp_path):
+    from erpdoo.events import Event
+
+    s = StateStore(str(tmp_path / "state.db"))
+    s.add_pending_events([Event(f"e{n}", "LeadWon", "crm.lead", n, {"event_id": f"e{n}"}) for n in (1, 2, 3)])
+    s.commit()
+    assert s.clear_delivered_events(["e1", "e3", "other"]) == 2
+    assert [e["event_id"] for _, e in s.pending_events()] == ["e2"]
+
+
+def test_the_instance_id_is_kept(tmp_path):
+    path = str(tmp_path / "state.db")
+    s = StateStore(path)
+    instance = s.instance
+    s.reset()  # e.g. a recreated slot: the same erpdoo, so the same transactional.id
+    assert StateStore(path).instance == instance != StateStore(str(tmp_path / "other.db")).instance
+
+
 def test_streaming_since_is_forgotten_with_the_copy(tmp_path):
     path = str(tmp_path / "state.db")
     s = StateStore(path)

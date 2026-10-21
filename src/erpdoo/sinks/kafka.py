@@ -1,4 +1,6 @@
-"""Kafka sink. send() returns only once the broker has acknowledged every event.
+"""Kafka sink. send() returns only once the broker has acknowledged every event,
+or, sharing a transactional producer (erpdoo.sinks.transactions), once
+every event is written in the open transaction, which the caller commits.
 
 Without a schema registry, each message is the event as JSON. With one
 (``schema_registry: {url: ...}``), each event type's schema is registered
@@ -36,40 +38,40 @@ REGISTRY_OPTIONS = {"url", "namespace", "username", "password"}
 
 
 class KafkaSink:
+    transactions = None  # the shared transactional producer, if any
+
     def __init__(
         self, bootstrap_servers: str, topic: str, partitions: int = 3, flush_timeout: float = 30.0,
-        format: str = "json", schema_registry: dict | None = None,
+        format: str = "json", schema_registry: dict | None = None, transactions=None,
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
         self.flush_timeout = flush_timeout
         self.schemas = schemas(format, schema_registry, topic)
-        check_reachable(bootstrap_servers)
-        self.producer = Producer({
-            "bootstrap.servers": bootstrap_servers,
-            "enable.idempotence": True,
-            "acks": "all",
-            "linger.ms": 5,
-        })
+        self.transactions = transactions
+        if transactions is None:
+            check_reachable(bootstrap_servers)
+            self.producer = Producer({
+                "bootstrap.servers": bootstrap_servers,
+                "enable.idempotence": True,
+                "acks": "all",
+                "linger.ms": 5,
+            })
         self.ensure_topic(partitions)
 
     def ensure_topic(self, partitions: int = 3, topic: str | None = None) -> None:
         """Create the sink's topic (or ``topic``) unless it exists."""
-        topic = topic or self.topic
-        admin = AdminClient({"bootstrap.servers": self.bootstrap_servers})
-        # replication_factor=-1 uses the broker's default.
-        futures = admin.create_topics([NewTopic(topic, num_partitions=partitions, replication_factor=-1)])
-        try:
-            futures[topic].result(timeout=30)
-            log.info("created topic %s", topic)
-        except KafkaException as e:
-            if e.args[0].code() != KafkaError.TOPIC_ALREADY_EXISTS:
-                raise
+        create_topic(self.bootstrap_servers, topic or self.topic, partitions)
 
     def deliver(self, records: list[Record]) -> list[KafkaError | None]:
         """Write records and wait for the broker. Returns each record's final
         error (None if written). Raises DeliveryError if the broker does not
-        answer in time, which is not the fault of any one record."""
+        answer in time, which is not the fault of any one record.
+
+        In a transaction, only errors known at once are returned; the
+        broker's answer comes when the transaction is committed."""
+        if self.transactions is not None:
+            return [self.transactions.produce(self.topic, *record) for record in records]
         results: list[KafkaError | None] = [None] * len(records)
         for i, (key, value, headers) in enumerate(records):
             def on_delivery(err, _msg, i=i):
@@ -97,7 +99,11 @@ class KafkaSink:
 
     def send(self, events: list[Event]) -> None:
         records, sent, failed = [], [], []
+        rejected = self.transactions.rejected if self.transactions is not None else {}
         for event in events:
+            if rejected and (self.topic, event.event_id) in rejected:  # by the broker, in an earlier transaction
+                failed.append((event, f"kafka: {rejected[self.topic, event.event_id]}"))
+                continue
             try:
                 value = (self.schemas.serialize(event.event_type, event.payload) if self.schemas
                          else json.dumps(event.payload).encode())
@@ -115,7 +121,22 @@ class KafkaSink:
                                 failed=failed)
 
     def close(self) -> None:
-        self.producer.flush(self.flush_timeout)
+        if self.transactions is None:  # a shared producer is closed with its transactions
+            self.producer.flush(self.flush_timeout)
+
+
+def create_topic(bootstrap_servers: str, topic: str, partitions: int = 3, config: dict | None = None) -> None:
+    """Create ``topic`` unless it exists."""
+    admin = AdminClient({"bootstrap.servers": bootstrap_servers})
+    # replication_factor=-1 uses the broker's default.
+    futures = admin.create_topics([NewTopic(topic, num_partitions=partitions, replication_factor=-1,
+                                            config=config or {})])
+    try:
+        futures[topic].result(timeout=30)
+        log.info("created topic %s", topic)
+    except KafkaException as e:
+        if e.args[0].code() != KafkaError.TOPIC_ALREADY_EXISTS:
+            raise
 
 
 def schemas(format: str, spec: dict | None, topic: str):

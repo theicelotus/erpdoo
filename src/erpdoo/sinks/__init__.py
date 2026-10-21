@@ -1,6 +1,8 @@
 """Event sinks. A sink's send() returns only once every event is delivered,
 and raises DeliveryError otherwise; erpdoo confirms the replication slot
-only after every sink returned, so delivery is at-least-once.
+only after every sink returned, so delivery is at-least-once. When every
+sink is Kafka, it is exactly once instead, in Kafka transactions (see
+erpdoo.sinks.transactions).
 
 A sink can have a dead-letter topic: events it gives up on are written
 there with the error, and the stream continues. Without one, a failed
@@ -47,14 +49,15 @@ class DeadLetterSink:
     the error, and the rest of the batch carries on. If the dead-letter topic
     cannot be written either, send() raises, so no event is lost."""
 
-    def __init__(self, sink: Sink, name: str, topic: str, bootstrap_servers: str, queue=None) -> None:
+    def __init__(self, sink: Sink, name: str, topic: str, bootstrap_servers: str, queue=None,
+                 transactions=None) -> None:
         self.sink = sink
         self.name = name
         self.topic = topic
         if queue is None:
             from erpdoo.sinks.kafka import KafkaSink
 
-            queue = KafkaSink(bootstrap_servers, topic)
+            queue = KafkaSink(bootstrap_servers, topic, transactions=transactions)
         self.queue = queue
 
     def send(self, events: list[Event]) -> None:
@@ -135,8 +138,10 @@ class InboundFilter:
         self.sink.close()
 
 
-def make_sink(spec: dict) -> Sink:
-    """Build a sink from one entry of the config's ``sinks`` list."""
+def make_sink(spec: dict, transactions=None) -> Sink:
+    """Build a sink from one entry of the config's ``sinks`` list. A Kafka
+    sink and its dead-letter topic write with ``transactions``' producer, if
+    given (see erpdoo.sinks.transactions)."""
     options = dict(spec)
     kind = options.pop("type", None)
     dead_letter = options.pop("dead_letter", None)
@@ -149,16 +154,16 @@ def make_sink(spec: dict) -> Sink:
         topics = skip_inbound
     else:
         raise ConfigError(f"sink {kind}: skip_inbound is true or a list of inbound topics")
-    sink = _make_sink(kind, options, dead_letter)
+    sink = _make_sink(kind, options, dead_letter, transactions)
     return sink if topics == [] else InboundFilter(sink, topics)
 
 
-def _make_sink(kind, options: dict, dead_letter) -> Sink:
+def _make_sink(kind, options: dict, dead_letter, transactions=None) -> Sink:
     try:
         if kind == "kafka":
             from erpdoo.sinks.kafka import KafkaSink
 
-            sink, name = KafkaSink(**options), f"kafka topic {options.get('topic')}"
+            sink, name = KafkaSink(**options, transactions=transactions), f"kafka topic {options.get('topic')}"
         elif kind == "webhook":
             from erpdoo.sinks.webhook import WebhookSink
 
@@ -179,7 +184,8 @@ def _make_sink(kind, options: dict, dead_letter) -> Sink:
     if unknown:
         raise ConfigError(f"sink {kind}: dead_letter has unknown keys {sorted(unknown)}")
     try:
-        return DeadLetterSink(sink, name, dead_letter["topic"], dead_letter["bootstrap_servers"])
+        return DeadLetterSink(sink, name, dead_letter["topic"], dead_letter["bootstrap_servers"],
+                              transactions=transactions if kind == "kafka" else None)
     except Exception:
         sink.close()  # e.g. Kafka is unreachable and the caller tries again
         raise

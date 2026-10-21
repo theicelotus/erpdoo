@@ -384,6 +384,23 @@ class ReplicationReader:
         on its status interval (10 s)."""
         self.cur.send_feedback(flush_lsn=lsn, force=now)
 
+    def system_identifier(self) -> str | None:
+        """Postgres' system identifier, which tells one database cluster from
+        another (positions of different clusters cannot be compared). None
+        if erpdoo's role may not read it."""
+        with closing(psycopg2.connect(self.dsn, application_name="erpdoo-setup")) as conn, conn.cursor() as cur:
+            try:
+                cur.execute("SELECT system_identifier::text FROM pg_control_system()")
+            except psycopg2.errors.InsufficientPrivilege:
+                return None
+            return cur.fetchone()[0]
+
+    def wal_now(self) -> int:
+        """Postgres' current WAL position."""
+        with closing(psycopg2.connect(self.dsn, application_name="erpdoo-setup")) as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_current_wal_lsn() - '0/0'")
+            return int(cur.fetchone()[0])
+
     def health(self) -> SlotHealth | None:
         """How far the slot trails Postgres' WAL (see erpdoo.health)."""
         if self._health_conn is None:

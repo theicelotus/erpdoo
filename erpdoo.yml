@@ -1,6 +1,9 @@
 # erpdoo settings. Strings may read environment variables with ${VAR} or
 # ${VAR:-default}. Events go to every sink listed; the replication slot is
-# confirmed only after all of them have delivered.
+# confirmed only after all of them have delivered. When every sink is Kafka,
+# delivery is exactly once, in Kafka transactions (consumers must read with
+# isolation.level=read_committed); with any other sink, such as the stdout
+# one below, at-least-once. See "Delivery" in the README.
 
 # Where Odoo's changes come from: Postgres logical replication (the default,
 # set with ERPDOO_PG_DSN), or, for hosted Odoo without database access,
@@ -61,6 +64,12 @@ sinks:
   #   dead_letter:                # optional, any sink: park failed events and continue
   #     topic: erpdoo.dead-letter
   #     bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
+
+# Kafka transactions, when every sink is Kafka (on one cluster).
+# delivery:
+#   transactions: true                  # false: at-least-once, as with other sinks
+#   transactional_id: erpdoo-1          # default: from the state store, unique per erpdoo
+#   checkpoint_topic: erpdoo.checkpoints
 
 # Inbound: messages from other systems that act on Odoo, by the rules in
 # rules/inbound/ (see "Inbound" in the README). They act through Odoo's API as

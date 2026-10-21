@@ -208,7 +208,8 @@ sinks:
 ```
 
 - **kafka**: one topic, keyed `model:id`, written with an idempotent producer
-  (`acks=all`). With `schema_registry`, messages are JSON Schema (`format: json`,
+  (`acks=all`), in Kafka transactions when every sink is Kafka (see
+  [Delivery](#delivery-exactly-once-to-kafka-at-least-once-otherwise)). With `schema_registry`, messages are JSON Schema (`format: json`,
   the default) or Avro (`format: avro`), see [Schemas](#schemas); without it,
   plain JSON.
 - **webhook**: one `POST` per event, in order, with the event as the JSON
@@ -243,15 +244,67 @@ are plain JSON, without a schema.
 Without a config file, events go to Kafka as set by `ERPDOO_KAFKA_BOOTSTRAP`
 and `ERPDOO_TOPIC`.
 
-**Delivery is at-least-once.** If erpdoo stops after a sink delivered but
-before the slot is confirmed, or one sink fails after another succeeded,
-the events are sent again after a restart with the same `event_id`, so
-consumers should dedupe on it. A resent event equals the first, related
-records included: the state store keeps the previous versions of changed
-rows until the slot is confirmed (a related row first read from Postgres
-during the resend is current). After a Postgres crash the slot can restart
-from before what erpdoo confirmed; erpdoo recognises those transactions as
-delivered and does not send them again.
+### Delivery: exactly once to Kafka, at-least-once otherwise
+
+**When every sink is Kafka** (on one cluster, dead-letter topics
+included), delivery is exactly once, with Kafka transactions. erpdoo
+writes each batch's events to every sink's topic (the JSON Schema and the
+Avro topic alike) together with a checkpoint record of how far it got, in
+one transaction: the end of the batch's last Postgres transaction (its
+LSN) in replication mode, the cursors in polling mode. Checkpoints go to a
+compacted topic, `erpdoo.checkpoints`, keyed by the producer's
+`transactional.id`. Only then is the slot confirmed. At startup erpdoo
+fences any earlier producer with its `transactional.id` (Kafka aborts that
+one's open transaction), reads its last checkpoint, skips the transactions
+Postgres streams again up to it, and confirms the slot there. So:
+
+- a crash after the Kafka commit but before the slot is confirmed sends
+  nothing twice;
+- a crash before the commit leaves an aborted transaction, and the batch
+  is sent again, once.
+
+**Consumers must read with `isolation.level=read_committed`**, or they
+also see the records of aborted transactions. That is librdkafka's default
+(confluent-kafka, kcat, most non-Java clients); the Java client and Kafka
+Connect default to `read_uncommitted`, so set it there:
+
+```properties
+isolation.level=read_committed
+```
+
+In polling mode a cursor alone cannot say what was delivered (the overlap
+is read again, compared with what the state store noted), so each poll is
+noted with its events, and the checkpoint of the transaction that delivers
+them lists their ids; after a crash, the noted events it lists are
+forgotten instead of sent again. Backfilled events go the same way in both
+modes.
+
+```yaml
+delivery:
+  transactions: true                    # the default; false: at-least-once
+  transactional_id: erpdoo-warehouse-1  # default: erpdoo-<random id kept in the state store>
+  checkpoint_topic: erpdoo.checkpoints
+```
+
+The default `transactional_id` is unique per state store, so two erpdoos
+never fence each other. If you set one, give each erpdoo its own. A new
+state store (a deleted volume) starts without a checkpoint: that one
+restart is at-least-once. The `erpdoo backfill` command does not use
+transactions, so it cannot fence a running erpdoo.
+
+**With a webhook or stdout sink** (or `transactions: false`, or Kafka
+sinks on different clusters), delivery is at-least-once, and erpdoo logs
+why at startup. If it stops after a sink delivered but before the slot is
+confirmed, or one sink fails after another succeeded, the events are sent
+again after a restart with the same `event_id`, so consumers should dedupe
+on it.
+
+Either way, a resent event equals the first, related records included:
+the state store keeps the previous versions of changed rows until the slot
+is confirmed (a related row first read from Postgres during the resend is
+current). After a Postgres crash the slot can restart from before what
+erpdoo confirmed; erpdoo recognises those transactions as delivered and
+does not send them again.
 
 **Something must restart erpdoo.** When Postgres or a sink goes away while
 it runs, erpdoo logs why and exits without confirming the undelivered
@@ -721,7 +774,12 @@ Messages are carried out one at a time, in order per partition:
    dead-letter topic as `{"message": ..., "error": ..., "rule": ...,
    "message_id": ..., "topic": ..., "partition": ..., "offset": ...,
    "failed_at": ...}`, and the stream moves on. Only processed ids are
-   noted, so a dead-lettered message can be sent again once fixed.
+   noted, so a dead-lettered message can be sent again once fixed. Unless
+   `delivery: {transactions: false}`, the dead-letter record and the
+   consumer offset are committed in one Kafka transaction, so a crash
+   cannot dead-letter a message twice. The events a message causes are not
+   in that transaction: they come from Odoo's changes, through the stream,
+   like any other.
 4. When Odoo or Postgres is away, or Odoo hits a passing database
    conflict, the message is retried with backoff (1 s, doubling up to
    60 s) for as long as it takes, and the messages after it wait. A refused
@@ -881,9 +939,11 @@ requests after `limit_time_real`, 120 s by default, in worker mode).
   had polled it all along, and the events of changes from before erpdoo
   noticed the app (it checks every minute) say `"backfill": true`.
 - **Event ids** come from the rule, the record and the tracking message
-  (the id `erpdoo backfill` gives the same change) or the `write_date`, so
-  a poll delivered but not noted (erpdoo stopped in between) sends the same
-  ids again, as in replication mode.
+  (the id `erpdoo backfill` gives the same change) or the `write_date`.
+  A poll is noted together with its events, which are then delivered and
+  forgotten, so erpdoo stopping in between loses none: with Kafka
+  transactions each is delivered once (see [Delivery](#delivery-exactly-once-to-kafka-at-least-once-otherwise)),
+  otherwise one may be sent again with the same id, as in replication mode.
 - **Related records** (customer, lines, products, taxes) are read for each
   poll in batches: one call per model and level of includes, whatever the
   number of events.

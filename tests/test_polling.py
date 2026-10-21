@@ -105,6 +105,10 @@ def test_baseline_then_tracked_transition(api):
     # Created as a quotation: the create rule sees the state before the tracked write.
     [created] = [e for e in events if e.event_type == "QuotationCreated"]
     assert created.payload["source"]["approximate"] is False
+    # Noted with the poll, until delivered (see erpdoo.__main__.send_pending).
+    assert [fields["event_id"] for _, fields in p.store.pending_events()] == [e.event_id for e in events]
+    assert p.position() == {"cursors": {"crm.lead": "2026-10-21 08:00:00", "sale.order": "2026-10-21 08:00:03"},
+                            "messages_cursor": "2026-10-21 08:00:03"}
     # The overlap is read again on the next polls: nothing is sent twice.
     api.tick(1)
     assert run(p).events == []

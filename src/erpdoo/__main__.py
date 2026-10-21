@@ -36,6 +36,7 @@ from erpdoo.rules import (
 )
 from erpdoo.schemas import SchemaError
 from erpdoo.sinks import DeliveryError, make_sink, prepare
+from erpdoo.sinks.transactions import Delivery, TransactionalDelivery, Transactions, transactional
 from erpdoo.store import StateStore
 
 log = logging.getLogger("erpdoo")
@@ -179,13 +180,15 @@ def run() -> None:
              f" ({', '.join(f'{r.name}: {r.model} not found' for r in skipped)})" if skipped else "")
     # Sinks start after the slot exists, so once the Kafka topic exists no
     # change is missed (the smoke test relies on this).
-    sinks = [retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec),
-                   (Unreachable, KafkaException, TimeoutError), stop)
-             for spec in config["sinks"]]
+    system = reader.system_identifier()
+    delivery = open_delivery(config, store, {"source": "replication", "system": system, "slot": slot}, stop)
+    sinks = delivery.sinks
     # Each event type's schema, for sinks with a schema registry. A rule
     # change that would break compatibility stops erpdoo here.
     retry("schema registry", lambda: prepare(sinks, builder.rules, registry), (Unreachable,), stop)
-    send_pending(store, sinks, builder.rules)
+    skip_until = resume(delivery, store, lambda cp: cp.get("system") == system and cp.get("slot") == slot
+                        and isinstance(cp.get("lsn"), int) and cp["lsn"] <= reader.wal_now())
+    send_pending(store, delivery, builder.rules)
     pending = store.pending_backfill()
     if pending:
         since, until = (datetime.fromtimestamp(t / 1e6, timezone.utc) for t in pending)
@@ -195,9 +198,13 @@ def run() -> None:
             log.error("could not backfill %s to %s: %s\nThen run: erpdoo backfill --since %s --until %s",
                       since.isoformat(), until.isoformat(), e, since.isoformat(), until.isoformat())
         else:
-            send_backfill(result, sinks)
+            for reason_ in result.skipped:
+                log.warning("backfill: %s", reason_)
+            # Noted with the window done, then sent like the other backfilled events.
+            store.add_pending_events(result.events)
             log.info("backfilled %s to %s: %s", since.isoformat(), until.isoformat(), result.summary())
         store.clear_pending_backfill()
+        send_pending(store, delivery, builder.rules)
     viewer = None
     if config.get("viewer") is not None:
         try:
@@ -207,19 +214,28 @@ def run() -> None:
         viewer = Viewer(**config["viewer"])
         viewer.start()
 
-    inbound = start_inbound(config, rules_path, registry, state_path, dsn, stop)
+    inbound = start_inbound(config, rules_path, registry, state_path, dsn, stop, store.instance)
 
     confirmed_at = time.monotonic()
     reported_at = 0.0  # last slot health report
-    # For tests only (scripts/replay_test.py): while this file exists, events
-    # are delivered but the slot is not confirmed; once it is removed, erpdoo
-    # exits at once, as if it had crashed.
+    # For tests only (scripts/replay_test.py, delivery_test.py): while this
+    # file exists, events are delivered but the slot is not confirmed; once
+    # it is removed, erpdoo exits at once, as if it had crashed. If the file
+    # says "before-commit", erpdoo holds instead just before it commits the
+    # first events (the Kafka transaction, or for at-least-once once the
+    # sinks have them), then exits when the file is removed.
     hold_ack = os.environ.get("ERPDOO_TEST_HOLD_ACK")
     holding = False
+    if hold_ack:
+        delivery.before_commit = lambda: hold_before_commit(hold_ack)
     recheck_at: float | None = None  # when to retry activating rules that did not fit
     last_error: str | None = None
     reader.start()
+    if skip_until is not None:
+        # Delivered in the last committed Kafka transaction: confirm the slot to it.
+        reader.ack(skip_until, now=True)
     log.info("streaming to %s", ", ".join(spec["type"] for spec in config["sinks"]))
+    skipped_txns = 0
     try:
         while not stop.is_set():
             if inbound is not None and inbound.error is not None:
@@ -230,19 +246,26 @@ def run() -> None:
             for txn in batch.transactions:
                 # Also gives updates and deletes their previous row.
                 replay = store.apply_transaction(txn)
+                if skip_until is not None and txn.end_lsn <= skip_until:
+                    skipped_txns += 1  # its events were committed to Kafka before a restart
+                    continue
+                if skip_until is not None and skipped_txns:
+                    log.info("skipped %d transactions up to %s, delivered before the restart", skipped_txns,
+                             format_lsn(skip_until))
+                skip_until = None
                 txn_events = builder.build(txn, replay)
                 events.extend(txn_events)
                 if viewer:
                     shown.append(describe(txn, txn_events))
             store.commit()
             # Every sink must deliver before the slot is confirmed. If one
-            # fails, erpdoo stops; after a restart all sinks get the events again.
+            # fails, erpdoo stops; after a restart all sinks get the events
+            # again, unless they were committed in a Kafka transaction.
             if events:
-                for sink in sinks:
-                    sink.send(events)
+                delivery.send(events, {"lsn": batch.transactions[-1].end_lsn})
             for item in shown:
                 viewer.publish(item)
-            if hold_ack and os.path.exists(hold_ack):
+            if hold_mode(hold_ack) == "after-commit":
                 holding = True  # test hook: delivered, not confirmed
             elif holding:
                 # Test hook: crash between delivery and confirmation.
@@ -286,7 +309,7 @@ def run() -> None:
                 continue
             builder, recheck_at, last_error = new_builder, None, None
             # Before anything streamed after the copy.
-            send_pending(store, sinks, builder.rules)
+            send_pending(store, delivery, builder.rules)
             report(new_skipped, {r.name for r in skipped}, registry)
             skipped = new_skipped
             for name in sorted({r.name for r in builder.rules} - before):
@@ -298,8 +321,7 @@ def run() -> None:
             stop.set()
             inbound.join(timeout=30)
         reader.close()
-        for sink in sinks:
-            sink.close()
+        delivery.close()
         if viewer:
             viewer.stop()
     log.info("stopped")
@@ -335,10 +357,12 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
     log.info("rules: %d active (%s), %d inactive; transitions from Odoo's field tracking: %s",
              len(poller.rules), ", ".join(r.name for r in poller.rules) or "none", len(skipped),
              ", ".join(sorted(n for p in poller.plans.values() for n in p.by_tracking)) or "none")
-    sinks = [retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec),
-                   (Unreachable, KafkaException, TimeoutError), stop)
-             for spec in config["sinks"]]
+    delivery = open_delivery(config, store, {"source": "polling", "odoo": f"{odoo['url']} {odoo['db']}"}, stop)
+    sinks = delivery.sinks
     retry("schema registry", lambda: prepare(sinks, poller.rules, poller.registry), (Unreachable,), stop)
+    # A poll's events are noted with it, so the cursors need not be skipped
+    # to: forgetting the noted events the last transaction delivered is enough.
+    resume(delivery, store, lambda cp: False)
     viewer = None
     if config.get("viewer") is not None:
         try:
@@ -348,7 +372,7 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
         viewer = Viewer(**config["viewer"])
         viewer.start()
     # No Postgres: inbound attempts are timed on erpdoo's clock (see erpdoo.polling).
-    inbound = start_inbound(config, rules_path, poller.registry, state_path, None, stop)
+    inbound = start_inbound(config, rules_path, poller.registry, state_path, None, stop, store.instance)
     interval = source["interval"]
     log.info("polling %s every %g s as %s, to %s", odoo["url"], interval, odoo["login"],
              ", ".join(spec["type"] for spec in config["sinks"]))
@@ -359,6 +383,8 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
         while not stop.is_set():
             if inbound is not None and inbound.error is not None:
                 raise InboundFailed(f"inbound: {reason(inbound.error)}")
+            # Events of a poll noted before a restart or a failed delivery.
+            send_pending(store, delivery, poller.rules, poller.position())
             started = time.monotonic()
             try:
                 if started - checked_at >= MODELS_CHECK_SECONDS:
@@ -380,12 +406,12 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
                 delay = min(delay * 2, MAX_POLL_DELAY)
                 continue
             delay = interval
-            # Every sink must deliver before the poll is noted. If one fails,
-            # erpdoo stops; after a restart the same changes are read again.
-            if result.events:
-                for sink in sinks:
-                    sink.send(result.events)
+            # The poll is noted with its events, which are then delivered
+            # and forgotten. If a sink fails, erpdoo stops; after a restart
+            # the noted events are sent again (except those a committed Kafka
+            # transaction delivered).
             poller.commit(result)
+            send_pending(store, delivery, poller.rules, poller.position(), quiet=True)
             load.add(result)
             (log.info if result.changes or result.events else log.debug)("poll %d: %s", result.number,
                                                                           result.summary())
@@ -401,8 +427,7 @@ def run_polling(config: dict, rules_path: str, state_path: str, lang: str, stop:
         if inbound is not None:
             stop.set()
             inbound.join(timeout=30)
-        for sink in sinks:
-            sink.close()
+        delivery.close()
         if viewer:
             viewer.stop()
 
@@ -450,7 +475,7 @@ class PollLoad:
 
 
 def start_inbound(config: dict, rules_path: str, registry: ModelRegistry, state_path: str, dsn: str | None,
-                  stop: threading.Event) -> Inbound | None:
+                  stop: threading.Event, instance: str) -> Inbound | None:
     """Start consuming inbound messages, if erpdoo.yml has inbound settings
     and there are inbound rules (ERPDOO_INBOUND_RULES, by default the
     inbound directory next to the rules)."""
@@ -466,23 +491,111 @@ def start_inbound(config: dict, rules_path: str, registry: ModelRegistry, state_
     if not active:
         log.warning("inbound: no inbound rules to use in %s", path)
         return None
-    inbound = Inbound(config["inbound"], active, state_path, dsn, stop)
+    # Dead-letter records and offsets in Kafka transactions, unless turned off.
+    transactional_id = (f"{config['delivery']['transactional_id'] or 'erpdoo-' + instance}-inbound"
+                        if config["delivery"]["transactions"] else None)
+    inbound = Inbound(config["inbound"], active, state_path, dsn, stop, transactional_id)
     inbound.start()
     return inbound
 
 
-def send_pending(store: StateStore, sinks: list, rules: list[Rule]) -> None:
-    """Deliver the backfilled events the state store keeps (see catch_up),
-    then forget them. Those of rules not active now wait."""
+def open_delivery(config: dict, store: StateStore, identity: dict, stop: threading.Event) -> Delivery:
+    """The sinks, with Kafka transactions if they can all take part (see
+    erpdoo.sinks.transactions). ``identity`` goes in each checkpoint: what
+    its position belongs to."""
+    exactly_once, why = transactional(config)
+    retried = (Unreachable, KafkaException, TimeoutError)
+    if not exactly_once:
+        log.info("delivery is at-least-once: %s. After a crash, events delivered but not yet confirmed are sent"
+                 " again, with the same event_id", why)
+        return Delivery([retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec), retried, stop)
+                         for spec in config["sinks"]])
+    settings = config["delivery"]
+    transactional_id = settings["transactional_id"] or f"erpdoo-{store.instance}"
+    bootstrap = config["sinks"][0]["bootstrap_servers"]
+    transactions = retry("Kafka", lambda: Transactions(bootstrap, transactional_id, settings["checkpoint_topic"]),
+                         retried, stop)
+    try:
+        sinks = [retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec, transactions), retried, stop)
+                 for spec in config["sinks"]]
+        delivery = retry("Kafka", lambda: TransactionalDelivery(sinks, transactions, identity), retried, stop)
+    except BaseException:
+        transactions.close()
+        raise
+    log.info("delivery is exactly once: Kafka transactions (transactional.id %s) with checkpoints in %s;"
+             " consumers must read with isolation.level=read_committed", transactional_id,
+             settings["checkpoint_topic"])
+    return delivery
+
+
+def resume(delivery: Delivery, store: StateStore, valid) -> int | None:
+    """Pick up from the last checkpoint, if delivery is exactly once: forget
+    the noted events it delivered, and return its WAL position if
+    ``valid(checkpoint)`` (it belongs to this slot), to skip to."""
+    checkpoint = delivery.checkpoint
+    if checkpoint is None:
+        return None
+    forgotten = store.clear_delivered_events(checkpoint.get("pending") or [])
+    if forgotten:
+        log.info("%d noted events were delivered in the last Kafka transaction; not sending them again", forgotten)
+    if checkpoint.get("source") == "replication" and valid(checkpoint):
+        delivery.position["lsn"] = checkpoint["lsn"]
+        log.info("last checkpoint: %s, committed at %s; skipping transactions up to it",
+                 format_lsn(checkpoint["lsn"]), checkpoint.get("committed_at"))
+        return checkpoint["lsn"]
+    if checkpoint.get("source") == "replication":
+        log.warning("the last checkpoint (%s) is of another slot or database, not skipping to it",
+                    {k: checkpoint.get(k) for k in ("system", "slot", "lsn")})
+    else:
+        log.info("last checkpoint: poll cursors %s, committed at %s", checkpoint.get("cursors"),
+                 checkpoint.get("committed_at"))
+    return None
+
+
+def format_lsn(lsn: int) -> str:
+    return f"{lsn >> 32:X}/{lsn & 0xFFFFFFFF:X}"
+
+
+def hold_mode(path: str | None) -> str | None:
+    """Test hook: None unless ERPDOO_TEST_HOLD_ACK's file exists; then
+    "before-commit" if it says so, else "after-commit"."""
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            return "before-commit" if f.read().strip() == "before-commit" else "after-commit"
+    except FileNotFoundError:
+        return None
+
+
+def hold_before_commit(path: str) -> None:
+    """Test hook: events are written but not committed. Wait while the file
+    says "before-commit", then exit as if erpdoo had crashed."""
+    if hold_mode(path) != "before-commit":
+        return
+    log.warning("holding before the commit while %s exists (test hook)", path)
+    while hold_mode(path) == "before-commit":
+        time.sleep(0.2)
+    log.warning("%s removed: exiting without committing (test hook)", path)
+    os._exit(70)
+
+
+def send_pending(store: StateStore, delivery: Delivery, rules: list[Rule], position: dict | None = None,
+                 quiet: bool = False) -> None:
+    """Deliver the events the state store keeps (backfilled ones, see
+    catch_up, and in polling mode those of a poll), then forget them. Those
+    of rules not active now wait. With Kafka transactions, each checkpoint
+    lists the events it delivered, which are forgotten after a crash."""
     names = {r.name for r in rules}
     ready = [(seq, Event(**fields)) for seq, fields in store.pending_events() if fields["event_type"] in names]
     if not ready:
         return
     for start in range(0, len(ready), 500):
-        for sink in sinks:
-            sink.send([event for _, event in ready[start:start + 500]])
-    store.clear_pending_events(seq for seq, _ in ready)
-    log.info("sent %d backfilled events", len(ready))
+        chunk = ready[start:start + 500]
+        delivery.send([event for _, event in chunk], position, pending=True)
+        store.clear_pending_events(seq for seq, _ in chunk)
+    if not quiet:
+        log.info("sent %d noted events", len(ready))
 
 
 def send_backfill(result: backfill.Backfill, sinks: list) -> None:

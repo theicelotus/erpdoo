@@ -24,6 +24,14 @@ access (see erpdoo.polling):
       type: polling
       interval: 5                 # seconds between polls
       odoo: {url: https://example.odoo.com, db: example, login: erpdoo-reader, api_key: ${ERPDOO_POLL_API_KEY}}
+
+How events are delivered (``delivery``): when every sink is Kafka, on one
+cluster, in Kafka transactions, exactly once (see erpdoo.sinks.transactions):
+
+    delivery:
+      transactions: true          # false: at-least-once, as with other sinks
+      transactional_id: erpdoo-1  # default: from the state store, unique per erpdoo
+      checkpoint_topic: erpdoo.checkpoints
 """
 
 from __future__ import annotations
@@ -38,13 +46,14 @@ from erpdoo.health import DEFAULTS, parse_size
 from erpdoo.rules import YamlLoader
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-SETTINGS = {"source", "sinks", "viewer", "slot", "tables", "backfill", "inbound"}
+SETTINGS = {"source", "sinks", "viewer", "slot", "tables", "backfill", "inbound", "delivery"}
 INBOUND = {"bootstrap_servers", "group_id", "dead_letter_topic", "odoo", "backoff", "max_backoff", "keep_days"}
 ODOO = {"url", "db", "login", "api_key"}
 # Polling: seconds between polls; seconds before the cursor read again, for
 # transactions that commit after it passed them; seconds between the id
 # comparisons that find deleted records (false: never); records per API call.
 POLLING = {"interval": 5.0, "overlap": 60.0, "deletes": 300.0, "batch": 500}
+DELIVERY = {"transactions": True, "transactional_id": None, "checkpoint_topic": "erpdoo.checkpoints"}
 
 
 class ConfigError(Exception):
@@ -85,7 +94,7 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
         if env.get("ERPDOO_SCHEMA_REGISTRY"):
             kafka["schema_registry"] = {"url": env["ERPDOO_SCHEMA_REGISTRY"]}
         return {"source": {"type": "replication"}, "sinks": [kafka], "slot": slot_settings(None), "tables": {},
-                "backfill": {"after_lost_slot": True}}
+                "backfill": {"after_lost_slot": True}, "delivery": delivery_settings(None)}
     doc = yaml.load(Path(path).read_text(), Loader=YamlLoader) or {}
     if not isinstance(doc, dict):
         raise ConfigError(f"{path}: expected a mapping")
@@ -112,7 +121,26 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
     config["backfill"] = {"after_lost_slot": True, **backfill}
     if config.get("inbound") is not None:
         config["inbound"] = inbound_settings(config["inbound"], path)
+    config["delivery"] = delivery_settings(config.get("delivery"), path)
     return config
+
+
+def delivery_settings(spec, path=None) -> dict:
+    """The ``delivery`` settings: whether to use Kafka transactions when every
+    sink is Kafka (exactly-once, see erpdoo.sinks.transactions), the
+    producer's transactional.id (by default from the state store, so unique
+    per erpdoo) and the topic of the checkpoints."""
+    spec = {} if spec is None else spec
+    where = f"{path}: delivery"
+    if not isinstance(spec, dict) or spec.keys() - DELIVERY.keys():
+        raise ConfigError(f"{where} takes {', '.join(sorted(DELIVERY))}")
+    settings = {**DELIVERY, **spec}
+    if not isinstance(settings["transactions"], bool):
+        raise ConfigError(f"{where}: transactions is true or false")
+    for key in ("transactional_id", "checkpoint_topic"):
+        if settings[key] is not None and (not isinstance(settings[key], str) or not settings[key]):
+            raise ConfigError(f"{where}: {key} is a name")
+    return settings
 
 
 def source_settings(spec, path=None) -> dict:

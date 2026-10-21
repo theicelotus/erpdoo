@@ -38,8 +38,10 @@ and the events of changes from before it was activated say "backfill": true.
 Events carry "source": {"polling": true, "approximate": ..., and
 "mail_message_id" or "write_date"}, and an id from the rule, the record and
 the tracking message (the id erpdoo backfill gives the same change) or the
-write_date and values. So an event sent again after a restart, because the
-poll was delivered but not yet noted, has the same id.
+write_date and values. A poll is noted together with its events, which
+are then delivered (in a Kafka transaction with a checkpoint that lists
+their ids, when every sink is Kafka) and forgotten, so a crash in between
+loses no event; delivered at-least-once, one sent again has the same id.
 
 Related records (includes, related fields) are read through the API for each
 poll in batches, one call per model and level of includes, as Odoo has them
@@ -653,7 +655,7 @@ class Poller:
 
     def poll(self) -> Poll:
         """Read what changed since the last poll and build its events. Nothing
-        is noted until commit(), after the events are delivered."""
+        is noted until commit(), which notes the events with it."""
         started, calls = time.monotonic(), self.client.calls
         self.polls += 1
         result = Poll(self.polls)
@@ -878,9 +880,19 @@ class Poller:
             source["inbound"] = {"message_id": cause["message_id"], "topic": cause["topic"], "rule": cause["rule"]}
         return (rule, record_id, before, after, str(uuid.uuid5(namespace, name)), at, source, order)
 
+    def position(self) -> dict:
+        """The cursors, for Kafka checkpoints: each rule model's, and the
+        tracking messages', as Odoo times."""
+        cursors = {p.model: self._meta(f"poll_cursor:{p.model}") for p in self.plans.values()}
+        messages = self._meta("poll_messages_cursor")
+        return {"cursors": {m: odoo_time(c) for m, c in sorted(cursors.items()) if c is not None},
+                "messages_cursor": odoo_time(messages) if messages is not None else None}
+
     def commit(self, result: Poll) -> None:
-        """Note a delivered poll: the records' values, the cursors and the
-        tracking messages handled."""
+        """Note a poll: the records' values, the cursors, the tracking
+        messages handled, and its events, which the state store keeps until
+        they are delivered (see erpdoo.__main__.send_pending)."""
+        self.store.add_pending_events(result.events)
         for table, rows in result.rows.items():
             self._put(table, list(rows.values()))
         for table, ids in result.deleted.items():
