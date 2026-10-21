@@ -46,9 +46,12 @@ jobs:
       # rename in between, and checks the replayed event is unchanged.
       - name: Replay test
         run: python scripts/replay_test.py
-      # Confirms orders while erpdoo is stopped, then while Redpanda is down;
-      # each event must arrive exactly once, and the slot must not be
-      # confirmed past an undelivered one (about a minute and a half).
+      # Confirms orders while erpdoo is stopped, then while Redpanda is down,
+      # with the dev stack's erpdoo (at-least-once) and a second one in Kafka
+      # transactions; each event must arrive exactly once, and no slot may be
+      # confirmed past an undelivered one. Then the second one crashes after
+      # a Kafka commit, before confirming its slot, and before a commit: a
+      # read_committed consumer must get each event once (about four minutes).
       - name: Delivery test
         run: python scripts/delivery_test.py
       # Inbound messages: both shipped rules, a repeat, a missing record

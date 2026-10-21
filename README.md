@@ -160,12 +160,19 @@ customer name included. It uses a test hook (`ERPDOO_TEST_HOLD_ACK` in
 `scripts/check_all.sh` rebuilds erpdoo and runs every check (unit tests and
 the test scripts) against the dev stack, with a summary at the end.
 
-`scripts/delivery_test.py`, also in CI, checks outages: it confirms orders
-while erpdoo is stopped, then while Redpanda is down. Each event must
-arrive exactly once on both topics once the service is back, and while
-Redpanda is down the replication slot must not be confirmed past any of
-the undelivered transactions. With erpdoo changed to confirm the slot
-before delivering, it fails, naming the order whose event was lost.
+`scripts/delivery_test.py`, also in CI, checks outages and crashes, with
+the dev stack's erpdoo (at-least-once, because of its stdout sink) and a
+second one whose sinks are all Kafka (exactly once). It confirms orders
+while both are stopped, then while Redpanda is down. Each event must
+arrive exactly once on every topic once the service is back, and while
+Redpanda is down neither replication slot may be confirmed past any of
+the undelivered transactions. Then the second erpdoo crashes after a Kafka
+commit, before confirming its slot, and once before the commit (the test
+hook): a `read_committed` consumer must get each event exactly once, and
+none of the uncommitted ones while it holds. With erpdoo changed to
+confirm the slot before delivering, it fails, naming the order whose event
+was lost; with `--no-transactions` (the second erpdoo at-least-once) the
+two crashes fail it with duplicates.
 
 ## Events
 
