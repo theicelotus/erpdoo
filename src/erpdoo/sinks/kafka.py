@@ -53,13 +53,15 @@ class KafkaSink:
         })
         self.ensure_topic(partitions)
 
-    def ensure_topic(self, partitions: int = 3) -> None:
+    def ensure_topic(self, partitions: int = 3, topic: str | None = None) -> None:
+        """Create the sink's topic (or ``topic``) unless it exists."""
+        topic = topic or self.topic
         admin = AdminClient({"bootstrap.servers": self.bootstrap_servers})
         # replication_factor=-1 uses the broker's default.
-        futures = admin.create_topics([NewTopic(self.topic, num_partitions=partitions, replication_factor=-1)])
+        futures = admin.create_topics([NewTopic(topic, num_partitions=partitions, replication_factor=-1)])
         try:
-            futures[self.topic].result(timeout=30)
-            log.info("created topic %s", self.topic)
+            futures[topic].result(timeout=30)
+            log.info("created topic %s", topic)
         except KafkaException as e:
             if e.args[0].code() != KafkaError.TOPIC_ALREADY_EXISTS:
                 raise

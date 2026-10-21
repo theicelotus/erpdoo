@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import psycopg2
 from confluent_kafka import KafkaException
@@ -25,6 +26,8 @@ from erpdoo.backfill import BackfillError
 from erpdoo.backoff import Stopped, Unreachable, reason, retry
 from erpdoo.config import ConfigError, load_config
 from erpdoo.events import EventBuilder
+from erpdoo.inbound import load_inbound_rules, validate_inbound
+from erpdoo.inbound_consumer import Inbound, InboundFailed
 from erpdoo.models import ModelRegistry
 from erpdoo.replication import PublicationError, ReplicationReader, StreamError
 from erpdoo.rules import (
@@ -57,7 +60,7 @@ def main() -> None:
         sys.exit(2)
     except Stopped:
         log.info("stopped")
-    except (DeliveryError, StreamError, psycopg2.OperationalError) as e:
+    except (DeliveryError, StreamError, InboundFailed, psycopg2.OperationalError) as e:
         # Nothing undelivered was confirmed: after a restart, which waits for
         # Postgres and Kafka to be back, the events are sent again.
         log.error("%s; stopping, unconfirmed events are sent again after a restart", reason(e))
@@ -166,6 +169,8 @@ def run() -> None:
         viewer = Viewer(**config["viewer"])
         viewer.start()
 
+    inbound = start_inbound(config, rules_path, registry, state_path, dsn, stop)
+
     confirmed_at = time.monotonic()
     reported_at = 0.0  # last slot health report
     # For tests only (scripts/replay_test.py): while this file exists, events
@@ -179,6 +184,8 @@ def run() -> None:
     log.info("streaming to %s", ", ".join(spec["type"] for spec in config["sinks"]))
     try:
         while not stop.is_set():
+            if inbound is not None and inbound.error is not None:
+                raise InboundFailed(f"inbound: {reason(inbound.error)}")
             batch = reader.poll(timeout=1.0)
             events = []
             shown = []
@@ -247,12 +254,37 @@ def run() -> None:
             if models_changed:
                 log.info("Odoo models changed, reloaded %d models", len(registry.models))
     finally:
+        if inbound is not None:
+            stop.set()
+            inbound.join(timeout=30)
         reader.close()
         for sink in sinks:
             sink.close()
         if viewer:
             viewer.stop()
     log.info("stopped")
+
+
+def start_inbound(config: dict, rules_path: str, registry: ModelRegistry, state_path: str, dsn: str,
+                  stop: threading.Event) -> Inbound | None:
+    """Start consuming inbound messages, if erpdoo.yml has inbound settings
+    and there are inbound rules (ERPDOO_INBOUND_RULES, by default the
+    inbound directory next to the rules)."""
+    path = os.environ.get("ERPDOO_INBOUND_RULES") or str(Path(rules_path) / "inbound")
+    rules = load_inbound_rules(path)
+    if config.get("inbound") is None:
+        if rules:
+            log.info("%d inbound rules in %s are not used: erpdoo.yml has no inbound settings", len(rules), path)
+        return None
+    active, skipped = validate_inbound(rules, registry)
+    for message in skipped:
+        log.warning("%s", message)
+    if not active:
+        log.warning("inbound: no inbound rules to use in %s", path)
+        return None
+    inbound = Inbound(config["inbound"], active, state_path, dsn, stop)
+    inbound.start()
+    return inbound
 
 
 def send_backfill(result: backfill.Backfill, sinks: list) -> None:

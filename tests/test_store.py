@@ -243,3 +243,31 @@ def test_a_store_in_an_older_format_starts_over(tmp_path):
     assert upgraded.tables == set()
     upgraded.load("res_partner", [{"id": 1, "active": True}], lsn=0x200)
     assert StateStore(path).tables == {"res_partner"}  # only once
+
+
+def test_inbound_log_and_the_attempt_a_transaction_falls_in(tmp_path):
+    from erpdoo.store import InboundLog
+
+    path = str(tmp_path / "state.db")
+    store, inbound = StateStore(path), InboundLog(path)
+    assert inbound.processed("payments", "m1") is None
+    first = inbound.begin("payments", "m1", "PaymentReceived", 8, 1000)
+    assert store.inbound_cause(1200) == {"topic": "payments", "message_id": "m1", "rule": "PaymentReceived", "uid": 8}
+    inbound.end(first, 1500)
+    inbound.finish("payments", "m1", "PaymentReceived", "done", 42)
+    assert inbound.processed("payments", "m1") == ("done", 42)
+    # Commits before, after and between attempts belong to none.
+    assert [store.inbound_cause(lsn) for lsn in (1000, 1600)] == [None, None]
+    second = inbound.begin("warehouse", "w1", "DeliveryShipped", 8, 2000)  # still running
+    assert store.inbound_cause(2500)["message_id"] == "w1"
+    # erpdoo stopped during it: the next attempt closes it.
+    inbound.begin("warehouse", "w2", "DeliveryShipped", 8, 3000)
+    assert store.inbound_cause(2500)["message_id"] == "w1" and store.inbound_cause(3100)["message_id"] == "w2"
+    assert second
+    # Once the slot is confirmed past an attempt, it is no longer needed.
+    store.prune(2600)
+    assert store.inbound_cause(1200) is None and store.inbound_cause(2500)["message_id"] == "w1"
+    # reset() (a new slot) keeps the processed messages.
+    store.reset()
+    assert inbound.processed("payments", "m1") == ("done", 42)
+    assert inbound.prune(-10) == 1 and inbound.processed("payments", "m1") is None

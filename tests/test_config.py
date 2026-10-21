@@ -60,3 +60,23 @@ def test_backfill_setting(tmp_path):
     assert load_config(path)["backfill"] == {"after_lost_slot": False}
     with pytest.raises(ConfigError, match="after_lost_slot"):
         load_config(write(tmp_path, "sinks: [{type: stdout}]\nbackfill: {after_lost_slot: maybe}\n"))
+
+
+def test_inbound_settings(tmp_path):
+    path = write(tmp_path, """
+sinks: [{type: stdout}]
+inbound:
+  bootstrap_servers: localhost:9092
+  backoff: 2
+  odoo: {url: "http://odoo:8069", db: odoo, login: erpdoo-integration, api_key: "${KEY}"}
+""")
+    inbound = load_config(path, env={"KEY": "k"})["inbound"]
+    assert inbound["backoff"] == 2.0 and inbound["odoo"]["api_key"] == "k"
+    for text, error in [
+        ("inbound: {odoo: {}}", "bootstrap_servers and odoo are required"),
+        ("inbound: {bootstrap_servers: x, odoo: {url: u, db: d, login: l}}", "odoo needs api_key, db, login, url"),
+        ("inbound: {bootstrap_servers: x, odoo: {url: u, db: d, login: l, api_key: k}, keep_days: soon}",
+         "are numbers"),
+    ]:
+        with pytest.raises(ConfigError, match=error):
+            load_config(write(tmp_path, "sinks: [{type: stdout}]\n" + text))

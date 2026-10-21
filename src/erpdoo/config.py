@@ -29,7 +29,9 @@ from erpdoo.health import DEFAULTS, parse_size
 from erpdoo.rules import YamlLoader
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-SETTINGS = {"sinks", "viewer", "slot", "tables", "backfill"}
+SETTINGS = {"sinks", "viewer", "slot", "tables", "backfill", "inbound"}
+INBOUND = {"bootstrap_servers", "group_id", "dead_letter_topic", "odoo", "backoff", "max_backoff", "keep_days"}
+INBOUND_ODOO = {"url", "db", "login", "api_key"}
 
 
 class ConfigError(Exception):
@@ -93,7 +95,26 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
             isinstance(v, bool) for v in backfill.values()):
         raise ConfigError(f"{path}: 'backfill' takes after_lost_slot: true or false")
     config["backfill"] = {"after_lost_slot": True, **backfill}
+    if config.get("inbound") is not None:
+        config["inbound"] = inbound_settings(config["inbound"], path)
     return config
+
+
+def inbound_settings(spec, path=None) -> dict:
+    """The ``inbound`` settings: where messages come from, and the Odoo user
+    the inbound rules act as."""
+    where = f"{path}: inbound"
+    if not isinstance(spec, dict) or spec.keys() - INBOUND or not {"bootstrap_servers", "odoo"} <= spec.keys():
+        raise ConfigError(f"{where} takes {', '.join(sorted(INBOUND))} (bootstrap_servers and odoo are required)")
+    odoo = spec["odoo"]
+    if not isinstance(odoo, dict) or odoo.keys() != INBOUND_ODOO or not all(odoo.values()):
+        raise ConfigError(f"{where}: odoo needs {', '.join(sorted(INBOUND_ODOO))} (an API key of the"
+                          " integration user, see \"Inbound\" in the README)")
+    try:
+        numbers = {k: float(spec[k]) for k in ("backoff", "max_backoff", "keep_days") if k in spec}
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where}: backoff, max_backoff and keep_days are numbers") from None
+    return {**spec, **numbers, "odoo": {k: str(v) for k, v in odoo.items()}}
 
 
 def slot_settings(spec, path=None) -> dict:

@@ -76,10 +76,30 @@ class TableSpec:
         return {"columns": sorted(self.columns) if self.columns is not None else None, "full": self.full}
 
 
+# Inbound messages (erpdoo.inbound_consumer), in the same file. reset() and
+# a format change leave them alone: they say which messages Odoo has had.
+INBOUND_SCHEMA = """
+    -- Messages carried out (or found carried out already), to skip repeats.
+    CREATE TABLE IF NOT EXISTS inbound_messages (
+        topic TEXT NOT NULL, message_id TEXT NOT NULL, rule TEXT NOT NULL, status TEXT NOT NULL,
+        record_id INTEGER, at INTEGER NOT NULL, PRIMARY KEY (topic, message_id));
+    -- Each attempt at a message: the WAL position before it and after it
+    -- (NULL while it runs), and the Odoo user it acts as. Messages are
+    -- carried out one at a time, so what that user committed in between was
+    -- caused by the message.
+    CREATE TABLE IF NOT EXISTS inbound_attempts (
+        id INTEGER PRIMARY KEY, start_lsn INTEGER NOT NULL, end_lsn INTEGER, topic TEXT NOT NULL,
+        message_id TEXT NOT NULL, rule TEXT NOT NULL, uid INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS inbound_attempts_start ON inbound_attempts (start_lsn);
+"""
+SQLITE_TIMEOUT = 30  # seconds to wait for the other connection's write (inbound and outbound share the file)
+
+
 class StateStore:
     def __init__(self, path: str, dsn: str | None = None) -> None:
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, timeout=SQLITE_TIMEOUT)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript(INBOUND_SCHEMA)
         self.db.executescript(
             """
             CREATE TABLE IF NOT EXISTS records (
@@ -296,8 +316,19 @@ class StateStore:
 
     def prune(self, lsn: int) -> None:
         """Drop versions of transactions before ``lsn``: the slot is confirmed
-        past them, so they are not streamed again."""
+        past them, so they are not streamed again. So are inbound attempts
+        that ended before it."""
         self.db.execute("DELETE FROM versions WHERE lsn < ?", [lsn])
+        self.db.execute("DELETE FROM inbound_attempts WHERE end_lsn < ?", [lsn])
+
+    def inbound_cause(self, commit_lsn: int) -> dict | None:
+        """The inbound attempt a transaction committed at ``commit_lsn`` falls
+        in, if any: {"topic", "message_id", "rule", "uid"}."""
+        row = self.db.execute(
+            "SELECT topic, message_id, rule, uid FROM inbound_attempts WHERE start_lsn < ?"
+            " AND (end_lsn IS NULL OR end_lsn >= ?) ORDER BY start_lsn DESC, id DESC LIMIT 1",
+            [commit_lsn, commit_lsn]).fetchone()
+        return dict(zip(("topic", "message_id", "rule", "uid"), row)) if row else None
 
     def commit(self) -> None:
         self.db.commit()
@@ -491,3 +522,49 @@ def _rows(conn, table: str, columns: frozenset[str] | None, estimate: int) -> It
                 total = f" of about {estimate:,}" if estimate else ""
                 log.info("state store: copying %s, %s%s rows so far", table, f"{count:,}", total)
     conn.commit()
+
+
+class InboundLog:
+    """The inbound side's own connection to the state store file."""
+
+    def __init__(self, path: str) -> None:
+        self.db = sqlite3.connect(path, timeout=SQLITE_TIMEOUT, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript(INBOUND_SCHEMA)
+        self.db.commit()
+
+    def processed(self, topic: str, message_id: str) -> tuple[str, int | None] | None:
+        """(status, record id) if the message was carried out already."""
+        return self.db.execute("SELECT status, record_id FROM inbound_messages WHERE topic = ? AND message_id = ?",
+                               [topic, message_id]).fetchone()
+
+    def begin(self, topic: str, message_id: str, rule: str, uid: int, lsn: int) -> int:
+        """Note an attempt starting at WAL position ``lsn``, before calling
+        Odoo. An attempt still open (erpdoo stopped during it) ends here."""
+        self.db.execute("UPDATE inbound_attempts SET end_lsn = ? WHERE end_lsn IS NULL", [lsn])
+        attempt = self.db.execute(
+            "INSERT INTO inbound_attempts (start_lsn, topic, message_id, rule, uid) VALUES (?, ?, ?, ?, ?)",
+            [lsn, topic, message_id, rule, uid]).lastrowid
+        self.db.commit()
+        return attempt
+
+    def end(self, attempt: int, lsn: int | None) -> None:
+        """Note where an attempt ended (None: not known, left open until the next one)."""
+        if lsn is not None:
+            self.db.execute("UPDATE inbound_attempts SET end_lsn = ? WHERE id = ?", [lsn, attempt])
+            self.db.commit()
+
+    def finish(self, topic: str, message_id: str, rule: str, status: str, record_id: int | None) -> None:
+        self.db.execute("INSERT OR REPLACE INTO inbound_messages VALUES (?, ?, ?, ?, ?, ?)",
+                        [topic, message_id, rule, status, record_id, int(time.time())])
+        self.db.commit()
+
+    def prune(self, keep_seconds: float) -> int:
+        """Forget processed messages older than ``keep_seconds``."""
+        count = self.db.execute("DELETE FROM inbound_messages WHERE at < ?",
+                                [int(time.time() - keep_seconds)]).rowcount
+        self.db.commit()
+        return count
+
+    def close(self) -> None:
+        self.db.close()
