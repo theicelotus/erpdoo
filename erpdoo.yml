@@ -24,6 +24,13 @@ sinks:
   #     topic: erpdoo.dead-letter
   #     bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
 
+# Log a warning when the replication slot is this far behind (it is logged
+# every report_seconds either way). See "Slot health" in the README.
+# slot:
+#   lag_warning: 1GB
+#   lag_warning_seconds: 300
+#   report_seconds: 60
+
 # Live page of each transaction's changes next to its events. No login: in
 # the dev stack compose publishes it on 127.0.0.1 only.
 viewer:

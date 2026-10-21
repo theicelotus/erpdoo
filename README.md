@@ -201,7 +201,57 @@ delivered: its inserts, updates (with the fields that changed, old and new)
 and deletes on one side, and the events built from it on the other. It
 needs the `viewer` extra (`pip install 'erpdoo[viewer]'`, included in the
 Docker image). It has no login and shows business data, so keep it on
-localhost or a private network.
+localhost or a private network. Its header shows how far the replication
+slot is behind (see below).
+
+## Slot health
+
+Postgres keeps all WAL that erpdoo's replication slot has not confirmed.
+While erpdoo keeps up, that is a few seconds' worth; if erpdoo is stopped,
+or a sink blocks the stream, it grows until erpdoo catches up. Every
+minute erpdoo logs how far the slot is behind, in bytes of WAL and in
+seconds (Postgres' `flush_lag` for erpdoo's connection: how long WAL waits
+before erpdoo confirms it; erpdoo confirms at least every 10 seconds):
+
+```
+INFO erpdoo: slot erpdoo: 469.7 kB of WAL not confirmed yet, 0.4 s behind; 12 rows fetched on demand so far
+```
+
+It logs a warning instead when the slot is more than 1 GB or 300 seconds
+behind, or when Postgres is about to invalidate it. The thresholds are set
+in [erpdoo.yml](erpdoo.yml):
+
+```yaml
+slot:
+  lag_warning: 1GB          # bytes of WAL, or 512MB, 2GB, ...
+  lag_warning_seconds: 300
+  report_seconds: 60
+```
+
+**Limit what a slot can hold.** By default Postgres keeps WAL for a slot
+without limit, so a slot left behind (erpdoo stopped for days) can fill
+the disk and stop the database, Odoo included. Set
+`max_slot_wal_keep_size` in `postgresql.conf` (or with
+`ALTER SYSTEM SET max_slot_wal_keep_size = '10GB'` and
+`SELECT pg_reload_conf()`, no restart needed) to cap it. Pick a size that
+covers the longest erpdoo outage you want to survive: when a slot needs
+more, Postgres invalidates it at the next checkpoint and removes the WAL.
+With the cap set, erpdoo's lag line also says how much more the slot can
+fall behind (`invalidated after 31.1 MB more`) and warns when Postgres
+marks it as about to be invalidated.
+
+If Postgres has invalidated the slot, erpdoo creates it again when it
+starts, copies its state store again and logs the time window it could
+not stream, from the last transaction it processed to the new slot:
+
+```
+ERROR erpdoo: replication slot erpdoo had been invalidated by Postgres, which removed WAL erpdoo had not read yet (it held more than max_slot_wal_keep_size); created it again. Changes committed between 2026-10-21T00:44:03.747894+00:00 and 2026-10-21T00:44:29.982924+00:00 were not streamed, so events from that time may be missing. The state store is copied again.
+```
+
+Events for records changed in that window are not sent, and erpdoo cannot
+rebuild them yet. This was tested on the
+dev stack with `max_slot_wal_keep_size = '64MB'`, erpdoo stopped, an order
+confirmed and 150 MB of unrelated WAL written.
 
 ## Writing rules
 
@@ -470,8 +520,12 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   model from another module that sets its own `_table` is not recognised
   yet. `python -m erpdoo.models <model>` shows how a model is mapped.
 - **An unused replication slot keeps WAL.** If erpdoo is stopped for a long
-  time, Postgres keeps the WAL it hasn't read yet and disk use grows. Drop the
-  slot (`SELECT pg_drop_replication_slot('erpdoo')`) if you remove erpdoo.
+  time, Postgres keeps the WAL it hasn't read yet and disk use grows, without
+  limit unless `max_slot_wal_keep_size` is set (see
+  [Slot health](#slot-health)). With the limit, a slot that needs more is
+  invalidated: erpdoo then starts over with a new slot, logs the window it
+  missed, and events from that window are not sent. Drop the slot
+  (`SELECT pg_drop_replication_slot('erpdoo')`) if you remove erpdoo.
 
 ## License
 
