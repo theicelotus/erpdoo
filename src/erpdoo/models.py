@@ -43,6 +43,7 @@ class Field:
     column2: str | None  # many2many: join table column holding the target's id
     related: str | None = None  # path of a related field, e.g. "product_tmpl_id.name"
     translate: bool = False  # stored as jsonb {"en_US": ..., "fr_FR": ...}
+    column_type: str | None = None  # Postgres type of the column (int4, numeric, float8, ...), if known
 
 
 @dataclass(frozen=True)
@@ -100,26 +101,30 @@ class ModelRegistry:
             )
             field_rows = cur.fetchall()
             cur.execute(
-                "SELECT c.relname, a.attname FROM pg_class c"
+                "SELECT c.relname, a.attname, t.typname FROM pg_class c"
                 " JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'"
                 " JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped"
+                " JOIN pg_type t ON t.oid = a.atttypid"
                 " WHERE c.relkind IN ('r', 'p')"
             )
-            table_columns: dict[str, set[str]] = {}
-            for table, column in cur.fetchall():
-                table_columns.setdefault(table, set()).add(column)
+            table_columns: dict[str, dict[str, str]] = {}
+            for table, column, type_name in cur.fetchall():
+                table_columns.setdefault(table, {})[column] = type_name
         return cls.from_rows(model_names, field_rows, table_columns, overrides)
 
     @classmethod
-    def from_rows(cls, model_names, field_rows, table_columns: dict[str, set[str]],
+    def from_rows(cls, model_names, field_rows, table_columns: dict[str, set[str] | dict[str, str]],
                   overrides: dict[str, str] | None = None) -> ModelRegistry:
         """Build the registry from ir_model names, ir_model_fields rows and the
-        columns of each table. A model's table is, in order: ``overrides``
+        columns of each table (a set of names, or names mapped to their
+        Postgres type). A model's table is, in order: ``overrides``
         (``tables:`` in erpdoo.yml), Odoo's naming rule with the core models
         known to differ, or else the one table no other model uses whose
         columns include every stored field of the model. Models without a
         table (abstract models, SQL views) are left out."""
         overrides = overrides or {}
+        column_types = {t: c if isinstance(c, dict) else dict.fromkeys(c) for t, c in table_columns.items()}
+        table_columns = {t: set(c) for t, c in table_columns.items()}
         stored: dict[str, set[str]] = {}
         for model, name, ttype, *_, store, _related, _translate in field_rows:
             if store and ttype not in ("one2many", "many2many"):
@@ -143,6 +148,7 @@ class ModelRegistry:
                 name, ttype, relation or None, name if is_column else None, inverse or None,
                 rel_table if store and ttype == "many2many" else None,
                 column1 or None, column2 or None, related or None, bool(translate),
+                column_types[tables[model]][name] if is_column else None,
             )
         models = {name: Model(name, tables[name], fields_by_model[name]) for name in tables}
         join_tables: dict[str, list[tuple[str, Field]]] = {}

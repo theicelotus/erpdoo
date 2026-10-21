@@ -102,3 +102,11 @@ def test_two_equally_close_tables_are_not_guessed():
     r = ModelRegistry.from_rows(models, fields, tables)
     assert "x.gadget" not in r.models
     assert "both fit" in r.problems[0]
+
+
+def test_fields_know_their_column_types_when_given():
+    tables = {**TABLES, "sale_order": {"id": "int4", "state": "varchar", "partner_id": "int4"}}
+    fields = ModelRegistry.from_rows(MODELS, FIELDS, tables).models["sale.order"].fields
+    assert fields["state"].column_type == "varchar" and fields["partner_id"].column_type == "int4"
+    assert fields["order_line"].column_type is None  # not a column
+    assert registry().models["sale.order"].fields["state"].column_type is None  # names only
