@@ -112,6 +112,12 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/python scripts/smoke_test.py
 ```
 
+`scripts/replay_test.py` checks the crash case: erpdoo delivers an event,
+the customer is renamed, and erpdoo crashes before confirming the slot. The
+event sent again after the restart must be identical to the first,
+customer name included. It uses a test hook (`ERPDOO_TEST_HOLD_ACK` in
+[docker-compose.yml](docker-compose.yml)) and also runs in CI.
+
 ## Events
 
 The packs in [rules/](rules/) cover:
@@ -383,14 +389,19 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
 - **The state store copies whole tables.** Each table a rule includes
   (partners, products, order and invoice lines, ...) is copied into SQLite
   when tracking starts, which takes a while on a large database, then kept
-  current from the stream. If events are sent again after a crash, their
-  related records reflect the current state, not the original moment.
-  many2many includes are not supported yet.
+  current from the stream. many2many includes are not supported yet.
 - **Delivery is at-least-once.** erpdoo streams changes over Postgres'
   replication protocol and confirms its position in the slot right after
   every sink has delivered the events. If it crashes in between, or one sink
   fails after another succeeded, the events are sent again after a restart,
-  with the same `event_id`. Consumers should dedupe on it.
+  with the same `event_id`. Consumers should dedupe on it. A resent event
+  is the same as the first, related records included: the state store keeps
+  the previous versions of changed rows until the slot is confirmed, and
+  reads related records as of the original commit. If Postgres itself
+  crashes, the slot can restart from further back than erpdoo confirmed
+  (Postgres saves its position at checkpoints); erpdoo no longer has
+  versions for those transactions, recognises them as delivered and does
+  not send them again.
 - **A sink that keeps failing stops the stream,** unless it has a
   dead-letter topic. By default erpdoo never skips an event: when a webhook
   rejects one (a 4xx) or stays unreachable past its retries, erpdoo exits
