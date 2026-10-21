@@ -9,7 +9,7 @@ InvoicePosted:
            payment_reference, currency_id, amount_untaxed, amount_tax, amount_total,
            amount_residual, payment_state, company_id]
   include:
-    partner_id: [name, email, vat]
+    partner_id: [name, email, vat, is_company]
     # Odoo filters invoice_line_ids in Python, so the database link holds
     # every journal item (tax, receivable, ...). Keep the product lines.
     invoice_line_ids:
@@ -29,4 +29,4 @@ InvoicePaid:
   fields: [name, state, invoice_date, invoice_origin, payment_reference, currency_id,
            amount_total, amount_residual, payment_state, company_id]
   include:
-    partner_id: [name, email, vat]
+    partner_id: [name, email, vat, is_company]

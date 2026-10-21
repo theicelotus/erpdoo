@@ -9,7 +9,7 @@ SaleOrderConfirmed:
   fields: [name, state, date_order, client_order_ref, currency_id,
            amount_untaxed, amount_tax, amount_total, user_id, team_id, company_id]
   include:
-    partner_id: [name, email, phone, vat]
+    partner_id: [name, email, phone, vat, is_company]
     order_line: [name, product_uom_qty, price_unit, discount, price_subtotal, price_total]
     order_line.product_id: [name, default_code]
     order_line.tax_id: [name, amount, amount_type]
@@ -22,6 +22,6 @@ SaleOrderCancelled:
   fields: [name, state, date_order, client_order_ref, currency_id, amount_total,
            user_id, team_id, company_id]
   include:
-    partner_id: [name, email, phone, vat]
+    partner_id: [name, email, phone, vat, is_company]
     order_line: [name, product_uom_qty, price_unit, price_subtotal]
     order_line.product_id: [name, default_code]

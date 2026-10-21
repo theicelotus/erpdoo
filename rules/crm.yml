@@ -10,5 +10,5 @@ LeadWon:
     active: true
   fields: [name, type, probability, expected_revenue, date_closed, user_id, team_id, company_id]
   include:
-    partner_id: [name, email, phone]
+    partner_id: [name, email, phone, is_company]
     stage_id: [name]
