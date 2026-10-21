@@ -196,9 +196,17 @@ def main() -> int:
     goods = odoo("product.product", "search", [("sale_ok", "=", True), ("type", "=", "consu")], limit=1)[0]
     goods_name = name_of("product.product", goods)
 
+    # A tax on each line, which events list through a many2many join table.
+    [sale_tax] = odoo("account.tax", "search_read", [("type_tax_use", "=", "sale")], fields=["name"], limit=1)
+    taxed = [(6, 0, [sale_tax["id"]])]
+
     def new_order(qty=2):
-        return odoo("sale.order", "create", {
-            "partner_id": partner_id, "order_line": [(0, 0, {"product_id": goods, "product_uom_qty": qty})]})
+        return odoo("sale.order", "create", {"partner_id": partner_id, "order_line": [
+            (0, 0, {"product_id": goods, "product_uom_qty": qty, "tax_id": taxed})]})
+
+    def taxes_match(lines, field):
+        got = [[tax.get("name") for tax in line.get(field) or []] for line in lines]
+        return [] if got == [[sale_tax["name"]]] else [f"taxes {got}, expected [[{sale_tax['name']!r}]]"]
 
     def partner_matches(record):
         got = (record.get("partner_id") or {}).get("name")
@@ -212,7 +220,8 @@ def main() -> int:
     order = new_order()
     odoo("sale.order", "action_confirm", [order])
     check("confirm quotation", "sale.order", order, "SaleOrderConfirmed", time.monotonic(),
-          lambda e: partner_matches(e["record"]) + lines_match(e["record"]["order_line"], "product_uom_qty", 2))
+          lambda e: partner_matches(e["record"]) + lines_match(e["record"]["order_line"], "product_uom_qty", 2)
+          + taxes_match(e["record"]["order_line"], "tax_id"))
     odoo("sale.order", "write", [order], {"client_order_ref": "smoke-test edit"})
     events.seen = [(t, e) for t, e in events.seen if not (e["model"] == "sale.order" and e["record_id"] == order)]
     check("edit confirmed order", "sale.order", order, None, time.monotonic())
@@ -261,15 +270,19 @@ def main() -> int:
 
     # InvoicePosted, then InvoicePaid after registering the full payment.
     def post(move_type):
+        line = {"product_id": goods, "quantity": 3, "price_unit": 100}
+        if move_type == "out_invoice":
+            line["tax_ids"] = taxed
         move = odoo("account.move", "create", {
             "move_type": move_type, "partner_id": partner_id, "invoice_date": date.today().isoformat(),
-            "invoice_line_ids": [(0, 0, {"product_id": goods, "quantity": 3, "price_unit": 100})]})
+            "invoice_line_ids": [(0, 0, line)]})
         odoo("account.move", "action_post", [move])
         return move
 
     invoice = post("out_invoice")
     check("post customer invoice", "account.move", invoice, "InvoicePosted", time.monotonic(),
-          lambda e: partner_matches(e["record"]) + lines_match(e["record"]["invoice_line_ids"], "quantity", 3))
+          lambda e: partner_matches(e["record"]) + lines_match(e["record"]["invoice_line_ids"], "quantity", 3)
+          + taxes_match(e["record"]["invoice_line_ids"], "tax_ids"))
     ctx = {"active_model": "account.move", "active_ids": [invoice]}
     payment = odoo("account.payment.register", "create", {}, context=ctx)
     odoo("account.payment.register", "action_create_payments", [payment], context=ctx)

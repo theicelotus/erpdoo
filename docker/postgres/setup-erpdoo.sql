@@ -7,7 +7,7 @@
 -- startup and, if any are missing, prints the SQL to add them.
 
 \set ON_ERROR_STOP on
-\set tables 'account_move, account_move_line, crm_lead, crm_stage, ir_model, ir_model_fields, product_product, product_template, res_partner, sale_order, sale_order_line, stock_move, stock_picking, stock_picking_type'
+\set tables 'account_move, account_move_line, account_move_line_account_tax_rel, account_tax, account_tax_sale_order_line_rel, crm_lead, crm_stage, ir_model, ir_model_fields, product_product, product_template, res_partner, sale_order, sale_order_line, stock_move, stock_picking, stock_picking_type'
 
 SELECT NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'erpdoo') AS create_role \gset
 \if :create_role

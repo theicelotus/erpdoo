@@ -12,6 +12,7 @@ SaleOrderConfirmed:
     partner_id: [name, email, phone, vat]
     order_line: [name, product_uom_qty, price_unit, discount, price_subtotal, price_total]
     order_line.product_id: [name, default_code]
+    order_line.tax_id: [name, amount, amount_type]
 
 SaleOrderCancelled:
   model: sale.order
