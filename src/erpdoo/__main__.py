@@ -71,7 +71,8 @@ def run() -> None:
 
     rules = load_rules(rules_path)
     # After a reboot erpdoo may start before Postgres and Kafka: wait for them.
-    registry = retry("Postgres", lambda: ModelRegistry.load(dsn), (psycopg2.OperationalError,), stop)
+    registry = retry("Postgres", lambda: ModelRegistry.load(dsn, config["tables"]), (psycopg2.OperationalError,), stop)
+    report_tables(registry, None)
     reader = ReplicationReader(dsn, slot, publication, lambda table: registry.model_for_table(table))
     store = StateStore(state_path)
 
@@ -187,7 +188,8 @@ def run() -> None:
                 report_health(reader, store, config["slot"], viewer)
             models_changed = any(c.table in MODEL_TABLES for txn in batch.transactions for c in txn.changes)
             if models_changed:
-                registry = ModelRegistry.load(dsn)
+                registry, previous = ModelRegistry.load(dsn, config["tables"]), registry
+                report_tables(registry, previous)
             elif recheck_at is None or time.monotonic() < recheck_at:
                 continue
             before = {r.name for r in builder.rules}
@@ -218,6 +220,17 @@ def run() -> None:
         if viewer:
             viewer.stop()
     log.info("stopped")
+
+
+def report_tables(registry: ModelRegistry, previous: ModelRegistry | None) -> None:
+    """Log tables found by their columns, and tables not found, once each."""
+    for model, table in sorted(registry.detected.items()):
+        if previous is None or previous.detected.get(model) != table:
+            log.info("model %s uses table %s, found by its columns (Odoo's naming rule gives %s); set it under"
+                     " tables: in erpdoo.yml to be sure", model, table, model.replace(".", "_"))
+    for problem in registry.problems:
+        if previous is None or problem not in previous.problems:
+            log.warning("table of model %s", problem)
 
 
 def report_health(reader: ReplicationReader, store: StateStore, settings: dict, viewer) -> None:

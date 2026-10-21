@@ -44,3 +44,11 @@ def test_default_without_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = load_config(None, env={"ERPDOO_TOPIC": "t"})
     assert config["sinks"] == [{"type": "kafka", "bootstrap_servers": "127.0.0.1:19092", "topic": "t"}]
+
+
+def test_tables_setting(tmp_path):
+    path = write(tmp_path, "sinks: [{type: stdout}]\ntables: {x.gadget: x_custom_gadgets}\n")
+    assert load_config(path)["tables"] == {"x.gadget": "x_custom_gadgets"}
+    assert load_config(write(tmp_path, "sinks: [{type: stdout}]\n"))["tables"] == {}
+    with pytest.raises(ConfigError, match="maps Odoo model names"):
+        load_config(write(tmp_path, "sinks: [{type: stdout}]\ntables: [x]\n"))

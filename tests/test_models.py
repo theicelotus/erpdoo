@@ -63,3 +63,42 @@ def test_references_and_links():
     assert r.references("sale.order", {"id": 8, "partner_id": None}) == {}
     assert r.links("sale_order_tag_rel", {"order_id": 7, "tag_id": 3}) == [
         Link("sale.order", 7, "tag_ids", "crm.tag", 3)]
+
+
+def gadget_rows():
+    # A model that sets _table = "x_custom_gadgets", and an abstract mixin.
+    fields = [(m, n, t, r, None, None, None, None, True, None, False) for m, n, t, r in [
+        ("x.gadget", "id", "integer", None), ("x.gadget", "name", "char", None),
+        ("x.gadget", "state", "selection", None), ("x.gadget", "partner_id", "many2one", "res.partner"),
+        ("x.gadget", "line_ids", "one2many", "x.gadget.line"),
+        ("x.mixin", "id", "integer", None), ("x.mixin", "create_date", "datetime", None)]]
+    tables = {"x_custom_gadgets": {"id", "name", "state", "partner_id", "create_date", "old_note"},
+              "res_partner": {"id", "name", "state"}, "x_unrelated": {"id", "name"}}
+    return ["x.gadget", "x.mixin", "res.partner"], fields, tables
+
+
+def test_table_found_by_its_columns():
+    r = ModelRegistry.from_rows(*gadget_rows())
+    assert r.models["x.gadget"].table == "x_custom_gadgets"
+    assert r.model_for_table("x_custom_gadgets") == "x.gadget"
+    assert r.detected == {"x.gadget": "x_custom_gadgets"}
+    assert r.models["x.gadget"].fields["state"].column == "state"
+    # Only magic fields: nothing to tell tables apart by.
+    assert "x.mixin" not in r.models and r.problems == []
+
+
+def test_table_from_the_config_wins():
+    models, fields, tables = gadget_rows()
+    tables["x_gadgets_v2"] = {"id", "name", "state", "partner_id"}
+    r = ModelRegistry.from_rows(models, fields, tables, {"x.gadget": "x_custom_gadgets"})
+    assert r.models["x.gadget"].table == "x_custom_gadgets" and r.detected == {}
+    r = ModelRegistry.from_rows(models, fields, tables, {"x.gadget": "missing"})
+    assert r.problems == ["x.gadget: table missing from erpdoo.yml does not exist"]
+
+
+def test_two_equally_close_tables_are_not_guessed():
+    models, fields, tables = gadget_rows()
+    tables["x_gadgets_copy"] = set(tables["x_custom_gadgets"])
+    r = ModelRegistry.from_rows(models, fields, tables)
+    assert "x.gadget" not in r.models
+    assert "both fit" in r.problems[0]

@@ -26,7 +26,7 @@ from erpdoo.health import DEFAULTS, parse_size
 from erpdoo.rules import YamlLoader
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-SETTINGS = {"sinks", "viewer", "slot"}
+SETTINGS = {"sinks", "viewer", "slot", "tables"}
 
 
 class ConfigError(Exception):
@@ -63,7 +63,7 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
             "type": "kafka",
             "bootstrap_servers": env.get("ERPDOO_KAFKA_BOOTSTRAP", "127.0.0.1:19092"),
             "topic": env.get("ERPDOO_TOPIC", "erpdoo.events"),
-        }], "slot": slot_settings(None)}
+        }], "slot": slot_settings(None), "tables": {}}
     doc = yaml.load(Path(path).read_text(), Loader=YamlLoader) or {}
     if not isinstance(doc, dict):
         raise ConfigError(f"{path}: expected a mapping")
@@ -78,6 +78,10 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
     if viewer is not None and (not isinstance(viewer, dict) or viewer.keys() - {"host", "port"}):
         raise ConfigError(f"{path}: 'viewer' takes host and port")
     config["slot"] = slot_settings(config.get("slot"), path)
+    tables = config.setdefault("tables", {}) or {}
+    if not isinstance(tables, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in tables.items()):
+        raise ConfigError(f"{path}: 'tables' maps Odoo model names to table names, e.g. x.gadget: x_gadgets")
+    config["tables"] = tables
     return config
 
 

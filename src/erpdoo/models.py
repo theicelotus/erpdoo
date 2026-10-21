@@ -27,6 +27,8 @@ TABLE_OVERRIDES = {
 }
 
 RELATIONAL_TYPES = {"many2one", "one2many", "many2many"}
+# Columns Odoo gives every model's table; they say nothing about which model it is.
+MAGIC_COLUMNS = {"id", "create_uid", "create_date", "write_uid", "write_date"}
 
 
 @dataclass(frozen=True)
@@ -71,9 +73,14 @@ class Link:
 
 
 class ModelRegistry:
-    def __init__(self, models: dict[str, Model], join_tables: dict[str, list[tuple[str, Field]]]) -> None:
+    def __init__(self, models: dict[str, Model], join_tables: dict[str, list[tuple[str, Field]]],
+                 detected: dict[str, str] | None = None, problems: list[str] | None = None) -> None:
         self.models = models
         self.join_tables = join_tables
+        # Models whose table was found by its columns, and tables that were
+        # not found or not clear.
+        self.detected = detected or {}
+        self.problems = problems or []
         self._by_table: dict[str, str] = {}
         for model in models.values():
             current = self._by_table.get(model.table)
@@ -83,7 +90,7 @@ class ModelRegistry:
                 self._by_table[model.table] = model.name
 
     @classmethod
-    def load(cls, dsn: str) -> ModelRegistry:
+    def load(cls, dsn: str, overrides: dict[str, str] | None = None) -> ModelRegistry:
         with closing(psycopg2.connect(dsn, application_name="erpdoo-models")) as conn, conn.cursor() as cur:
             cur.execute("SELECT model FROM ir_model")
             model_names = [r[0] for r in cur.fetchall()]
@@ -101,20 +108,33 @@ class ModelRegistry:
             table_columns: dict[str, set[str]] = {}
             for table, column in cur.fetchall():
                 table_columns.setdefault(table, set()).add(column)
-        return cls.from_rows(model_names, field_rows, table_columns)
+        return cls.from_rows(model_names, field_rows, table_columns, overrides)
 
     @classmethod
-    def from_rows(cls, model_names, field_rows, table_columns: dict[str, set[str]]) -> ModelRegistry:
+    def from_rows(cls, model_names, field_rows, table_columns: dict[str, set[str]],
+                  overrides: dict[str, str] | None = None) -> ModelRegistry:
         """Build the registry from ir_model names, ir_model_fields rows and the
-        columns of each table. Models without a table (abstract models, SQL
-        views) are left out."""
-        fields_by_model: dict[str, dict[str, Field]] = {}
-        tables = {}
+        columns of each table. A model's table is, in order: ``overrides``
+        (``tables:`` in erpdoo.yml), Odoo's naming rule with the core models
+        known to differ, or else the one table no other model uses whose
+        columns include every stored field of the model. Models without a
+        table (abstract models, SQL views) are left out."""
+        overrides = overrides or {}
+        stored: dict[str, set[str]] = {}
+        for model, name, ttype, *_, store, _related, _translate in field_rows:
+            if store and ttype not in ("one2many", "many2many"):
+                stored.setdefault(model, set()).add(name)
+        tables, problems = {}, []
         for name in model_names:
-            table = TABLE_OVERRIDES.get(name, _default_table(name))
+            table = overrides.get(name) or TABLE_OVERRIDES.get(name, _default_table(name))
             if table in table_columns:
                 tables[name] = table
-                fields_by_model[name] = {}
+            elif name in overrides:
+                problems.append(f"{name}: table {table} from erpdoo.yml does not exist")
+        detected = _detect_tables([m for m in model_names if m not in tables], stored, table_columns,
+                                  set(tables.values()), problems)
+        tables.update(detected)
+        fields_by_model: dict[str, dict[str, Field]] = {name: {} for name in tables}
         for model, name, ttype, relation, inverse, rel_table, column1, column2, store, related, translate in field_rows:
             if model not in tables:
                 continue
@@ -130,7 +150,7 @@ class ModelRegistry:
             for f in model.fields.values():
                 if f.relation_table:
                     join_tables.setdefault(f.relation_table, []).append((model.name, f))
-        return cls(models, join_tables)
+        return cls(models, join_tables, detected, problems)
 
     def model_for_table(self, table: str) -> str | None:
         return self._by_table.get(table)
@@ -158,13 +178,45 @@ def _default_table(model: str) -> str:
     return model.replace(".", "_")
 
 
+def _detect_tables(models, stored, table_columns, claimed: set[str], problems: list[str]) -> dict[str, str]:
+    """Tables of models that set their own _table, found by their columns:
+    a table with an id that no other model uses, whose columns include every stored field of
+    the model besides the ones all tables have. Of several such tables, the
+    one with the fewest other columns (columns of removed fields stay in
+    Odoo's tables); if two are equally close, none."""
+    found = {}
+    for model in models:
+        fields = stored.get(model, set())
+        if not fields - MAGIC_COLUMNS:
+            continue  # abstract models, or nothing to tell tables apart by
+        # A model's table has an id; many2many join tables do not.
+        candidates = sorted((len(columns - fields), table) for table, columns in table_columns.items()
+                            if table not in claimed and "id" in columns and fields <= columns)
+        if not candidates:
+            continue  # no table: an abstract model or an SQL view
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+            problems.append(f"{model}: tables {candidates[0][1]} and {candidates[1][1]} both fit; set the table"
+                            " under tables: in erpdoo.yml")
+            continue
+        found[model] = candidates[0][1]
+        claimed.add(candidates[0][1])
+    return found
+
+
 def main() -> None:
+    from erpdoo.config import load_config
+
     dsn = os.environ.get("ERPDOO_PG_DSN", "host=localhost dbname=odoo user=erpdoo password=erpdoo")
-    registry = ModelRegistry.load(dsn)
+    registry = ModelRegistry.load(dsn, load_config(os.environ.get("ERPDOO_CONFIG"))["tables"])
     print(f"{len(registry.models)} models with tables, {len(registry.join_tables)} many2many join tables")
+    for model, table in sorted(registry.detected.items()):
+        print(f"{model} -> table {table}, found by its columns")
+    for problem in registry.problems:
+        print(f"table of model {problem}")
     for name in sys.argv[1:]:
         model = registry.models[name]
-        print(f"\n{model.name} -> table {model.table}, {len(model.fields)} fields")
+        how = " (found by its columns)" if name in registry.detected else ""
+        print(f"\n{model.name} -> table {model.table}{how}, {len(model.fields)} fields")
         for f in sorted(model.relational_fields(), key=lambda f: (f.type, f.name)):
             if f.type == "many2one":
                 where = f"column {f.column}" if f.column else "not stored"
