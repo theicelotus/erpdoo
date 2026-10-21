@@ -51,6 +51,10 @@ jobs:
       # confirmed past an undelivered one (about a minute and a half).
       - name: Delivery test
         run: python scripts/delivery_test.py
+      # Inbound messages: both shipped rules, a repeat, a missing record
+      # (dead-lettered), Odoo stopped, and the loop marker (about a minute).
+      - name: Inbound test
+        run: python scripts/inbound_test.py
       # Installs a test module whose model sets its own _table.
       - name: Custom table name test
         run: python scripts/custom_table_test.py

@@ -8,12 +8,13 @@
 # PYTHON overrides the interpreter (default: .venv/bin/python if it exists).
 cd "$(dirname "$0")/.." || exit 1
 PYTHON=${PYTHON:-$( [ -x .venv/bin/python ] && echo .venv/bin/python || echo python )}
-checks=(unit smoke replay delivery custom_table backfill)
+checks=(unit smoke replay delivery inbound custom_table backfill)
 declare -A command=(
   [unit]="$PYTHON -m pytest -q"
   [smoke]="$PYTHON scripts/smoke_test.py"
   [replay]="$PYTHON scripts/replay_test.py"
   [delivery]="$PYTHON scripts/delivery_test.py"
+  [inbound]="$PYTHON scripts/inbound_test.py"
   [custom_table]="$PYTHON scripts/custom_table_test.py"
   [backfill]="$PYTHON scripts/backfill_test.py"
 )
