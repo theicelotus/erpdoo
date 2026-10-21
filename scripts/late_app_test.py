@@ -82,7 +82,11 @@ def main() -> int:
             if "Traceback" in text or sh("docker", "inspect", "-f", "{{.State.Status}}", container).strip() == "exited":
                 raise SystemExit(f"{container} stopped:\n{text[-3000:]}")
             return re.search(pattern, text)
-        return wait_until(f"{pattern!r} in the log of {container}", found, timeout)
+        try:
+            return wait_until(f"{pattern!r} in the log of {container}", found, timeout)
+        except SystemExit:
+            print(f"     last lines of {container}'s log:\n" + "\n".join(logs(container).splitlines()[-40:]))
+            raise
 
     def start(container: str) -> None:
         extra = ["-e", "ERPDOO_PG_DSN=host=postgres-is-not-used-in-polling-mode dbname=odoo"] if container == POLLING else []

@@ -466,7 +466,8 @@ class Poller:
         now = int(self.clock() * SECOND)
         first = self._meta("poll_since") is None
         if first:  # every model there now predates polling
-            self._set_meta("poll_since", now)
+            # To the second, as Odoo gives the models' creation times.
+            self._set_meta("poll_since", now - now % SECOND)
         fresh = [plan for plan in plans.values() if plan.table not in self.store.specs]
         created = self._created([plan.model for plan in fresh]) if fresh and not first else {}
         for plan in plans.values():

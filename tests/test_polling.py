@@ -359,6 +359,23 @@ def test_a_model_installed_later_is_polled_from_its_creation(api):
     assert [e.payload["source"].get("backfill", False) for e in run(p).events] == [False]
 
 
+def test_a_model_installed_in_the_second_polling_started_is_caught_up(api):
+    # Odoo gives the install time to the second; polling started later in that second.
+    api.now = api.now.replace(microsecond=900000)
+    api.hidden = {"crm.lead"}
+    p = Poller(api, SETTINGS, StateStore(":memory:"))
+    p.clock = lambda: api.now.replace(tzinfo=timezone.utc).timestamp()
+    p.load()
+    p.activate([CONFIRMED])
+    api.now = api.now.replace(microsecond=950000)
+    api.install("crm.lead")
+    api.create("crm.lead", {"name": "Won at once", "probability": 100.0, "active": True})
+    api.tick()
+    p.load()
+    p.activate([CONFIRMED, WON])
+    assert [e.payload["source"].get("backfill") for e in run(p).events] == [True]
+
+
 def test_a_model_from_before_polling_started_gets_a_baseline(api):
     api.hidden = {"crm.lead"}
     store = StateStore(":memory:")
