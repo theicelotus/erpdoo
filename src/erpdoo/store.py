@@ -279,6 +279,21 @@ class StateStore:
                               [table, record_id, lsn]).fetchone()
         return json.loads(row[0]) if row else _UNKNOWN
 
+    def set_pending_backfill(self, since: int, until: int) -> None:
+        """Remember a window to backfill (microseconds since 1970, UTC), so it
+        is backfilled after a restart if delivering it fails."""
+        self.db.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                            [("backfill_since", since), ("backfill_until", until)])
+        self.db.commit()
+
+    def pending_backfill(self) -> tuple[int, int] | None:
+        rows = dict(self.db.execute("SELECT key, value FROM meta WHERE key IN ('backfill_since', 'backfill_until')"))
+        return (rows["backfill_since"], rows["backfill_until"]) if len(rows) == 2 else None
+
+    def clear_pending_backfill(self) -> None:
+        self.db.execute("DELETE FROM meta WHERE key IN ('backfill_since', 'backfill_until')")
+        self.db.commit()
+
     def prune(self, lsn: int) -> None:
         """Drop versions of transactions before ``lsn``: the slot is confirmed
         past them, so they are not streamed again."""

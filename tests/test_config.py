@@ -52,3 +52,11 @@ def test_tables_setting(tmp_path):
     assert load_config(write(tmp_path, "sinks: [{type: stdout}]\n"))["tables"] == {}
     with pytest.raises(ConfigError, match="maps Odoo model names"):
         load_config(write(tmp_path, "sinks: [{type: stdout}]\ntables: [x]\n"))
+
+
+def test_backfill_setting(tmp_path):
+    assert load_config(write(tmp_path, "sinks: [{type: stdout}]\n"))["backfill"] == {"after_lost_slot": True}
+    path = write(tmp_path, "sinks: [{type: stdout}]\nbackfill: {after_lost_slot: false}\n")
+    assert load_config(path)["backfill"] == {"after_lost_slot": False}
+    with pytest.raises(ConfigError, match="after_lost_slot"):
+        load_config(write(tmp_path, "sinks: [{type: stdout}]\nbackfill: {after_lost_slot: maybe}\n"))

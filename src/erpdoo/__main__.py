@@ -104,17 +104,24 @@ def run() -> None:
             replica_identity_full=full,
         )
         if slot_created:
+            lost = None
             if reader.slot_was_lost:
                 reader.slot_was_lost = False
+                lost = (store.applied_time, int(time.time() * 1_000_000))
                 since = (datetime.fromtimestamp(store.applied_time / 1e6, timezone.utc).isoformat()
                          if store.applied_time else "the last transaction erpdoo processed (time unknown)")
+                after = (" They are backfilled from Odoo's records next." if config["backfill"]["after_lost_slot"]
+                         and store.applied_time else "")
                 log.error(
                     "replication slot %s had been invalidated by Postgres, which removed WAL erpdoo had not"
                     " read yet (it held more than max_slot_wal_keep_size); created it again. Changes committed"
-                    " between %s and %s were not streamed, so events from that time may be missing."
-                    " The state store is copied again.", slot, since, datetime.now(timezone.utc).isoformat())
+                    " between %s and %s were not streamed, so events from that time may be missing.%s"
+                    " The state store is copied again.", slot, since,
+                    datetime.fromtimestamp(lost[1] / 1e6, timezone.utc).isoformat(), after)
             # A new slot starts now: changes since the store was last updated are lost.
             store.reset()
+            if lost and lost[0] and config["backfill"]["after_lost_slot"]:
+                store.set_pending_backfill(*lost)
         store.sync(dsn, tracked)
         return EventBuilder(active, registry, store, lang), skipped
 
@@ -134,6 +141,18 @@ def run() -> None:
     sinks = [retry(f"{spec['type']} sink", lambda spec=spec: make_sink(spec),
                    (Unreachable, KafkaException, TimeoutError), stop)
              for spec in config["sinks"]]
+    pending = store.pending_backfill()
+    if pending:
+        since, until = (datetime.fromtimestamp(t / 1e6, timezone.utc) for t in pending)
+        try:
+            result = backfill.run(builder.rules, registry, dsn, since, until, lang)
+        except BackfillError as e:
+            log.error("could not backfill %s to %s: %s\nThen run: erpdoo backfill --since %s --until %s",
+                      since.isoformat(), until.isoformat(), e, since.isoformat(), until.isoformat())
+        else:
+            send_backfill(result, sinks)
+            log.info("backfilled %s to %s: %s", since.isoformat(), until.isoformat(), result.summary())
+        store.clear_pending_backfill()
     viewer = None
     if config.get("viewer") is not None:
         try:

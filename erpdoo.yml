@@ -36,6 +36,12 @@ sinks:
 #   lag_warning_seconds: 300
 #   report_seconds: 60
 
+# When Postgres has invalidated the replication slot, erpdoo creates it again
+# and backfills the window it missed from Odoo's records (see "Backfill" in
+# the README). Set to false to only log the window.
+# backfill:
+#   after_lost_slot: true
+
 # Live page of each transaction's changes next to its events. No login: in
 # the dev stack compose publishes it on 127.0.0.1 only.
 viewer:

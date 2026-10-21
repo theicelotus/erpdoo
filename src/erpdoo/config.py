@@ -26,7 +26,7 @@ from erpdoo.health import DEFAULTS, parse_size
 from erpdoo.rules import YamlLoader
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-SETTINGS = {"sinks", "viewer", "slot", "tables"}
+SETTINGS = {"sinks", "viewer", "slot", "tables", "backfill"}
 
 
 class ConfigError(Exception):
@@ -63,7 +63,7 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
             "type": "kafka",
             "bootstrap_servers": env.get("ERPDOO_KAFKA_BOOTSTRAP", "127.0.0.1:19092"),
             "topic": env.get("ERPDOO_TOPIC", "erpdoo.events"),
-        }], "slot": slot_settings(None), "tables": {}}
+        }], "slot": slot_settings(None), "tables": {}, "backfill": {"after_lost_slot": True}}
     doc = yaml.load(Path(path).read_text(), Loader=YamlLoader) or {}
     if not isinstance(doc, dict):
         raise ConfigError(f"{path}: expected a mapping")
@@ -82,6 +82,11 @@ def load_config(path: str | Path | None, env=os.environ) -> dict:
     if not isinstance(tables, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in tables.items()):
         raise ConfigError(f"{path}: 'tables' maps Odoo model names to table names, e.g. x.gadget: x_gadgets")
     config["tables"] = tables
+    backfill = config.get("backfill") or {}
+    if not isinstance(backfill, dict) or backfill.keys() - {"after_lost_slot"} or not all(
+            isinstance(v, bool) for v in backfill.values()):
+        raise ConfigError(f"{path}: 'backfill' takes after_lost_slot: true or false")
+    config["backfill"] = {"after_lost_slot": True, **backfill}
     return config
 
 
