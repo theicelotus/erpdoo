@@ -109,11 +109,13 @@ class Decoder:
 class Events:
     """Collects events from the topic, starting at its current end."""
 
-    def __init__(self, bootstrap: str, topic: str, registry: str = REGISTRY) -> None:
+    def __init__(self, bootstrap: str, topic: str, registry: str = REGISTRY, logger=None) -> None:
         self.topic = topic
         self.decode = Decoder(registry)
-        self.consumer = Consumer({"bootstrap.servers": bootstrap, "group.id": f"smoke-{uuid.uuid4()}",
-                                  "enable.auto.commit": False})
+        config = {"bootstrap.servers": bootstrap, "group.id": f"smoke-{uuid.uuid4()}", "enable.auto.commit": False}
+        if logger is not None:  # for librdkafka's log lines
+            config["logger"] = logger
+        self.consumer = Consumer(config)
 
         def topic_partitions():
             meta = self.consumer.list_topics(topic, timeout=10).topics[topic]
