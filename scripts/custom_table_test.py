@@ -44,7 +44,9 @@ def main() -> int:
     erpdoo = ["docker", "compose", "run", "--rm", "--no-deps", "-T",
               "-v", f"{Path(__file__).parent.parent / 'tests' / 'rules_custom_table'}:/rules:ro",
               "-e", "ERPDOO_RULES=/rules", "-e", f"ERPDOO_SLOT={SLOT}", "-e", "ERPDOO_STATE=/tmp/custom.db",
-              "-e", f"ERPDOO_TOPIC={TOPIC}", "-e", "ERPDOO_TEST_HOLD_ACK=", "erpdoo"]
+              "-e", f"ERPDOO_TOPIC={TOPIC}", "-e", "ERPDOO_TEST_HOLD_ACK=",
+              # No inbound rules: the dev stack's erpdoo consumes the inbound topics.
+              "-e", "ERPDOO_INBOUND_RULES=/no-inbound-rules", "erpdoo"]
 
     def admin(statements: str) -> None:
         subprocess.run(shlex.split(args.admin_sql), input=statements, text=True, check=True, capture_output=True)

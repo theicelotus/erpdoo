@@ -134,6 +134,10 @@ services:
       ERPDOO_KAFKA_BOOTSTRAP: redpanda:9092
       ERPDOO_TOPIC: erpdoo.events
       ERPDOO_SCHEMA_REGISTRY: http://redpanda:8081
+      # Inbound rules act as Odoo's erpdoo-integration user, created by
+      # odoo-init with this fixed key (dev stack only).
+      ERPDOO_ODOO_URL: http://odoo:8069
+      ERPDOO_ODOO_API_KEY: dev-only-integration-key-not-secret
       # Test hook for scripts/replay_test.py; does nothing unless the file exists.
       ERPDOO_TEST_HOLD_ACK: /var/lib/erpdoo/test-hold-ack
     ports:

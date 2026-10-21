@@ -42,6 +42,22 @@ sinks:
   #     topic: erpdoo.dead-letter
   #     bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
 
+# Inbound: messages from other systems that act on Odoo, by the rules in
+# rules/inbound/ (see "Inbound" in the README). They act through Odoo's API as
+# a dedicated integration user, so Odoo's own access rights and checks apply.
+inbound:
+  bootstrap_servers: ${ERPDOO_KAFKA_BOOTSTRAP:-127.0.0.1:19092}
+  # group_id: erpdoo-inbound                       # Kafka consumer group
+  # dead_letter_topic: erpdoo.inbound.dead-letter  # messages that cannot be carried out, with the reason
+  # backoff: 1                # seconds before retrying when Odoo is unreachable, doubling up to max_backoff
+  # max_backoff: 60
+  # keep_days: 30             # how long processed message ids are kept, to skip repeats
+  odoo:
+    url: ${ERPDOO_ODOO_URL:-http://localhost:8069}
+    db: ${ERPDOO_ODOO_DB:-odoo}
+    login: erpdoo-integration
+    api_key: ${ERPDOO_ODOO_API_KEY}
+
 # Tables of models that set their own _table in Odoo, when erpdoo should not
 # find them by their columns (see "Table names are inferred" in the README).
 # tables:
