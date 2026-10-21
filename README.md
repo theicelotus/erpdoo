@@ -144,6 +144,13 @@ event sent again after the restart must be identical to the first,
 customer name included. It uses a test hook (`ERPDOO_TEST_HOLD_ACK` in
 [docker-compose.yml](docker-compose.yml)) and also runs in CI.
 
+`scripts/delivery_test.py`, also in CI, checks outages: it confirms orders
+while erpdoo is stopped, then while Redpanda is down. Each event must
+arrive exactly once on both topics once the service is back, and while
+Redpanda is down the replication slot must not be confirmed past any of
+the undelivered transactions. With erpdoo changed to confirm the slot
+before delivering, it fails, naming the order whose event was lost.
+
 ## Events
 
 The packs in [rules/](rules/) cover:
