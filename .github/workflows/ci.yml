@@ -36,8 +36,10 @@ jobs:
       # Odoo's database is installed and the other services are started.
       - name: Start the stack
         run: docker compose up -d --build
-      - run: pip install -e .
-      # Waits for Odoo and erpdoo, then drives every shipped event through Odoo.
+      # dev: the scripts decode events with confluent-kafka's deserializers.
+      - run: pip install -e '.[dev]'
+      # Waits for Odoo and erpdoo, then drives every shipped event through Odoo,
+      # and checks each event against its schema, in both formats, and Odoo.
       - name: Smoke test
         run: python scripts/smoke_test.py
       # Crashes erpdoo between delivery and confirmation, with a customer

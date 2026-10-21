@@ -2,9 +2,19 @@
 
 Drives Odoo through its API the way the UI buttons do (confirm, cancel, post,
 register payment, validate delivery, mark won) and checks that exactly one
-matching event arrives on Kafka for each, with related records that match
-Odoo's own data. Also checks actions that must not produce an event, and
-that erpdoo's database role cannot change any of Odoo's tables.
+matching event arrives on Kafka for each. Also checks actions that must not
+produce an event, and that erpdoo's database role cannot change any of
+Odoo's tables.
+
+Every event is read from both topics of the dev stack, erpdoo.events (JSON
+Schema) and erpdoo.events.avro (Avro), with confluent-kafka's deserializers;
+each must be valid against the schema registered for its event type, and
+the two must say the same. Every field of each checked event, related
+records and many2many lines included, is compared with the value Odoo
+returns through JSON-RPC (see scripts/event_checks.py), and the comparison
+must cover booleans, dates, datetimes, numbers, selections and translated
+fields. The product gets a French name first (fr_FR is activated if it is
+not), so its name holds two languages and the event must show English.
 
     python scripts/smoke_test.py
 """
@@ -28,6 +38,8 @@ from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.schema_registry.json_schema import JSONDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
+
+from event_checks import OdooCheck, SchemaCheck, same_event
 
 REGISTRY = "http://localhost:18081"
 
@@ -112,6 +124,7 @@ class Events:
         self.consumer.assign([TopicPartition(topic, pid, self.consumer.get_watermark_offsets(
             TopicPartition(topic, pid), timeout=10)[1]) for pid in partitions])
         self.seen: list[tuple[float, dict]] = []
+        self.all: list[dict] = []  # every event read; checks may drop events from seen
         self.schema_ids: dict[str, int | None] = {}  # event_id -> id of the schema it was written with
 
     def poll(self, timeout: float) -> dict | None:
@@ -121,6 +134,7 @@ class Events:
             return None
         event, schema_id = self.decode(msg)
         self.seen.append((time.monotonic(), event))
+        self.all.append(event)
         self.schema_ids[event["event_id"]] = schema_id
         return event
 
@@ -140,6 +154,17 @@ class Events:
             if matches():
                 deadline = min(deadline, time.monotonic() + settle)
         return matches()
+
+    def find(self, event_id: str, timeout: float = 15) -> dict | None:
+        """The event with this id, reading on until it arrives."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for _, event in self.seen:
+                if event["event_id"] == event_id:
+                    return event
+            if time.monotonic() > deadline:
+                return None
+            self.poll(0.2)
 
 
 def write_access(dsn: str) -> tuple[list[str], list[str]]:
@@ -191,7 +216,8 @@ def main() -> int:
     p.add_argument("--odoo", default="http://localhost:8069")
     p.add_argument("--db", default="odoo")
     p.add_argument("--kafka", default="127.0.0.1:19092")
-    p.add_argument("--topic", default="erpdoo.events")
+    p.add_argument("--topic", default="erpdoo.events", help="JSON Schema topic, namespace erpdoo")
+    p.add_argument("--avro-topic", default="erpdoo.events.avro", help="Avro topic, namespace erpdoo.avro")
     p.add_argument("--registry", default=REGISTRY)
     p.add_argument("--pg", default="host=localhost dbname=odoo user=erpdoo password=erpdoo",
                    help="erpdoo's connection, to check that it cannot write")
@@ -201,7 +227,21 @@ def main() -> int:
     wait_until("Odoo", lambda: urllib.request.urlopen(args.odoo.rstrip("/") + "/web/health", timeout=5).status == 200)
     odoo = Odoo(args.odoo, args.db, "admin", "admin")
     events = Events(args.kafka, args.topic, args.registry)
+    avro = Events(args.kafka, args.avro_topic, args.registry)
+    schemas = SchemaCheck(events.decode.client, args.registry)
+    in_odoo = OdooCheck(odoo)
     results: list[tuple[str, bool, str]] = []
+
+    def deep(event: dict) -> list[str]:
+        """The event against its schema, its Avro twin, and Odoo."""
+        problems = schemas.problems(event, events.schema_ids.get(event["event_id"]), "erpdoo")
+        twin = avro.find(event["event_id"])
+        if twin is None:
+            problems.append(f"not on {args.avro_topic}")
+        else:
+            problems += [f"avro: {p}" for p in schemas.problems(twin, avro.schema_ids[twin["event_id"]], "erpdoo.avro")]
+            problems += same_event(twin, event)
+        return problems + in_odoo.problems(event)
 
     problems, notes = write_access(args.pg)
     detail = "; ".join(problems) or "no write access to Odoo's tables"
@@ -221,7 +261,7 @@ def main() -> int:
             ok, detail = False, f"expected one {event_type}, got {types}"
         else:
             arrived, event = found[0]
-            problems = verify(event) if verify else []
+            problems = (verify(event) if verify else []) + deep(event)
             ok = not problems
             detail = f"{arrived - since:.2f}s" if ok else "; ".join(problems)
             if not ok:
@@ -232,10 +272,16 @@ def main() -> int:
     def name_of(model, record_id):
         return odoo(model, "read", [record_id], ["name"])[0]["name"]
 
-    partner_id = odoo("res.partner", "search", [("customer_rank", ">", 0)], limit=1)[0]
+    # A company, so that the events carry a true boolean (is_company).
+    partner_id = odoo("res.partner", "search", [("customer_rank", ">", 0), ("is_company", "=", True)], limit=1)[0]
     partner_name = name_of("res.partner", partner_id)
     goods = odoo("product.product", "search", [("sale_ok", "=", True), ("type", "=", "consu")], limit=1)[0]
     goods_name = name_of("product.product", goods)
+    # A French name besides the English one: events are rendered in en_US.
+    odoo("res.lang", "write", odoo("res.lang", "search", [("code", "=", "fr_FR"), ("active", "in", [True, False])]),
+         {"active": True})
+    template = odoo("product.product", "read", [goods], ["product_tmpl_id"])[0]["product_tmpl_id"][0]
+    odoo("product.template", "update_field_translations", [template], "name", {"fr_FR": f"{goods_name} (FR)"})
 
     # A tax on each line, which events list through a many2many join table.
     [sale_tax] = odoo("account.tax", "search_read", [("type_tax_use", "=", "sale")], fields=["name"], limit=1)
@@ -306,8 +352,12 @@ def main() -> int:
     found = events.wait("sale.order", order2, args.timeout)
     cancelled = [e for _, e in found if e["event_type"] == "SaleOrderCancelled"]
     ok = len(cancelled) == 1 and cancelled[0]["changes"]["state"] == {"from": "sale", "to": "cancel"}
-    results.append(("cancel order", ok, "" if ok else f"got {[e['event_type'] for _, e in found]}"))
-    print(f"{'ok  ' if ok else 'FAIL'} cancel order: {'from sale to cancel' if ok else results[-1][2]}")
+    detail = "from sale to cancel" if ok else f"got {[e['event_type'] for _, e in found]}"
+    if ok and (problems := deep(cancelled[0])):
+        ok, detail = False, "; ".join(problems)
+        print(json.dumps(cancelled[0], indent=2))
+    results.append(("cancel order", ok, detail))
+    print(f"{'ok  ' if ok else 'FAIL'} cancel order: {detail}")
 
     # InvoicePosted, then InvoicePaid after registering the full payment.
     def post(move_type):
@@ -345,6 +395,28 @@ def main() -> int:
     lost = lead("Smoke test: lost")
     odoo("crm.lead", "action_set_lost", [lost])
     check("mark opportunity lost", "crm.lead", lost, None, time.monotonic())
+
+    # Every event read, also those of actions not checked one by one.
+    events.wait("-", 0, 1)
+    missing = [e["event_id"] for e in events.all if avro.find(e["event_id"], 10) is None]
+    invalid = [f"{e['event_type']} {e['event_id']}: {p}" for feed, namespace in ((events, "erpdoo"), (avro, "erpdoo.avro"))
+               for e in feed.all for p in schemas.problems(e, feed.schema_ids[e["event_id"]], namespace)]
+    types = sorted({e["event_type"] for e in events.all})
+    ok = bool(events.all) and not invalid and not missing
+    detail = (f"{len(events.all)} JSON Schema and {len(avro.all)} Avro events of {len(types)} types"
+              f" ({', '.join(types)}) decoded and valid" if ok else "; ".join(invalid[:5] + [f"{len(missing)} not in Avro"]))
+    results.append(("every event decodes and fits its registered schema, in both formats", ok, detail))
+    print(f"{'ok  ' if ok else 'FAIL'} every event decodes and fits its registered schema, in both formats: {detail}")
+
+    # The comparison with Odoo covered the kinds of values that matter.
+    counts = in_odoo.compared
+    kinds = {"booleans": counts["boolean"], "dates": counts["date"], "datetimes": counts["datetime"],
+             "numbers": counts["float"] + counts["monetary"] + counts["integer"], "selections": counts["selection"],
+             "translated fields": counts["translated"], "many2many lines": counts["many2many"]}
+    ok = all(kinds.values())
+    detail = ", ".join(f"{n} {kind}" for kind, n in kinds.items()) + f"; {sum(counts.values())} values in all"
+    results.append(("fields compared with Odoo", ok, detail))
+    print(f"{'ok  ' if ok else 'FAIL'} fields compared with Odoo: {detail}")
 
     failed = [name for name, ok, _ in results if not ok]
     print("OK" if not failed else f"FAIL: {', '.join(failed)}")
