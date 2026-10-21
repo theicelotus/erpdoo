@@ -326,35 +326,52 @@ consumer receives the event. Results from two consecutive runs:
 
 | | Run 1 | Run 2 |
 |---|---|---|
-| Latency, one order at a time (200 orders), p50 / p95 / p99 | 13.4 / 17.5 / 37.0 ms | 13.4 / 19.2 / 40.5 ms |
-| Burst while erpdoo runs (3,000 orders, 25 per transaction, 8 concurrent clients) | 173 events/s | 172 events/s |
-| Latency during that burst, p50 / p95 / p99 | 33 / 83 / 94 ms | 30 / 104 / 120 ms |
-| Last event after the last commit | 0.05 s | 0.04 s |
-| Backlog of 3,000 confirmed orders, erpdoo started afterwards | 2,502 events/s (1.20 s) | 2,332 events/s (1.29 s) |
-| erpdoo startup (container start to streaming) | 0.66 s | 0.65 s |
+| Latency, one order at a time (200 orders), p50 / p95 / p99 | 13.2 / 16.4 / 28.5 ms | 13.2 / 15.7 / 22.3 ms |
+| Burst while erpdoo runs (3,000 orders, 25 per transaction, 8 concurrent clients) | 166 events/s | 169 events/s |
+| Latency during that burst, p50 / p95 / p99 | 24 / 52 / 65 ms | 32 / 71 / 87 ms |
+| Last event after the last commit | 0.04 s | 0.05 s |
+| Backlog of 3,000 confirmed orders, erpdoo started afterwards | 3,188 events/s (0.94 s) | 3,219 events/s (0.93 s) |
+| erpdoo startup (container start to streaming) | 0.72 s | 0.69 s |
 
 How to read it:
 
 - In the burst, Odoo is the limit: it committed about 170 confirmations a
-  second, and erpdoo delivered each within about 100 ms, finishing 50 ms
+  second, and erpdoo delivered each within about 90 ms, finishing 50 ms
   after the last commit.
 - The backlog run takes Odoo out of the picture: erpdoo works through 3,000
-  waiting confirmations at about 2,300 to 2,500 events a second, including
-  the state store lookups for each event's partner and order lines.
-- These runs include the state store's copy of the rule tables and the row
-  versions it keeps for replays. Compared with the version before (which
-  used `REPLICA IDENTITY FULL` instead), the 95th and 99th percentile
-  latency during the burst went up from 55 to 88 ms to 83 to 120 ms;
-  throughput and the backlog did not get slower.
+  waiting confirmations at about 3,200 events a second, including the
+  state store lookups for each event's partner and order lines. The orders
+  were created while erpdoo ran, so their lines were already in the store;
+  orders from before erpdoo started cost one query each for their lines.
 - No events were missing or duplicated in any phase.
 - This is one machine with no network between the services, and small
   demo tables. Expect higher latency across real networks, and a longer
-  first start on a large database while the state store copies its tables.
+  first start on a large database while the state store copies the rule
+  tables.
   The orders use a service product, so no deliveries are created.
 
 To reproduce, start the stack and run `.venv/bin/python scripts/benchmark.py`.
 It creates about 6,200 orders in the dev database and stops and starts the
 erpdoo container for the backlog phase.
+
+### State store size and startup
+
+The state store keeps the rule tables with only the columns the rules use,
+and fetches related records when an event first needs them. Before, it
+copied every column of the rule tables and of every related table at
+startup. Measured on the dev database after the runs above (about 16,000
+sale orders and order lines, 3,700 deliveries and stock moves), each
+with a new store and its own slot, two runs each:
+
+| | Copy whole tables | Columns rules use, related rows on demand |
+|---|---|---|
+| Startup, process start to streaming | 2.15 s / 1.90 s | 0.94 s / 0.92 s |
+| Store size after startup (SQLite file after a clean stop) | 59.2 MB | 8.5 MB |
+| The same after the smoke test ran meanwhile | | 8.5 MB |
+
+Startup is dominated by copying `sale_order` (16,000 rows), now with 13 of its
+51 columns; `sale_order_line` and the other related
+tables are no longer copied.
 
 ### WAL per order confirmation
 
@@ -389,7 +406,8 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   is leaving by comparing with the row before the change, and Postgres only
   sends that row with `REPLICA IDENTITY FULL`. erpdoo instead keeps the
   rule tables (`sale_order`, `account_move`, `stock_picking` and `crm_lead`
-  with the shipped rules) in its state store, with the previous version of
+  with the shipped rules) in its state store, copied when tracking starts
+  but only with the columns the rules use, with the previous version of
   each changed row until the slot is confirmed past it. That costs disk
   space and a longer first copy on a large database (`account_move` holds
   every invoice and journal entry), to save little WAL (see
@@ -405,12 +423,18 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   or asking an admin to, erpdoo checks that it has a primary key or another
   replica identity. Without one, Postgres would reject Odoo's updates and
   deletes on that table, so erpdoo refuses to start and names the table.
-- **The state store copies whole tables.** Each table a rule includes
-  (partners, products, order and invoice lines, ...) is copied into SQLite
-  when tracking starts, which takes a while on a large database, then kept
-  current from the stream. A many2many include also copies its join table
-  (for taxes, `account_move_line_account_tax_rel`, one row per line and
-  tax), which must be published like the other tables.
+- **Related records are fetched on first use.** Tables a rule includes
+  (partners, products, order and invoice lines, ...) are not copied up
+  front. The first time an event needs a row, erpdoo reads it from
+  Postgres, with the columns the rules use, and from then on keeps it
+  current from the stream; the lines of an order are read together the
+  first time. A row read this way is as Postgres has it at that moment,
+  which can be newer than the transaction the event is about when erpdoo
+  is behind, for example while it works through a backlog. Records created
+  while erpdoo runs need no query: their lines arrive in the stream. A
+  many2many include works the same way through its join table (for taxes,
+  `account_move_line_account_tax_rel`), which must be published like the
+  other tables.
 - **Delivery is at-least-once.** erpdoo streams changes over Postgres'
   replication protocol and confirms its position in the slot right after
   every sink has delivered the events. If it crashes in between, or one sink
@@ -418,7 +442,8 @@ depend on when checkpoints happen; the rule-table figure is the steady one.
   with the same `event_id`. Consumers should dedupe on it. A resent event
   is the same as the first, related records included: the state store keeps
   the previous versions of changed rows until the slot is confirmed, and
-  reads related records as of the original commit. If Postgres itself
+  reads related records as of the original commit (a related row it reads
+  from Postgres for the first time during the resend is current). If Postgres itself
   crashes, the slot can restart from further back than erpdoo confirmed
   (Postgres saves its position at checkpoints); erpdoo no longer has
   versions for those transactions, recognises them as delivered and does
