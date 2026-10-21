@@ -326,21 +326,26 @@ consumer receives the event. Results from two consecutive runs:
 
 | | Run 1 | Run 2 |
 |---|---|---|
-| Latency, one order at a time (200 orders), p50 / p95 / p99 | 13.5 / 20.0 / 26.2 ms | 13.2 / 14.5 / 20.2 ms |
-| Burst while erpdoo runs (3,000 orders, 25 per transaction, 8 concurrent clients) | 155 events/s | 152 events/s |
-| Latency during that burst, p50 / p95 / p99 | 31 / 55 / 60 ms | 28 / 76 / 88 ms |
-| Last event after the last commit | 0.03 s | 0.03 s |
-| Backlog of 3,000 confirmed orders, erpdoo started afterwards | 2,020 events/s (1.49 s) | 2,012 events/s (1.49 s) |
-| erpdoo startup (container start to streaming) | 0.80 s | 0.75 s |
+| Latency, one order at a time (200 orders), p50 / p95 / p99 | 13.4 / 17.5 / 37.0 ms | 13.4 / 19.2 / 40.5 ms |
+| Burst while erpdoo runs (3,000 orders, 25 per transaction, 8 concurrent clients) | 173 events/s | 172 events/s |
+| Latency during that burst, p50 / p95 / p99 | 33 / 83 / 94 ms | 30 / 104 / 120 ms |
+| Last event after the last commit | 0.05 s | 0.04 s |
+| Backlog of 3,000 confirmed orders, erpdoo started afterwards | 2,502 events/s (1.20 s) | 2,332 events/s (1.29 s) |
+| erpdoo startup (container start to streaming) | 0.66 s | 0.65 s |
 
 How to read it:
 
-- In the burst, Odoo is the limit: it committed about 150 confirmations a
-  second, and erpdoo delivered each within tens of milliseconds, finishing
-  30 ms after the last commit.
+- In the burst, Odoo is the limit: it committed about 170 confirmations a
+  second, and erpdoo delivered each within about 100 ms, finishing 50 ms
+  after the last commit.
 - The backlog run takes Odoo out of the picture: erpdoo works through 3,000
-  waiting confirmations at about 2,000 events a second, including the
-  state store lookups for each event's partner and order lines.
+  waiting confirmations at about 2,300 to 2,500 events a second, including
+  the state store lookups for each event's partner and order lines.
+- These runs include the state store's copy of the rule tables and the row
+  versions it keeps for replays. Compared with the version before (which
+  used `REPLICA IDENTITY FULL` instead), the 95th and 99th percentile
+  latency during the burst went up from 55 to 88 ms to 83 to 120 ms;
+  throughput and the backlog did not get slower.
 - No events were missing or duplicated in any phase.
 - This is one machine with no network between the services, and small
   demo tables. Expect higher latency across real networks, and a longer
