@@ -615,7 +615,7 @@ How to read it:
 - Schemas cost no measurable time. An earlier measurement, with one Kafka
   sink writing plain JSON, gave 13.2 ms at p50; that same configuration
   gives 18.8 ms on this machine today (and one JSON Schema sink alone
-  18.6 ms), with a dev database grown to about 30,000 orders by the test
+  18.6 ms), with a dev database grown to about 47,000 orders by the test
   runs. The difference is the machine and its data, not the formats.
 - This is one machine with no network between the services, and small
   demo tables. Expect higher latency across real networks, and a longer
