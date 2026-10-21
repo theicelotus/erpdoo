@@ -1,0 +1,20 @@
+# Inbound: a warehouse system reports a shipment. See src/erpdoo/inbound.py
+# for the rule format, and "Inbound" in the README.
+#
+#   {"id": "wh-81723", "type": "DeliveryShipped", "reference": "WH/OUT/00042",
+#    "tracking_number": "1Z999AA10123456784"}
+
+DeliveryShipped:
+  topic: warehouse.events
+  model: stock.picking
+  find:
+    name: "{reference}"
+    picking_type_code: outgoing
+  # Validated before (erpdoo stopped before it could note the message).
+  already_done: { state: done }
+  steps:
+    - write: { carrier_tracking_ref: "{tracking_number}" }   # needs the stock_delivery app
+    # Validates what is reserved; anything not reserved goes to a backorder.
+    - call: button_validate
+      context: { skip_sms: true, skip_backorder: true }
+  expect: { state: done }
