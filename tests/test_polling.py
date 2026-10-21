@@ -293,3 +293,19 @@ def test_models_changed(api):
     assert not p.models_changed()
     api.fields.append({**api.fields[-1], "id": len(api.fields) + 1, "name": "x_note", "write_date": api.now})
     assert p.models_changed()
+
+
+def test_an_idle_poll_costs_one_call_per_model_and_one_for_tracking(api):
+    # A condition on a related record needs a read, but only for records that changed.
+    line_added = parse_rule("ChairLineAdded", {"model": "sale.order.line", "on": ["create"],
+                                               "when": {"product_id.default_code": "CHAIR"}, "fields": ["name"]})
+    p = poller(api, rules=[CONFIRMED, WON, line_added], batch=500)
+    run(p)
+    record = order(api)
+    api.write("sale.order", record, {"state": "sale"})
+    assert {e.event_type for e in run(p).events} == {"SaleOrderConfirmed", "ChairLineAdded"}
+    api.tick()
+    calls = api.calls
+    result = run(p)  # reads the same records again (the overlap), nothing changed
+    assert (result.events, result.changes) == ([], [])
+    assert api.calls - calls == result.calls == 4  # sale.order, sale.order.line, crm.lead, tracking

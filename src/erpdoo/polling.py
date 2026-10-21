@@ -616,9 +616,12 @@ class Poller:
             missing = {i for m, i in by_record if m == plan.model} - current.keys()
             if missing:  # changed in a transaction that committed between the two reads
                 current.update({r["id"]: r for r in self.reader.read(plan.model, missing, plan.columns)})
+            # Only records that changed: the overlap reads others again every poll.
+            changed = {i: r for i, r in current.items()
+                       if (plan.model, i) in by_record or _keep(plan.spec, r) != self.stored(plan.table, i)}
             conditions = [c.field for r in plan.rules for c in r.conditions]
-            related.prefetch(plan.model, list(current.values()), [], {}, conditions)
-            matches += self._evaluate(plan, current, by_record, result)
+            related.prefetch(plan.model, list(changed.values()), [], {}, conditions)
+            matches += self._evaluate(plan, changed, by_record, result)
             seen = [micros(r["write_date"]) for r in current.values() if r.get("write_date")]
             result.cursors[plan.model] = max([self._meta(f"poll_cursor:{plan.model}"), *seen])
         if any(p.deletes for p in self.plans.values()) and (
