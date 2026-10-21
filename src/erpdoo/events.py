@@ -79,12 +79,15 @@ class EventBuilder:
         self.lang = lang
         self._hops: dict[tuple[str, str], list] = {}
         self._before_copy_logged: set[str] = set()
+        self._as_of: int | None = None  # related records are read as of this WAL position
 
     def build(self, txn: Transaction, replay: bool = False) -> list[Event]:
         """Events for one transaction. Apply the transaction to the store
-        first (StateStore.apply_transaction), so related records are as of
-        its commit and updates and deletes carry their previous row;
-        ``replay`` is what that returned."""
+        first (StateStore.apply_transaction), so updates and deletes carry
+        their previous row; ``replay`` is what that returned. Related records
+        are read as of the transaction's commit, also when it is streamed
+        again after a crash and the store is already further on."""
+        self._as_of = txn.end_lsn
         events = []
         changes_by_model: dict[str, dict] = {}
         for rule in self.rules:
@@ -153,7 +156,7 @@ class EventBuilder:
             target = self.registry.models[f.relation]
             if f.type == "many2one":
                 target_id = row.get(f.column)
-                related = self.store.get(target.table, target_id) if target_id is not None else None
+                related = self.store.get(target.table, target_id, self._as_of) if target_id is not None else None
                 if target_id is None:
                     out[inc.field] = None
                 elif related is None:
@@ -162,7 +165,7 @@ class EventBuilder:
                     out[inc.field] = self.render(target.name, related, inc.fields, inc.children)
             else:
                 inverse = target.fields[f.inverse].column
-                rows = self.store.find(target.table, inverse, row["id"])
+                rows = self.store.find(target.table, inverse, row["id"], self._as_of)
                 out[inc.field] = [
                     self.render(target.name, r, inc.fields, inc.children)
                     for r in rows if all(c.matches({}, r) for c in inc.where)
@@ -179,7 +182,8 @@ class EventBuilder:
         current = row
         for _, hop in hops:
             target_id = current.get(hop.column)
-            current = self.store.get(self.registry.models[hop.relation].table, target_id) if target_id else None
+            table = self.registry.models[hop.relation].table
+            current = self.store.get(table, target_id, self._as_of) if target_id else None
             if current is None:
                 return None
         value = current.get(f.column)

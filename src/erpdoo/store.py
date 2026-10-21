@@ -12,7 +12,7 @@ send it (updates and deletes without REPLICA IDENTITY FULL). For that it
 keeps the previous version of every row a transaction changed, until the
 replication slot is confirmed past that transaction: a transaction streamed
 again after a crash is already in the store, and its previous rows then
-come from these versions.
+come from these versions, and so do related records as of its commit.
 """
 
 from __future__ import annotations
@@ -187,21 +187,43 @@ class StateStore:
     def commit(self) -> None:
         self.db.commit()
 
-    def get(self, table: str, record_id: int) -> dict | None:
+    def get(self, table: str, record_id: int, as_of: int | None = None) -> dict | None:
+        """A row, as of WAL position ``as_of`` (the end of a transaction) if
+        given: during a replay the store is ahead of the stream, and the row
+        then comes from the versions kept since the slot's confirmed position."""
+        if as_of is not None and as_of < self.applied_lsn:
+            row = self.db.execute("SELECT data FROM versions WHERE tbl = ? AND id = ? AND lsn >= ?"
+                                  " ORDER BY lsn LIMIT 1", [table, record_id, as_of]).fetchone()
+            if row:
+                return json.loads(row[0])
         row = self.db.execute("SELECT data FROM records WHERE tbl = ? AND id = ?", [table, record_id]).fetchone()
         return json.loads(row[0]) if row else None
 
-    def find(self, table: str, column: str, value: object) -> list[dict]:
-        """Rows of ``table`` whose ``column`` equals ``value``, by id."""
+    def find(self, table: str, column: str, value: object, as_of: int | None = None) -> list[dict]:
+        """Rows of ``table`` whose ``column`` equals ``value``, by id, as of
+        WAL position ``as_of`` if given (see get)."""
         if not _COLUMN.match(column):
             raise ValueError(f"invalid column name {column!r}")
         # No ORDER BY: with it, SQLite prefers the primary key (tbl, id) and
         # scans the whole table instead of using the column's index.
-        rows = self.db.execute(
+        rows = dict(self.db.execute(
             f"SELECT id, data FROM records WHERE tbl = ? AND json_extract(data, '$.{column}') = ?",
             [table, value],
-        )
-        return [json.loads(data) for _, data in sorted(rows)]
+        ))
+        if as_of is not None and as_of < self.applied_lsn:
+            # Rows changed since then were, at that point, as their oldest
+            # version after it says (null: not created yet).
+            for record_id, data in self.db.execute(
+                "SELECT id, data FROM versions v WHERE tbl = ? AND lsn = ("
+                " SELECT min(lsn) FROM versions w WHERE w.tbl = v.tbl AND w.id = v.id AND w.lsn >= ?)",
+                [table, as_of],
+            ):
+                then = json.loads(data)
+                if then is not None and then.get(column) == value:
+                    rows[record_id] = data
+                else:
+                    rows.pop(record_id, None)
+        return [json.loads(data) for _, data in sorted(rows.items())]
 
     def sync(self, dsn: str, tables: dict[str, set[str]]) -> None:
         """Track exactly ``tables`` (table -> columns to index): drop tables no

@@ -124,3 +124,23 @@ def test_replay_after_a_crash_fires_again_with_the_same_id():
     [second] = b.build(again, b.store.apply_transaction(again))
     assert second.event_id == first.event_id
     assert second.payload["changes"] == first.payload["changes"]
+
+
+def test_replay_shows_related_records_as_they_were():
+    b = builder()
+    b.store.load("sale_order", [order()], lsn=0x100)
+    confirm = Transaction(900, 0x2000, 0x2100, datetime(2026, 1, 1, tzinfo=timezone.utc),
+                          [update(None, order(state="sale"))])
+    [first] = b.build(confirm, b.store.apply_transaction(confirm))
+    # The customer is renamed before the slot is confirmed, then erpdoo crashes.
+    rename = Transaction(901, 0x3000, 0x3100, datetime(2026, 1, 1, tzinfo=timezone.utc),
+                         [Change("update", "res_partner", "res.partner", None, False,
+                                 {"id": 10, "name": "Azure Renamed", "email": "azure@example.com"})])
+    b.store.apply_transaction(rename)
+    b.store.commit()
+    again = Transaction(900, 0x2000, 0x2100, datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        [update(None, order(state="sale"))])
+    [second] = b.build(again, b.store.apply_transaction(again))
+    assert second.event_id == first.event_id
+    assert second.payload == first.payload
+    assert second.payload["record"]["partner_id"]["name"] == "Azure Interior"

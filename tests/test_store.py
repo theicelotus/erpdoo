@@ -127,3 +127,24 @@ def test_find_uses_the_column_index():
                         "AND json_extract(data, '$.order_id') = ?", ["sale_order_line", 5]).fetchall()
     assert "records_order_id" in plan[0][3]
     assert [r["id"] for r in s.find("sale_order_line", "order_id", 5)] == [15, 16, 17]
+
+
+def test_rows_as_of_an_earlier_position():
+    s = store()
+    s.apply_transaction(txn(0x200, change("update", new={"id": 1, "order_id": 7, "name": "Desk XL"})))
+    s.apply_transaction(txn(0x300, change("update", new={"id": 1, "order_id": 7, "name": "Desk XXL"})))
+    assert s.get("sale_order_line", 1, as_of=0x210)["name"] == "Desk XL"   # after the first
+    assert s.get("sale_order_line", 1, as_of=0x110)["name"] == "Desk"      # before both
+    assert s.get("sale_order_line", 1, as_of=0x310)["name"] == "Desk XXL"  # now
+    assert s.get("sale_order_line", 1)["name"] == "Desk XXL"
+
+
+def test_find_as_of_an_earlier_position():
+    s = store()
+    s.apply_transaction(txn(0x200, change("insert", new={"id": 3, "order_id": 7, "name": "Lamp", "note": None}),
+                            change("delete", old={"id": 2}, key_only=True),
+                            change("update", new={"id": 1, "order_id": 8, "name": "Desk"})))
+    assert [r["name"] for r in s.find("sale_order_line", "order_id", 7)] == ["Lamp"]
+    # Before that transaction: Lamp did not exist, Chair was not deleted, Desk was on order 7.
+    assert [r["name"] for r in s.find("sale_order_line", "order_id", 7, as_of=0x110)] == ["Desk", "Chair"]
+    assert s.find("sale_order_line", "order_id", 8, as_of=0x110) == []
