@@ -9,6 +9,7 @@ checked against the running stack, not only with unit tests.
 - [Running the checks](#running-the-checks)
 - [The checks](#the-checks)
   - [Unit tests](#unit-tests)
+  - [Link check](#link-check)
   - [Smoke test](#smoke-test)
   - [Replay test](#replay-test)
   - [Delivery test](#delivery-test)
@@ -47,14 +48,14 @@ scripts/check_all.sh
 
 [scripts/check_all.sh](scripts/check_all.sh) rebuilds erpdoo
 (`docker compose up -d --build erpdoo`) and runs every check below, unit
-tests and test scripts, one after the other against the dev stack, with a
+tests, link check and test scripts, one after the other against the dev stack, with a
 summary at the end. It exits non-zero if any check failed. `PYTHON`
 overrides the interpreter (default: `.venv/bin/python` if it exists).
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same
 checks on every push and pull request, as separate steps: the unit tests on
-Python 3.11 and 3.13, and the scripts against a full stack. A new check
-goes into both `check_all.sh` and `ci.yml`.
+Python 3.11 and 3.13, the link check, and the scripts against a full stack.
+A new check goes into both `check_all.sh` and `ci.yml`.
 
 ## The checks
 
@@ -66,6 +67,18 @@ goes into both `check_all.sh` and `ci.yml`.
 
 The tests in [tests/](tests/) need no stack: they use a small fake Odoo
 schema and API, and pgoutput messages built in the test.
+
+### Link check
+
+```sh
+.venv/bin/python scripts/check_links.py
+```
+
+[scripts/check_links.py](scripts/check_links.py) checks that every relative
+link in README.md, CONTRIBUTING.md, CHANGELOG.md and docs/ points at a file
+that exists, every `#anchor` at a heading of its page (as GitHub makes
+them), and that the README links every page in docs/. It does not fetch
+links to websites, and needs no stack.
 
 ### Smoke test
 

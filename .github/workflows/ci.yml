@@ -23,6 +23,17 @@ jobs:
       - run: pip install -e '.[dev,viewer]'
       - run: pytest -q
 
+  links:
+    name: Link check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      # Relative links and #anchors in the Markdown files; no stack needed.
+      - run: python scripts/check_links.py
+
   smoke:
     name: Full stack smoke test
     runs-on: ubuntu-24.04

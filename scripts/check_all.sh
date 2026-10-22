@@ -8,9 +8,10 @@
 # PYTHON overrides the interpreter (default: .venv/bin/python if it exists).
 cd "$(dirname "$0")/.." || exit 1
 PYTHON=${PYTHON:-$( [ -x .venv/bin/python ] && echo .venv/bin/python || echo python )}
-checks=(unit smoke replay delivery inbound custom_table backfill late_app polling)
+checks=(unit links smoke replay delivery inbound custom_table backfill late_app polling)
 declare -A command=(
   [unit]="$PYTHON -m pytest -q"
+  [links]="$PYTHON scripts/check_links.py"
   [smoke]="$PYTHON scripts/smoke_test.py"
   [replay]="$PYTHON scripts/replay_test.py"
   [delivery]="$PYTHON scripts/delivery_test.py"
