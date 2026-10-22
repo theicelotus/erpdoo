@@ -62,18 +62,7 @@ A full example event is in [docs/events.md](docs/events.md#an-event).
 For your own self-hosted Odoo:
 
 1. Have a database admin prepare Postgres once, as described in the [Postgres setup guide](docs/postgres-setup.md).
-2. Install erpdoo in one of two ways:
-   - **With pip**, from a clone, with the live viewer's extra:
-     ```sh
-     git clone https://github.com/theicelotus/erpdoo && pip install './erpdoo[viewer]'
-     ```
-   - **With Docker**, by building its image:
-     ```sh
-     git clone https://github.com/theicelotus/erpdoo && docker build -t erpdoo ./erpdoo
-     ```
-3. Copy the shipped rules from [rules/](rules/) and set `ERPDOO_PG_DSN` (for example `host=db dbname=odoo user=erpdoo password=...`), `ERPDOO_RULES` and `ERPDOO_STATE` (the state store's SQLite file, on persistent storage). All settings are in [Configuration](docs/configuration.md).
-4. Run `erpdoo` under a supervisor (systemd, or Docker's restart policy). When Postgres or a sink goes away it exits without confirming what is undelivered, and continues from there when restarted.
-5. Tell it where events go, in `erpdoo.yml` (or `ERPDOO_CONFIG`):
+2. Tell erpdoo where events go, in `erpdoo.yml`:
    ```yaml
    sinks:
      - type: kafka
@@ -82,6 +71,29 @@ For your own self-hosted Odoo:
        schema_registry:
          url: http://schema-registry:8081
    ```
+3. Install and run erpdoo in one of these ways:
+   - **With pip** (Python 3.11 or later), with the live viewer's extra. Copy the shipped rules from [rules/](rules/) into the directory with `erpdoo.yml`, run erpdoo there, and set where Odoo's Postgres is and where the state store's SQLite file goes (on persistent storage):
+     ```sh
+     pip install 'erpdoo[viewer]'
+     export ERPDOO_PG_DSN='host=db dbname=odoo user=erpdoo password=...' ERPDOO_STATE=/var/lib/erpdoo/state.db
+     erpdoo
+     ```
+   - **With Docker**, from the published image, which has the viewer and the shipped rules. Mount your `erpdoo.yml`, and a volume for the state store:
+     ```sh
+     docker run -d --name erpdoo --restart unless-stopped \
+       -e ERPDOO_PG_DSN='host=db dbname=odoo user=erpdoo password=...' \
+       -v "$PWD/erpdoo.yml:/app/erpdoo.yml:ro" -v erpdoo-state:/var/lib/erpdoo \
+       ghcr.io/theicelotus/erpdoo:0.1.0
+     ```
+     To use your own rules, mount them at `/app/rules`. For the live viewer, set `viewer: { host: 0.0.0.0 }` in `erpdoo.yml` and add `-p 127.0.0.1:8000:8000`.
+   - **From source**, from a clone, with pip or by building the image:
+     ```sh
+     git clone https://github.com/theicelotus/erpdoo
+     pip install './erpdoo[viewer]'          # or: docker build -t erpdoo ./erpdoo
+     ```
+4. Run it under a supervisor (systemd, or Docker's restart policy). When Postgres or a sink goes away it exits without confirming what is undelivered, and continues from there when restarted.
+
+All settings, `ERPDOO_RULES` and `ERPDOO_CONFIG` among them, are in [Configuration](docs/configuration.md).
 
 ## Usage
 
@@ -141,6 +153,7 @@ docker compose restart erpdoo             # dev stack: after editing rules/ or e
 - [Slot health](docs/slot-health.md): replication lag, WAL limits, invalidated slots
 - [Performance](docs/performance.md): latency, throughput, state store size, WAL cost
 - [Configuration](docs/configuration.md): environment variables and erpdoo.yml
+- [Changelog](CHANGELOG.md): what changed in each release
 
 ## Contributing
 
