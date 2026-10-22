@@ -3,7 +3,7 @@ WORKDIR /app
 # Dependencies first, in a layer that changes only with pyproject.toml, so a
 # code change does not download them again.
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir hatchling \
+RUN pip install --no-cache-dir hatchling hatch-fancy-pypi-readme \
     && mkdir -p src/erpdoo && touch src/erpdoo/__init__.py README.md \
     && pip install --no-cache-dir '.[viewer]' && pip uninstall -y -q erpdoo && rm -rf src README.md
 COPY README.md ./

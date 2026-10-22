@@ -1,12 +1,12 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-fancy-pypi-readme>=24"]
 build-backend = "hatchling.build"
 
 [project]
 name = "erpdoo"
 version = "0.1.0"
 description = "Turn Odoo database changes into business events and stream them to Kafka and other sinks"
-readme = "README.md"
+dynamic = ["readme"]
 license = "MIT"
 requires-python = ">=3.11"
 keywords = ["odoo", "kafka", "cdc", "change-data-capture", "postgresql", "logical-replication", "webhooks"]
@@ -41,6 +41,22 @@ Issues = "https://github.com/theicelotus/erpdoo/issues"
 
 [project.scripts]
 erpdoo = "erpdoo.__main__:main"
+
+# The README for PyPI, whose page cannot follow its relative links: they
+# point at the files on GitHub instead.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(!\[[^\]]*\])\((?!https?://)([^)\s]+)\)'
+replacement = '\1(https://raw.githubusercontent.com/theicelotus/erpdoo/main/\2)'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?://|mailto:|#)([^)\s]+)\)'
+replacement = '](https://github.com/theicelotus/erpdoo/blob/main/\1)'
 
 # Only what is needed to build, test and run erpdoo from the sdist (the
 # readme, license and pyproject.toml are always in it), not every file of
