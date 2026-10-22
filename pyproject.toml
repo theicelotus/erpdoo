@@ -42,5 +42,11 @@ Issues = "https://github.com/theicelotus/erpdoo/issues"
 [project.scripts]
 erpdoo = "erpdoo.__main__:main"
 
+# Only what is needed to build, test and run erpdoo from the sdist (the
+# readme, license and pyproject.toml are always in it), not every file of
+# the working tree.
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/rules", "/docs", "/erpdoo.yml", "/CHANGELOG.md", "/CONTRIBUTING.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
