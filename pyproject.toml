@@ -4,11 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "erpdoo"
-version = "0.0.1"
+version = "0.1.0"
 description = "Turn Odoo database changes into business events and stream them to Kafka and other sinks"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
+keywords = ["odoo", "kafka", "cdc", "change-data-capture", "postgresql", "logical-replication", "webhooks"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Office/Business",
+]
 dependencies = [
     "psycopg2-binary>=2.9",
     "confluent-kafka>=2.6",
@@ -20,6 +32,12 @@ dependencies = [
 viewer = ["fastapi>=0.110", "uvicorn>=0.29"]
 # The test scripts decode events with confluent-kafka's own deserializers.
 dev = ["pytest>=8", "httpx2>=2", "jsonschema>=4.18", "confluent-kafka[avro,json]>=2.6"]
+
+[project.urls]
+Homepage = "https://github.com/theicelotus/erpdoo"
+Documentation = "https://github.com/theicelotus/erpdoo#documentation"
+Changelog = "https://github.com/theicelotus/erpdoo/blob/main/CHANGELOG.md"
+Issues = "https://github.com/theicelotus/erpdoo/issues"
 
 [project.scripts]
 erpdoo = "erpdoo.__main__:main"
